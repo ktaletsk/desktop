@@ -6,5 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "ipykernel>=7.2.0",
+    "ipywidgets>=8.1.8",
+    "jinja2>=3.1.6",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
     "pandas>=3.0.1",
+    "pip>=26.0.1",
+    "polars>=1.38.1",
+    "rich>=14.3.3",
+    "tqdm>=4.67.3",
+    "uv>=0.10.7",
 ]

@@ -3,6 +3,8 @@ Lattice Boltzmann Method (D2Q9) fluid simulation with matplotlib inline renderin
 Styled for Gruvbox Dark.
 """
 
+import time
+
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -37,10 +39,10 @@ CMAP = gruvbox_diverging_cmap()
 
 # ── Grid & physics params ──
 NX, NY = 400, 100
-TAU = 0.6  # relaxation time (viscosity ~ (tau - 0.5)/3)
+TAU = 0.53  # lower viscosity → vortices develop faster
 STEPS = 3000
-PLOT_EVERY = 30  # ~100 frames total, smooth for a demo
-INLET_V = 0.04
+PLOT_EVERY = 100  # ~30 frames
+INLET_V = 0.06
 
 # D2Q9 lattice velocities and weights
 C = np.array(
@@ -160,6 +162,7 @@ def main(rho: np.ndarray, ux: np.ndarray, uy: np.ndarray):
                 fontweight="bold",
             )
             h.update(fig)
+            time.sleep(0.001)
 
     # ── Final frame ──
     curl = (np.roll(uy, -1, axis=0) - np.roll(uy, 1, axis=0)) - (
