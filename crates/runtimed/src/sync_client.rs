@@ -238,6 +238,14 @@ where
                     .collect();
                 self.put_list(key, &items)?;
             }
+            serde_json::Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    // Store as i64 since Automerge's Int is more widely supported
+                    self.doc
+                        .put(automerge::ROOT, key, u as i64)
+                        .map_err(|e| SyncClientError::SyncError(format!("put u64: {}", e)))?;
+                }
+            }
             _ => {}
         }
 
@@ -339,6 +347,22 @@ fn get_all_from_doc(doc: &AutoCommit) -> SyncedSettings {
             })
     };
 
+    let get_u64 = |key: &str| -> Option<u64> {
+        doc.get(automerge::ROOT, key)
+            .ok()
+            .flatten()
+            .and_then(|(value, _)| match value {
+                automerge::Value::Scalar(s) => match s.as_ref() {
+                    // Use try_from to prevent negative values wrapping to huge u64
+                    automerge::ScalarValue::Int(i) => u64::try_from(*i).ok(),
+                    automerge::ScalarValue::Uint(u) => Some(*u),
+                    automerge::ScalarValue::Str(s) => s.parse().ok(),
+                    _ => None,
+                },
+                _ => None,
+            })
+    };
+
     // Read uv packages: try nested list, fall back to flat comma string
     let uv_packages = {
         let nested = read_nested_list(doc, "uv", "default_packages");
@@ -379,6 +403,7 @@ fn get_all_from_doc(doc: &AutoCommit) -> SyncedSettings {
         conda: CondaDefaults {
             default_packages: conda_packages,
         },
+        keep_alive_secs: get_u64("keep_alive_secs").unwrap_or(defaults.keep_alive_secs),
     }
 }
 
