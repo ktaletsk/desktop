@@ -467,6 +467,10 @@ pub struct NotebookRoom {
     pub trust_state: Arc<RwLock<TrustState>>,
     /// The notebook file path (notebook_id is the path).
     pub notebook_path: PathBuf,
+    /// Working directory for untitled notebooks (used for project file detection).
+    /// When the notebook_id is a UUID (untitled), this provides the directory context
+    /// for finding pyproject.toml, pixi.toml, or environment.yaml.
+    pub working_dir: Arc<RwLock<Option<PathBuf>>>,
     /// Timestamp when auto-launch was triggered (for grace period on eviction).
     /// If set, the room won't be evicted for 30 seconds to allow client reconnect.
     pub auto_launch_at: Arc<RwLock<Option<std::time::Instant>>>,
@@ -524,6 +528,7 @@ impl NotebookRoom {
             blob_store,
             trust_state: Arc::new(RwLock::new(trust_state)),
             notebook_path,
+            working_dir: Arc::new(RwLock::new(None)),
             auto_launch_at: Arc::new(RwLock::new(None)),
             comm_state: Arc::new(CommState::new()),
         }
@@ -553,6 +558,7 @@ impl NotebookRoom {
             blob_store,
             trust_state: Arc::new(RwLock::new(trust_state)),
             notebook_path,
+            working_dir: Arc::new(RwLock::new(None)),
             auto_launch_at: Arc::new(RwLock::new(None)),
             comm_state: Arc::new(CommState::new()),
         }
@@ -631,11 +637,18 @@ pub async fn handle_notebook_sync_connection<R, W>(
     default_runtime: crate::runtime::Runtime,
     default_python_env: crate::settings_doc::PythonEnvType,
     daemon: std::sync::Arc<crate::daemon::Daemon>,
+    working_dir: Option<PathBuf>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // Set working_dir on the room if provided (for untitled notebook project detection)
+    if let Some(wd) = working_dir {
+        let mut room_wd = room.working_dir.write().await;
+        *room_wd = Some(wd);
+    }
+
     room.active_peers.fetch_add(1, Ordering::Relaxed);
     let peers = room.active_peers.load(Ordering::Relaxed);
     info!(
@@ -1050,6 +1063,11 @@ async fn acquire_pool_env_for_source(
     }
 }
 
+/// Check if a notebook_id is a UUID (untitled/unsaved notebook).
+fn is_untitled_notebook(notebook_id: &str) -> bool {
+    uuid::Uuid::parse_str(notebook_id).is_ok()
+}
+
 /// Auto-launch kernel for a trusted notebook when first peer connects.
 /// This is similar to handle_notebook_request(LaunchKernel) but without a request/response.
 ///
@@ -1073,6 +1091,15 @@ async fn auto_launch_kernel(
     let notebook_path = PathBuf::from(notebook_id);
     let notebook_path_opt = if notebook_path.exists() {
         Some(notebook_path.clone())
+    } else if is_untitled_notebook(notebook_id) {
+        // For untitled notebooks, use the working_dir from the handshake for project file detection
+        let working_dir = room.working_dir.read().await;
+        working_dir.clone().inspect(|p| {
+            info!(
+                "[notebook-sync] Using working_dir for untitled notebook project detection: {}",
+                p.display()
+            );
+        })
     } else {
         None
     };
@@ -2862,6 +2889,7 @@ mod tests {
                 pending_launch: false,
             })),
             notebook_path: notebook_path.clone(),
+            working_dir: Arc::new(RwLock::new(None)),
             auto_launch_at: Arc::new(RwLock::new(None)),
             comm_state: Arc::new(crate::comm_state::CommState::new()),
         };
@@ -3039,5 +3067,18 @@ mod tests {
         } else {
             panic!("Expected code cell");
         }
+    }
+
+    #[test]
+    fn test_is_untitled_notebook_with_uuid() {
+        assert!(is_untitled_notebook("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_untitled_notebook("a1b2c3d4-e5f6-7890-abcd-ef1234567890"));
+    }
+
+    #[test]
+    fn test_is_untitled_notebook_with_path() {
+        assert!(!is_untitled_notebook("/home/user/notebook.ipynb"));
+        assert!(!is_untitled_notebook("./relative/path.ipynb"));
+        assert!(!is_untitled_notebook("notebook.ipynb"));
     }
 }

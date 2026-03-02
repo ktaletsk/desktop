@@ -296,6 +296,28 @@ case "${1:-help}" in
     fi
     ;;
 
+  test-untitled-pyproject)
+    # Test untitled notebook with pyproject.toml detection via --cwd
+    cd "$PROJECT_ROOT"
+    require_binary
+    $0 stop 2>/dev/null || true
+    sleep 1
+    start_daemon
+
+    # Use --cwd to set the working directory for untitled notebook project file detection
+    FIXTURE_DIR="$PROJECT_ROOT/crates/notebook/fixtures/audit-test/pyproject-project"
+
+    echo "Starting untitled notebook with --cwd $FIXTURE_DIR"
+    RUST_LOG="${RUST_LOG:-info}" "$BINARY" --webdriver-port "$PORT" --cwd "$FIXTURE_DIR" &
+    wait_for_server 30
+    TEST_EXIT=0
+    E2E_SPEC="e2e/specs/untitled-pyproject.spec.js" WEBDRIVER_PORT="$PORT" pnpm exec wdio run e2e/wdio.conf.js || TEST_EXIT=$?
+    # Stop app
+    PIDS=$(lsof -ti :"$PORT" 2>/dev/null || true)
+    [ -n "$PIDS" ] && echo "$PIDS" | xargs kill 2>/dev/null || true
+    exit $TEST_EXIT
+    ;;
+
   help|*)
     echo "Usage: ./e2e/dev.sh <command> [args...]"
     echo ""
@@ -316,6 +338,7 @@ case "${1:-help}" in
     echo "Test:"
     echo "  test [spec|all]    Run E2E tests (requires app already running)"
     echo "  test-fixture <nb> <spec>  Run a fixture test (starts fresh app)"
+    echo "  test-untitled-pyproject   Test untitled notebook with pyproject.toml"
     echo ""
     echo "Debug:"
     echo "  status             Check if WebDriver server is running"
