@@ -198,7 +198,7 @@ impl ServiceManager {
             std::fs::set_permissions(&self.config.binary_path, perms)?;
         }
 
-        // Service config already exists, just restart
+        // Service config already exists, just restart.
         self.start()?;
 
         info!("[service] Upgrade completed successfully");
@@ -368,7 +368,7 @@ impl ServiceManager {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>~/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 </dict>
 </plist>
@@ -440,7 +440,7 @@ Type=simple
 ExecStart={}
 Restart=on-failure
 RestartSec=5
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PATH=~/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -448,13 +448,13 @@ WantedBy=default.target
             self.config.binary_path.display(),
         );
 
-        let service_path = systemd_service_path();
-        if let Some(parent) = service_path.parent() {
+        let service_file_path = systemd_service_path();
+        if let Some(parent) = service_file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(&service_path, service_content)?;
-        info!("[service] Created {:?}", service_path);
+        std::fs::write(&service_file_path, service_content)?;
+        info!("[service] Created {:?}", service_file_path);
 
         // Reload systemd
         std::process::Command::new("systemctl")
