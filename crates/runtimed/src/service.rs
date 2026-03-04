@@ -97,6 +97,9 @@ pub enum ServiceError {
     #[error("Failed to stop service: {0}")]
     StopFailed(String),
 
+    #[error("Failed to install service: {0}")]
+    InstallFailed(String),
+
     #[error("Unsupported platform")]
     UnsupportedPlatform,
 }
@@ -203,7 +206,10 @@ impl ServiceManager {
             std::fs::set_permissions(&self.config.binary_path, perms)?;
         }
 
-        // Service config already exists, just restart.
+        // Recreate service config to apply any template changes (e.g., new env vars)
+        self.create_service_config()?;
+        info!("[service] Updated service config");
+
         self.start()?;
 
         info!("[service] Upgrade completed successfully");
@@ -348,16 +354,25 @@ impl ServiceManager {
     // macOS-specific implementations
     #[cfg(target_os = "macos")]
     fn create_macos_plist(&self) -> ServiceResult<()> {
+        // Get home directory at plist generation time - launchd doesn't expand ~
+        let home = dirs::home_dir().ok_or_else(|| {
+            ServiceError::InstallFailed(
+                "Cannot determine home directory for service install".into(),
+            )
+        })?;
+        let home_str = home.to_string_lossy();
+        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+
         let plist_content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{}</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
+        <string>{binary}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -367,21 +382,26 @@ impl ServiceManager {
         <true/>
     </dict>
     <key>StandardOutPath</key>
-    <string>{}</string>
+    <string>{log}</string>
     <key>StandardErrorPath</key>
-    <string>{}</string>
+    <string>{log}</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+        <key>USER</key>
+        <string>{user}</string>
         <key>PATH</key>
-        <string>~/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>{home}/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 </dict>
 </plist>
 "#,
-            daemon_launchd_label(),
-            self.config.binary_path.display(),
-            self.config.log_path.display(),
-            self.config.log_path.display(),
+            label = daemon_launchd_label(),
+            binary = self.config.binary_path.display(),
+            log = self.config.log_path.display(),
+            home = home_str,
+            user = user,
         );
 
         let plist_path = plist_path();
@@ -436,24 +456,34 @@ impl ServiceManager {
     // Linux-specific implementations
     #[cfg(target_os = "linux")]
     fn create_linux_systemd(&self) -> ServiceResult<()> {
+        // Get home directory at service generation time - systemd doesn't expand ~
+        let home = dirs::home_dir().ok_or_else(|| {
+            ServiceError::InstallFailed(
+                "Cannot determine home directory for service install".into(),
+            )
+        })?;
+        let home_str = home.to_string_lossy();
+
         let service_name = daemon_service_basename();
         let service_content = format!(
             r#"[Unit]
-Description={} - Jupyter Runtime Daemon
+Description={name} - Jupyter Runtime Daemon
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={}
+ExecStart={binary}
 Restart=on-failure
 RestartSec=5
-Environment=PATH=~/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME={home}
+Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
 "#,
-            service_name,
-            self.config.binary_path.display(),
+            name = service_name,
+            binary = self.config.binary_path.display(),
+            home = home_str,
         );
 
         let service_file_path = systemd_service_path();
@@ -646,5 +676,48 @@ mod tests {
         let manager = ServiceManager::default();
         // Just verify it doesn't panic
         let _ = manager.is_installed();
+    }
+
+    /// Verify the macOS plist template includes HOME env var (prevents startup failures)
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_plist_template_contains_home_env() {
+        // Verify that dirs::home_dir() returns Some (prerequisite for the template)
+        assert!(
+            dirs::home_dir().is_some(),
+            "HOME must be available for plist generation"
+        );
+
+        // Check the actual plist file if it exists (from a previous install)
+        let plist_path = plist_path();
+        if plist_path.exists() {
+            let content = std::fs::read_to_string(&plist_path).unwrap();
+            assert!(
+                content.contains("<key>HOME</key>"),
+                "Installed plist should contain HOME env var. \
+                 If this fails, run 'runt daemon doctor --fix' to update the plist."
+            );
+        }
+    }
+
+    /// Verify the Linux systemd template includes HOME env var
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_template_contains_home_env() {
+        // Verify that dirs::home_dir() returns Some (prerequisite for the template)
+        assert!(
+            dirs::home_dir().is_some(),
+            "HOME must be available for systemd service generation"
+        );
+
+        // Check the actual service file if it exists
+        let service_path = systemd_service_path();
+        if service_path.exists() {
+            let content = std::fs::read_to_string(&service_path).unwrap();
+            assert!(
+                content.contains("Environment=HOME="),
+                "Installed systemd service should contain HOME env var"
+            );
+        }
     }
 }
