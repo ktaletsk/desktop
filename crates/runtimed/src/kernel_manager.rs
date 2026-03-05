@@ -1844,9 +1844,33 @@ impl RoomKernel {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No kernel running"))?;
 
-        // Create history request
+        // Create history request.
+        // IPython's history search uses fnmatch (glob) matching, so we need to:
+        // 1. Escape any glob metacharacters in the user's search term
+        // 2. Wrap with *...* for substring matching
+        // Without this, a search for "for" would only match entries exactly equal
+        // to "for", not entries containing "for".
+        let glob_pattern = match pattern {
+            Some(ref p) if !p.is_empty() => {
+                let mut escaped = String::with_capacity(p.len() + 2);
+                escaped.push('*');
+                for c in p.chars() {
+                    match c {
+                        '*' | '?' | '[' | ']' => {
+                            escaped.push('[');
+                            escaped.push(c);
+                            escaped.push(']');
+                        }
+                        _ => escaped.push(c),
+                    }
+                }
+                escaped.push('*');
+                escaped
+            }
+            _ => "*".to_string(),
+        };
         let request = HistoryRequest::Search {
-            pattern: pattern.unwrap_or_else(|| "*".to_string()),
+            pattern: glob_pattern,
             unique,
             output: false,
             raw: true,
