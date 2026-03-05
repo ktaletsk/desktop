@@ -475,6 +475,7 @@ export function NotebookToolbar({
               users={peers.map((p) => ({
                 id: p.peer_id,
                 name: p.user.name,
+                icon: p.user.icon,
                 color: p.user.color,
               }))}
               size="sm"

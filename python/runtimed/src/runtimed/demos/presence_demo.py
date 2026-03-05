@@ -7,10 +7,10 @@ moving the cursor between cells. Run this while you have a notebook open
 in the nteract desktop app to see the presence indicator appear.
 
 Usage:
-    # Connect to a notebook by path (matches what's open in the app)
-    python -m runtimed.demos.presence_demo /path/to/notebook.ipynb
+    # Connect to a notebook by filename (uses just the name, e.g., "notebook.ipynb")
+    python -m runtimed.demos.presence_demo notebook.ipynb
 
-    # Connect to a virtual notebook room by ID
+    # Connect to a notebook room by explicit ID
     python -m runtimed.demos.presence_demo --notebook-id my-session
 
     # Customize the agent identity
@@ -20,11 +20,12 @@ Usage:
         --color "#7c3aed"
 
 Requirements:
-    - The daemon must be running (cargo xtask dev-daemon)
-    - For path-based connection, the notebook must be open in the app
+    - The daemon must be running (cargo xtask dev-daemon for worktree mode)
+    - The notebook must be open in the app (the demo connects by filename)
 """
 
 import argparse
+import os
 import random
 import sys
 import time
@@ -102,9 +103,10 @@ def main():
     if args.notebook_id:
         notebook_id = args.notebook_id
     elif args.notebook:
-        # Use the full path as the notebook ID (matches how the app connects)
-        notebook_path = Path(args.notebook).resolve()
-        notebook_id = str(notebook_path)
+        # Use just the filename - this matches how the app identifies notebooks
+        # The app uses the filename (e.g., "mine.ipynb") not the full path
+        notebook_path = Path(args.notebook)
+        notebook_id = notebook_path.name
     else:
         print("Error: Provide a notebook path or --notebook-id", file=sys.stderr)
         parser.print_help()
@@ -122,12 +124,27 @@ def main():
         if args.color:
             color = args.color
 
+    # Show daemon connection info
+    workspace_path = os.environ.get("RUNTIMED_WORKSPACE_PATH")
+    workspace_name = os.environ.get("RUNTIMED_WORKSPACE_NAME")
+    is_dev = os.environ.get("RUNTIMED_DEV") == "1" or workspace_path is not None
+
     print(f"Presence Demo")
-    print(f"  Notebook: {notebook_id}")
+    print(f"  Notebook ID: {notebook_id}")
     print(f"  Identity: {name} ({icon})")
     print(f"  Color: {color}")
     print(f"  Interval: {args.interval}s")
     print(f"  Duration: {args.duration}s")
+    print()
+    print(f"Daemon Connection:")
+    if is_dev:
+        print(f"  Mode: dev (worktree)")
+        if workspace_name:
+            print(f"  Workspace: {workspace_name}")
+        if workspace_path:
+            print(f"  Path: {workspace_path}")
+    else:
+        print(f"  Mode: system")
     print()
 
     try:
