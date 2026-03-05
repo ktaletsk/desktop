@@ -23,6 +23,7 @@ import { GlobalFindBar } from "./components/GlobalFindBar";
 import { NotebookToolbar } from "./components/NotebookToolbar";
 import { NotebookView } from "./components/NotebookView";
 import { TrustDialog } from "./components/TrustDialog";
+import { UntrustedBanner } from "./components/UntrustedBanner";
 import { useCondaDependencies } from "./hooks/useCondaDependencies";
 import { useDaemonKernel } from "./hooks/useDaemonKernel";
 import { useDenoDependencies } from "./hooks/useDenoDependencies";
@@ -133,6 +134,7 @@ function AppContent() {
     trustInfo,
     typosquatWarnings,
     loading: trustLoading,
+    needsApproval,
     checkTrust,
     approveTrust,
   } = useTrust();
@@ -527,9 +529,11 @@ function AppContent() {
     const success = await approveTrust();
     if (success && pendingKernelStartRef.current) {
       pendingKernelStartRef.current = false;
-      // Now start the kernel since trust was approved
+      // Fire and forget - dialog closes immediately, kernel starts in background
       // Use "auto" for both - daemon detects from Automerge doc
-      await launchKernel("auto", "auto");
+      launchKernel("auto", "auto").catch((e) => {
+        logger.error("[App] kernel launch after trust approval failed:", e);
+      });
     }
     return success;
   }, [approveTrust, launchKernel]);
@@ -905,6 +909,14 @@ function AppContent() {
             });
         }}
       />
+      {needsApproval && kernelStatus === KERNEL_STATUS.NOT_STARTED && (
+        <UntrustedBanner
+          onReviewClick={() => {
+            pendingKernelStartRef.current = true;
+            setTrustDialogOpen(true);
+          }}
+        />
+      )}
       <NotebookToolbar
         kernelStatus={kernelStatus}
         envSource={envSource}
