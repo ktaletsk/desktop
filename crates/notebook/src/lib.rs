@@ -419,9 +419,29 @@ async fn initialize_notebook_sync(
                 warn!("[notebook-sync] Failed to emit notebook:updated: {}", e);
             }
 
-            // Sync cells to NotebookState (for save-to-disk and delete_cell operations)
+            // Sync cells to NotebookState (for save-to-disk and delete_cell operations).
+            // Filter out cells with in-flight deletes to prevent re-adding them when
+            // another peer (e.g. a Python binding) triggers an update before our
+            // delete has round-tripped through Automerge.
             if let Ok(mut state) = notebook_state_for_receiver.lock() {
-                state.notebook.cells = update.cells.iter().map(cell_snapshot_to_nbformat).collect();
+                let incoming_ids: std::collections::HashSet<&str> =
+                    update.cells.iter().map(|c| c.id.as_str()).collect();
+                // Clear pending IDs that automerge has already processed
+                state
+                    .pending_deletes
+                    .retain(|id| incoming_ids.contains(id.as_str()));
+
+                if state.pending_deletes.is_empty() {
+                    state.notebook.cells =
+                        update.cells.iter().map(cell_snapshot_to_nbformat).collect();
+                } else {
+                    state.notebook.cells = update
+                        .cells
+                        .iter()
+                        .filter(|c| !state.pending_deletes.contains(&c.id))
+                        .map(cell_snapshot_to_nbformat)
+                        .collect();
+                }
                 info!(
                     "[notebook-sync] Updated local state with {} cells from peer",
                     state.notebook.cells.len()
@@ -1607,6 +1627,11 @@ async fn delete_cell(
     if let Some(handle) = notebook_sync.lock().await.as_ref() {
         if let Err(e) = handle.delete_cell(&cell_id).await {
             warn!("[notebook-sync] delete_cell failed: {}", e);
+            // Sync failed — remove from pending set so future Automerge updates
+            // can restore the cell (it still exists in the Automerge doc).
+            if let Ok(mut s) = state.lock() {
+                s.pending_deletes.remove(&cell_id);
+            }
         }
     }
 

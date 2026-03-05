@@ -4,7 +4,7 @@ import {
   open as openDialog,
   save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { logger } from "../lib/logger";
 import type { JupyterOutput, NotebookCell } from "../types";
 
@@ -287,6 +287,9 @@ export function useNotebook() {
   const [focusedCellId, setFocusedCellId] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const outputCacheRef = useRef<Map<string, JupyterOutput>>(new Map());
+  // Track cell IDs with in-flight deletes so that incoming Automerge updates
+  // (which may not yet reflect the delete) don't resurrect them in the UI.
+  const pendingDeletesRef = useRef<Set<string>>(new Set());
   // Store blob port promise so event handlers can await it
   const blobPortPromiseRef = useRef<Promise<number | null> | null>(null);
 
@@ -396,6 +399,27 @@ export function useNotebook() {
         // Trust Automerge as source of truth for outputs.
         // The daemon writes outputs to Automerge before broadcasting,
         // so Automerge always has the canonical output state.
+        //
+        // Filter out cells with in-flight deletes. When another peer (e.g. a
+        // Python binding) triggers an Automerge update before our delete has
+        // round-tripped, the update would still contain the deleted cell and
+        // resurrect it in the UI. We keep filtering until the delete has
+        // propagated (cell no longer present in the update).
+        const pending = pendingDeletesRef.current;
+        if (pending.size > 0) {
+          // Clear pending IDs that automerge has already processed (no longer in update)
+          const incomingIds = new Set(newCells.map((c) => c.id));
+          for (const id of pending) {
+            if (!incomingIds.has(id)) {
+              pending.delete(id);
+            }
+          }
+          // Filter remaining pending deletes from the incoming cells
+          if (pending.size > 0) {
+            setCells(newCells.filter((c) => !pending.has(c.id)));
+            return;
+          }
+        }
         setCells(newCells);
       },
     );
@@ -476,10 +500,15 @@ export function useNotebook() {
 
   const deleteCell = useCallback(async (cellId: string) => {
     try {
+      // Mark as pending before the async invoke so that any Automerge
+      // updates arriving mid-delete won't resurrect this cell in the UI.
+      pendingDeletesRef.current.add(cellId);
       await invoke("delete_cell", { cellId });
       setCells((prev) => prev.filter((c) => c.id !== cellId));
       setDirty(true);
     } catch (e) {
+      // Delete failed — remove from pending set so future updates include it
+      pendingDeletesRef.current.delete(cellId);
       logger.error("[notebook] Delete cell failed:", e);
     }
   }, []);

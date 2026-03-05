@@ -3,7 +3,7 @@ use crate::settings::{self, PythonEnvType};
 use log::info;
 use nbformat::v4::{Cell, CellId, CellMetadata, Notebook, Output};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -155,6 +155,11 @@ pub struct NotebookState {
     /// Working directory for untitled notebooks (used for project file detection).
     /// Set from --cwd CLI argument and preserved across daemon reconnects.
     pub working_dir: Option<PathBuf>,
+    /// Cell IDs with in-flight deletes that haven't round-tripped through Automerge yet.
+    /// Used to prevent the receiver loop from re-adding deleted cells when another
+    /// peer (e.g. a Python binding) triggers an Automerge update before the delete
+    /// has propagated.
+    pub pending_deletes: HashSet<String>,
 }
 
 impl NotebookState {
@@ -220,6 +225,7 @@ impl NotebookState {
             path: None,
             dirty: false,
             working_dir: None,
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -324,6 +330,7 @@ impl NotebookState {
             path: None,
             dirty: false,
             working_dir: None,
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -384,6 +391,7 @@ impl NotebookState {
             path: None,
             dirty: false,
             working_dir: None,
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -436,6 +444,7 @@ impl NotebookState {
             path: None,
             dirty: false,
             working_dir: None,
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -445,6 +454,7 @@ impl NotebookState {
             path: Some(path),
             dirty: false,
             working_dir: None, // Saved notebooks use path for project detection
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -590,6 +600,7 @@ impl NotebookState {
         }
         if let Some(idx) = self.find_cell_index(cell_id) {
             self.notebook.cells.remove(idx);
+            self.pending_deletes.insert(cell_id.to_string());
             self.dirty = true;
             true
         } else {
