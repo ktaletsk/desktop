@@ -498,19 +498,28 @@ export function useNotebook() {
     [],
   );
 
-  const deleteCell = useCallback(async (cellId: string) => {
-    try {
-      // Mark as pending before the async invoke so that any Automerge
-      // updates arriving mid-delete won't resurrect this cell in the UI.
-      pendingDeletesRef.current.add(cellId);
-      await invoke("delete_cell", { cellId });
-      setCells((prev) => prev.filter((c) => c.id !== cellId));
-      setDirty(true);
-    } catch (e) {
-      // Delete failed — remove from pending set so future updates include it
+  const deleteCell = useCallback((cellId: string) => {
+    // Local-first: update UI immediately, sync to daemon in background.
+    // This avoids the race where an Automerge update from another peer
+    // (e.g. Python binding) arrives mid-round-trip and resurrects the cell.
+    pendingDeletesRef.current.add(cellId);
+    setCells((prev) => {
+      if (prev.length <= 1) {
+        // Can't delete the last cell — undo the pending mark
+        pendingDeletesRef.current.delete(cellId);
+        return prev;
+      }
+      return prev.filter((c) => c.id !== cellId);
+    });
+    setDirty(true);
+
+    // Fire-and-forget: sync deletion to backend → daemon Automerge doc
+    invoke("delete_cell", { cellId }).catch((e) => {
+      // Sync failed — clear pending flag and restore from canonical state
       pendingDeletesRef.current.delete(cellId);
-      logger.error("[notebook] Delete cell failed:", e);
-    }
+      logger.error("[notebook] delete_cell sync failed:", e);
+      invoke("refresh_from_automerge").catch(() => {});
+    });
   }, []);
 
   const save = useCallback(async () => {
