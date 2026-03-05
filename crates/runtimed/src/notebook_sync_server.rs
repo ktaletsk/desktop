@@ -2130,10 +2130,16 @@ async fn handle_notebook_request(
             }
         }
 
-        NotebookRequest::SaveNotebook { format_cells: _ } => {
-            // TODO: format_cells support (requires ruff/deno formatter access)
-            match save_notebook_to_disk(room).await {
-                Ok(()) => NotebookResponse::NotebookSaved {},
+        NotebookRequest::SaveNotebook { format_cells, path } => {
+            // Format cells if requested (before saving)
+            if format_cells {
+                if let Err(e) = format_notebook_cells(room).await {
+                    warn!("[save] Format cells failed (continuing with save): {}", e);
+                }
+            }
+
+            match save_notebook_to_disk(room, path.as_deref()).await {
+                Ok(saved_path) => NotebookResponse::NotebookSaved { path: saved_path },
                 Err(e) => NotebookResponse::Error {
                     error: format!("Failed to save notebook: {e}"),
                 },
@@ -2343,19 +2349,195 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
     }
 }
 
+/// Format all code cells in a notebook using ruff (Python) or deno fmt (Deno).
+///
+/// Reads the runtime type from the notebook metadata and formats accordingly.
+/// Updates the Automerge doc with formatted sources and broadcasts changes.
+/// Formatting errors are logged but don't fail the operation (best-effort).
+async fn format_notebook_cells(room: &NotebookRoom) -> Result<usize, String> {
+    use kernel_launch::tools;
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    // Get runtime type from metadata - only format for known runtimes (Python/Deno)
+    let metadata_json = {
+        let doc = room.doc.read().await;
+        doc.get_metadata(NOTEBOOK_METADATA_KEY)
+    };
+
+    let runtime = metadata_json
+        .as_ref()
+        .and_then(|json| serde_json::from_str::<NotebookMetadataSnapshot>(json).ok())
+        .and_then(|snapshot| detect_notebook_kernel_type(&snapshot));
+
+    // Skip formatting for unknown kernelspec to avoid incorrectly reformatting non-Python/Deno notebooks
+    let runtime = match runtime {
+        Some(rt) => rt,
+        None => {
+            info!("[format] Skipping format: unknown kernelspec (no formatter available)");
+            return Ok(0);
+        }
+    };
+
+    // Get all code cells
+    let cells: Vec<(String, String)> = {
+        let doc = room.doc.read().await;
+        doc.get_cells()
+            .into_iter()
+            .filter(|cell| cell.cell_type == "code" && !cell.source.trim().is_empty())
+            .map(|cell| (cell.id, cell.source))
+            .collect()
+    };
+
+    if cells.is_empty() {
+        return Ok(0);
+    }
+
+    let mut formatted_count = 0;
+
+    for (cell_id, source) in cells {
+        let format_result = match runtime.as_str() {
+            "python" => {
+                // Format with ruff
+                match tools::get_ruff_path().await {
+                    Ok(ruff_path) => {
+                        let mut child = match tokio::process::Command::new(&ruff_path)
+                            .args(["format", "--stdin-filename", "cell.py", "-"])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("[format] Failed to spawn ruff: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Some(mut stdin) = child.stdin.take() {
+                            if stdin.write_all(source.as_bytes()).await.is_err() {
+                                continue;
+                            }
+                        }
+
+                        match child.wait_with_output().await {
+                            Ok(output) if output.status.success() => {
+                                String::from_utf8(output.stdout).ok()
+                            }
+                            _ => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            "deno" => {
+                // Format with deno fmt
+                match tools::get_deno_path().await {
+                    Ok(deno_path) => {
+                        let mut child = match tokio::process::Command::new(&deno_path)
+                            .args(["fmt", "--ext=ts", "-"])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("[format] Failed to spawn deno fmt: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Some(mut stdin) = child.stdin.take() {
+                            if stdin.write_all(source.as_bytes()).await.is_err() {
+                                continue;
+                            }
+                        }
+
+                        match child.wait_with_output().await {
+                            Ok(output) if output.status.success() => {
+                                String::from_utf8(output.stdout).ok()
+                            }
+                            _ => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(formatted) = format_result {
+            // Strip trailing newline (formatters always add one, but cells shouldn't have it)
+            let formatted = formatted.strip_suffix('\n').unwrap_or(&formatted);
+
+            if formatted != source {
+                // Update Automerge doc
+                let mut doc = room.doc.write().await;
+                if doc.update_source(&cell_id, formatted).is_ok() {
+                    formatted_count += 1;
+                }
+            }
+        }
+    }
+
+    // Broadcast changes to connected peers if any cells were formatted
+    if formatted_count > 0 {
+        let _ = room.changed_tx.send(());
+        info!(
+            "[format] Formatted {} code cells (runtime: {})",
+            formatted_count, runtime
+        );
+    }
+
+    Ok(formatted_count)
+}
+
 /// Save the notebook from the Automerge doc to disk as .ipynb.
+///
+/// If `target_path` is Some, saves to that path (with .ipynb appended if needed).
+/// If `target_path` is None, saves to `room.notebook_path` (original file location).
 ///
 /// 1. Read existing .ipynb from disk (if it exists) to preserve unknown metadata
 /// 2. Read cells and metadata from the Automerge doc
 /// 3. Merge metadata: replace kernelspec, language_info, runt; preserve everything else
 /// 4. Reconstruct cells: source and outputs from Automerge, cell metadata from existing file
 /// 5. Write the merged notebook to disk
-async fn save_notebook_to_disk(room: &NotebookRoom) -> Result<(), String> {
-    let notebook_path = &room.notebook_path;
+///
+/// Returns the absolute path where the notebook was written.
+async fn save_notebook_to_disk(
+    room: &NotebookRoom,
+    target_path: Option<&str>,
+) -> Result<String, String> {
+    // Determine the actual save path
+    let notebook_path = match target_path {
+        Some(p) => {
+            let path = PathBuf::from(p);
+
+            // Reject relative paths - daemon CWD is unpredictable (could be / when running as launchd)
+            // Clients (Tauri file dialog, Python SDK) should always provide absolute paths.
+            if path.is_relative() {
+                return Err(format!(
+                    "Relative paths are not supported for save: '{}'. Please provide an absolute path.",
+                    p
+                ));
+            }
+
+            // Ensure .ipynb extension
+            if p.ends_with(".ipynb") {
+                path
+            } else {
+                PathBuf::from(format!("{}.ipynb", p))
+            }
+        }
+        None => room.notebook_path.clone(),
+    };
 
     // Read existing .ipynb to preserve unknown metadata and cell metadata
     // Distinguish between file-not-found (ok, create new) and parse errors (warn, continue)
-    let existing: Option<serde_json::Value> = match tokio::fs::read_to_string(notebook_path).await {
+    let existing: Option<serde_json::Value> = match tokio::fs::read_to_string(&notebook_path).await
+    {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(value) => Some(value),
             Err(e) => {
@@ -2493,7 +2675,7 @@ async fn save_notebook_to_disk(room: &NotebookRoom) -> Result<(), String> {
     let content_with_newline = format!("{content}\n");
 
     // Write to disk (async to avoid blocking the runtime)
-    tokio::fs::write(notebook_path, content_with_newline)
+    tokio::fs::write(&notebook_path, content_with_newline)
         .await
         .map_err(|e| format!("Failed to write notebook: {e}"))?;
 
@@ -2509,7 +2691,7 @@ async fn save_notebook_to_disk(room: &NotebookRoom) -> Result<(), String> {
         notebook_path, cell_count
     );
 
-    Ok(())
+    Ok(notebook_path.to_string_lossy().to_string())
 }
 
 /// Resolve a single cell output — handles both manifest hashes and raw JSON.
@@ -3269,6 +3451,8 @@ mod tests {
                 }),
                 conda: None,
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         }
     }
@@ -3288,6 +3472,8 @@ mod tests {
                     python: None,
                 }),
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         }
     }
@@ -3303,6 +3489,8 @@ mod tests {
                 uv: None,
                 conda: None,
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         }
     }
@@ -3354,6 +3542,8 @@ mod tests {
                     python: None,
                 }),
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         };
         assert_eq!(check_inline_deps(&snapshot), Some("uv:inline".to_string()));
@@ -3379,6 +3569,8 @@ mod tests {
                     config: None,
                     flexible_npm_imports: None,
                 }),
+                trust_signature: None,
+                trust_timestamp: None,
             },
         };
         assert_eq!(check_inline_deps(&snapshot), Some("deno".to_string()));
@@ -3402,6 +3594,8 @@ mod tests {
                 uv: None,
                 conda: None,
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         };
         assert_eq!(
@@ -3426,6 +3620,8 @@ mod tests {
                 uv: None,
                 conda: None,
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         };
         assert_eq!(
@@ -3450,6 +3646,8 @@ mod tests {
                 uv: None,
                 conda: None,
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         };
         assert_eq!(
@@ -3477,6 +3675,8 @@ mod tests {
                 uv: None,
                 conda: None,
                 deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
             },
         };
         assert_eq!(
@@ -3548,7 +3748,7 @@ mod tests {
         }
 
         // Save to disk
-        save_notebook_to_disk(&room).await.unwrap();
+        save_notebook_to_disk(&room, None).await.unwrap();
 
         // Read and validate with nbformat
         let content = std::fs::read_to_string(&notebook_path).unwrap();
@@ -3595,7 +3795,7 @@ mod tests {
             doc.update_source("cell1", "x = 1").unwrap();
         }
 
-        save_notebook_to_disk(&room).await.unwrap();
+        save_notebook_to_disk(&room, None).await.unwrap();
 
         // Verify unknown metadata is preserved
         let content = std::fs::read_to_string(&notebook_path).unwrap();
@@ -3654,7 +3854,7 @@ mod tests {
             doc.add_cell(0, "cell-with-id", "code").unwrap();
         }
 
-        save_notebook_to_disk(&room).await.unwrap();
+        save_notebook_to_disk(&room, None).await.unwrap();
 
         // Verify nbformat_minor is upgraded to 5
         let content = std::fs::read_to_string(&notebook_path).unwrap();
@@ -3683,7 +3883,7 @@ mod tests {
             doc.set_execution_count("cell1", "1").unwrap();
         }
 
-        save_notebook_to_disk(&room).await.unwrap();
+        save_notebook_to_disk(&room, None).await.unwrap();
 
         // Read and validate
         let content = std::fs::read_to_string(&notebook_path).unwrap();
@@ -3993,5 +4193,107 @@ mod tests {
             new_cell.outputs,
             vec![r#"{"output_type":"execute_result"}"#]
         );
+    }
+
+    #[tokio::test]
+    async fn test_save_notebook_to_disk_with_target_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _original_path) = test_room_with_path(&tmp, "original.ipynb");
+
+        // Add a cell
+        {
+            let mut doc = room.doc.write().await;
+            doc.add_cell(0, "cell1", "code").unwrap();
+            doc.update_source("cell1", "x = 1").unwrap();
+        }
+
+        // Save to a different absolute path
+        let new_path = tmp.path().join("new_location.ipynb");
+        let result = save_notebook_to_disk(&room, Some(new_path.to_str().unwrap())).await;
+
+        assert!(result.is_ok());
+        let saved_path = result.unwrap();
+        assert_eq!(saved_path, new_path.to_string_lossy());
+        assert!(new_path.exists(), "File should be created at new path");
+
+        // Verify content
+        let content = std::fs::read_to_string(&new_path).unwrap();
+        let notebook: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(notebook["cells"][0]["source"], serde_json::json!(["x = 1"]));
+    }
+
+    #[tokio::test]
+    async fn test_save_notebook_to_disk_appends_ipynb_extension() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _original_path) = test_room_with_path(&tmp, "original.ipynb");
+
+        // Add a cell
+        {
+            let mut doc = room.doc.write().await;
+            doc.add_cell(0, "cell1", "code").unwrap();
+        }
+
+        // Save to path without .ipynb extension
+        let base_path = tmp.path().join("no_extension");
+        let result = save_notebook_to_disk(&room, Some(base_path.to_str().unwrap())).await;
+
+        assert!(result.is_ok());
+        let saved_path = result.unwrap();
+        assert!(
+            saved_path.ends_with(".ipynb"),
+            "Saved path should have .ipynb extension"
+        );
+
+        let expected_path = tmp.path().join("no_extension.ipynb");
+        assert!(
+            expected_path.exists(),
+            "File should exist with .ipynb extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_notebook_to_disk_rejects_relative_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _original_path) = test_room_with_path(&tmp, "original.ipynb");
+
+        // Try to save with a relative path
+        let result = save_notebook_to_disk(&room, Some("relative/path.ipynb")).await;
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Relative paths are not supported"),
+            "Error should mention relative paths: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_format_notebook_cells_skips_unknown_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (room, _notebook_path) = test_room_with_path(&tmp, "unknown_runtime.ipynb");
+
+        // Add a code cell (no kernelspec metadata set = unknown runtime)
+        {
+            let mut doc = room.doc.write().await;
+            doc.add_cell(0, "cell1", "code").unwrap();
+            doc.update_source("cell1", "x=1").unwrap(); // Would be formatted if Python
+        }
+
+        // Run format - should skip (return 0) since no kernelspec
+        let result = format_notebook_cells(&room).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "Should format 0 cells for unknown runtime"
+        );
+
+        // Source should be unchanged
+        let cells = {
+            let doc = room.doc.read().await;
+            doc.get_cells()
+        };
+        assert_eq!(cells[0].source, "x=1", "Source should remain unchanged");
     }
 }

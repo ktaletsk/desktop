@@ -425,6 +425,8 @@ fn default_metadata_snapshot() -> runtimed::notebook_metadata::NotebookMetadataS
             uv: None,
             conda: None,
             deno: None,
+            trust_signature: None,
+            trust_timestamp: None,
         },
     }
 }
@@ -1268,8 +1270,10 @@ async fn get_notebook_path(
 /// Format all code cells in the notebook and save.
 /// Formatting is best-effort - cells that fail to format are saved as-is.
 ///
-/// Save path: daemon writes .ipynb to disk (merging synced metadata with
-/// existing file content). Falls back to local save if daemon is unavailable.
+/// The daemon handles both formatting and disk persistence:
+/// - Formats code cells using ruff (Python) or deno fmt (Deno)
+/// - Updates the Automerge doc with formatted sources (synced to all clients)
+/// - Writes the .ipynb file to disk
 #[tauri::command]
 async fn save_notebook(
     window: tauri::Window,
@@ -1277,121 +1281,39 @@ async fn save_notebook(
 ) -> Result<(), String> {
     let state = notebook_state_for_window(&window, registry.inner())?;
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
-    // First pass: collect cells to format (release lock for async formatting)
-    let (runtime, cells_to_format, path) = {
+
+    // Verify we have a path - daemon will use the room's notebook_path
+    {
         let nb = state.lock().map_err(|e| e.to_string())?;
-        let path = nb
-            .path
-            .clone()
-            .ok_or_else(|| "No file path set - use save_notebook_as".to_string())?;
-        let rt = nb.get_runtime();
-
-        // Collect all code cells with their sources
-        let cells: Vec<(String, String)> = nb
-            .notebook
-            .cells
-            .iter()
-            .filter_map(|cell| {
-                if let nbformat::v4::Cell::Code { id, source, .. } = cell {
-                    let src = source.join("");
-                    if !src.trim().is_empty() {
-                        return Some((id.to_string(), src));
-                    }
-                }
-                None
-            })
-            .collect();
-
-        (rt, cells, path)
-    };
-
-    // Format each cell (async, outside the lock)
-    for (cell_id, source) in cells_to_format {
-        let format_result = match runtime {
-            Runtime::Python => format::format_python(&source).await,
-            Runtime::Deno => format::format_deno(&source, "typescript").await,
-            Runtime::Other(_) => Err(anyhow::anyhow!("No formatter for unknown runtime")),
-        };
-
-        if let Ok(result) = format_result {
-            let cell_source = result.source_for_cell();
-            if cell_source != source {
-                // Update notebook state with formatted code
-                {
-                    let mut nb = state.lock().map_err(|e| e.to_string())?;
-                    nb.update_cell_source(&cell_id, cell_source);
-                }
-                // Emit event to sync frontend
-                let _ = emit_to_label::<_, _, _>(
-                    &window,
-                    window.label(),
-                    "cell:source_updated",
-                    serde_json::json!({
-                        "cell_id": cell_id,
-                        "source": cell_source,
-                    }),
-                );
-            }
+        if nb.path.is_none() {
+            return Err("No file path set - use save_notebook_as".to_string());
         }
-        // Formatting errors are silently ignored - save with original code
     }
 
-    // Try daemon save first (daemon merges metadata + cells from Automerge doc)
-    // Clone handle out of the mutex to avoid holding lock across await
+    // Save via daemon - daemon handles formatting and disk write
+    // Formatted sources are synced back via Automerge
     let sync_handle = notebook_sync.lock().await.clone();
-    let daemon_saved = if let Some(ref handle) = sync_handle {
-        match handle
-            .send_request(NotebookRequest::SaveNotebook {
-                format_cells: false, // Already formatted above
-            })
-            .await
-        {
-            Ok(NotebookResponse::NotebookSaved {}) => {
-                info!("[save] Notebook saved via daemon");
-                true
-            }
-            Ok(NotebookResponse::Error { error }) => {
-                warn!(
-                    "[save] Daemon save failed: {}, falling back to local",
-                    error
-                );
-                false
-            }
-            Ok(_) => {
-                warn!("[save] Unexpected daemon response, falling back to local");
-                false
-            }
-            Err(e) => {
-                warn!("[save] Daemon request failed: {}, falling back to local", e);
-                false
-            }
-        }
-    } else {
-        false
-    };
+    let handle = sync_handle.ok_or("Not connected to daemon")?;
 
-    // Fallback: save locally if daemon save didn't work
-    if !daemon_saved {
-        // Refresh NotebookState from Automerge before serializing — the receiver
-        // loop sync-back was removed, so NotebookState cells/metadata may be stale.
-        if let Some(ref handle) = sync_handle {
-            if let Ok(cells) = handle.get_cells().await {
-                if let Ok(mut nb) = state.lock() {
-                    nb.notebook.cells = cells.iter().map(cell_snapshot_to_nbformat).collect();
-                }
-            }
-            if let Some(snapshot) = get_metadata_snapshot(handle).await {
-                if let Ok(mut nb) = state.lock() {
-                    notebook_state::merge_snapshot_into_nbformat(
-                        &snapshot,
-                        &mut nb.notebook.metadata,
-                    );
-                }
-            }
+    match handle
+        .send_request(NotebookRequest::SaveNotebook {
+            format_cells: true, // Daemon formats cells before saving
+            path: None,         // Use room's notebook_path
+        })
+        .await
+    {
+        Ok(NotebookResponse::NotebookSaved { path }) => {
+            info!("[save] Notebook saved via daemon to: {}", path);
         }
-        let nb = state.lock().map_err(|e| e.to_string())?;
-        let content = nb.serialize()?;
-        std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+        Ok(NotebookResponse::Error { error }) => {
+            return Err(format!("Daemon save failed: {}", error));
+        }
+        Ok(other) => {
+            return Err(format!("Unexpected daemon response: {:?}", other));
+        }
+        Err(e) => {
+            return Err(format!("Daemon request failed: {}", e));
+        }
     }
 
     // Mark as clean
@@ -1403,9 +1325,14 @@ async fn save_notebook(
 }
 
 /// Save notebook to a specific path (Save As).
-/// Formats all code cells before saving.
-// TODO(automerge-metadata): Same as save_notebook — delegate disk write to the
-// daemon via Automerge sync once the daemon owns persistence.
+///
+/// The daemon handles both formatting and disk persistence:
+/// - Formats code cells using ruff (Python) or deno fmt (Deno)
+/// - Updates the Automerge doc with formatted sources (synced to all clients)
+/// - Writes the .ipynb file to the specified path
+///
+/// Uses the daemon-returned path (which may have .ipynb appended) as the
+/// canonical path for window title, state, and room reconnection.
 #[tauri::command]
 async fn save_notebook_as(
     path: String,
@@ -1415,103 +1342,51 @@ async fn save_notebook_as(
     let state = notebook_state_for_window(&window, registry.inner())?;
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
     let sync_generation = sync_generation_for_window(&window, registry.inner())?;
-    let save_path = PathBuf::from(&path);
 
-    // First pass: collect cells to format (release lock for async formatting)
-    let (runtime, cells_to_format) = {
-        let nb = state.lock().map_err(|e| e.to_string())?;
-        let rt = nb.get_runtime();
+    // Save via daemon to the new path - daemon handles formatting and disk write
+    let sync_handle = notebook_sync.lock().await.clone();
+    let handle = sync_handle.ok_or("Not connected to daemon")?;
 
-        // Collect all code cells with their sources
-        let cells: Vec<(String, String)> = nb
-            .notebook
-            .cells
-            .iter()
-            .filter_map(|cell| {
-                if let nbformat::v4::Cell::Code { id, source, .. } = cell {
-                    let src = source.join("");
-                    if !src.trim().is_empty() {
-                        return Some((id.to_string(), src));
-                    }
-                }
-                None
-            })
-            .collect();
-
-        (rt, cells)
+    // Use daemon-returned path (may have .ipynb appended or be normalized)
+    let saved_path = match handle
+        .send_request(NotebookRequest::SaveNotebook {
+            format_cells: true, // Daemon formats cells before saving
+            path: Some(path),
+        })
+        .await
+    {
+        Ok(NotebookResponse::NotebookSaved { path: daemon_path }) => {
+            info!("[save-as] Notebook saved via daemon to: {}", daemon_path);
+            PathBuf::from(daemon_path)
+        }
+        Ok(NotebookResponse::Error { error }) => {
+            return Err(format!("Daemon save failed: {}", error));
+        }
+        Ok(other) => {
+            return Err(format!("Unexpected daemon response: {:?}", other));
+        }
+        Err(e) => {
+            return Err(format!("Daemon request failed: {}", e));
+        }
     };
 
-    // Format each cell (async, outside the lock)
-    for (cell_id, source) in cells_to_format {
-        let format_result = match runtime {
-            Runtime::Python => format::format_python(&source).await,
-            Runtime::Deno => format::format_deno(&source, "typescript").await,
-            Runtime::Other(_) => Err(anyhow::anyhow!("No formatter for unknown runtime")),
-        };
+    // Update the stored path and window title using daemon-returned path
+    let filename = saved_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Untitled.ipynb");
+    let _ = window.set_title(filename);
 
-        if let Ok(result) = format_result {
-            let cell_source = result.source_for_cell();
-            if cell_source != source {
-                // Update notebook state with formatted code
-                {
-                    let mut nb = state.lock().map_err(|e| e.to_string())?;
-                    nb.update_cell_source(&cell_id, cell_source);
-                }
-                // Emit event to sync frontend
-                let _ = emit_to_label::<_, _, _>(
-                    &window,
-                    window.label(),
-                    "cell:source_updated",
-                    serde_json::json!({
-                        "cell_id": cell_id,
-                        "source": cell_source,
-                    }),
-                );
-            }
-        }
-    }
-
-    // Refresh NotebookState from Automerge before serializing — the receiver
-    // loop sync-back was removed, so NotebookState cells/metadata may be stale.
-    {
-        let sync_handle = notebook_sync.lock().await.clone();
-        if let Some(ref handle) = sync_handle {
-            if let Ok(cells) = handle.get_cells().await {
-                if let Ok(mut nb) = state.lock() {
-                    nb.notebook.cells = cells.iter().map(cell_snapshot_to_nbformat).collect();
-                }
-            }
-            if let Some(snapshot) = get_metadata_snapshot(handle).await {
-                if let Ok(mut nb) = state.lock() {
-                    notebook_state::merge_snapshot_into_nbformat(
-                        &snapshot,
-                        &mut nb.notebook.metadata,
-                    );
-                }
-            }
-        }
-    }
-
-    // Now save
     {
         let mut nb = state.lock().map_err(|e| e.to_string())?;
-        let content = nb.serialize()?;
-        std::fs::write(&save_path, &content).map_err(|e| e.to_string())?;
-
-        // Update the stored path and window title
-        let filename = save_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Untitled.ipynb");
-        let _ = window.set_title(filename);
-
-        nb.path = Some(save_path.clone());
+        nb.path = Some(saved_path.clone());
         nb.dirty = false;
     }
+
     // Keep context.path in sync for non-save consumers
     if let Ok(ctx) = registry.get(window.label()) {
         if let Ok(mut p) = ctx.path.lock() {
-            *p = Some(save_path);
+            *p = Some(saved_path);
         }
     }
     refresh_native_menu(window.app_handle(), registry.inner());
