@@ -7,7 +7,8 @@
 | Phase | Status | Notes |
 |-------|--------|-------|
 | 0: Optimistic mutations | ✅ Done | [PR #542](https://github.com/nteract/desktop/pull/542) merged |
-| 1: Eliminate `NotebookState` | ⬜ Not started | Remove redundant state layer |
+| 1.1–1.3: Eliminate `NotebookState` dual-write | ✅ Done | [PR #544](https://github.com/nteract/desktop/pull/544) merged |
+| 1.4: Delegate save-to-disk to daemon | ⬜ Not started | `save_notebook`/`save_notebook_as` still use `NotebookState` |
 | 2: Frontend Automerge doc | ⬜ Not started | The real architectural shift |
 | 3: Authority boundary hardening | ⬜ Not started | Formalize writer roles per field |
 | 4: Optimize Tauri sync relay | ⬜ Not started | Binary IPC, reduce overhead |
@@ -185,77 +186,71 @@ const addCell = useCallback((cellType, afterCellId?) => {
 
 ---
 
-## Phase 1: Eliminate `NotebookState`
+<details>
+<summary><h2>Phase 1.1–1.3: Eliminate <code>NotebookState</code> dual-write ✅</h2></summary>
 
-**Goal:** Remove the redundant `nbformat::Notebook` struct from the Tauri process. The sync client's `AutoCommit` doc becomes the single source of truth on the app side.
+**Goal:** Remove the redundant `nbformat::Notebook` struct from the Tauri process as a dual-write target. The `NotebookSyncHandle` becomes the single source of truth for all cell and metadata operations.
 
 **Effort:** Medium (1-2 weeks). **Risk:** Medium — many Tauri commands reference `NotebookState`.
 
-### 1.1 — Audit `NotebookState` usage
+### What was done
 
-All Tauri commands that use `NotebookState` need to be redirected to the sync handle:
+All ~25 call sites in `crates/notebook/src/lib.rs` that dual-wrote to both `NotebookState` and the sync handle were migrated:
 
-| Command | Current usage | Migration |
-|---------|--------------|-----------|
-| `update_cell_source` | Writes to both `NotebookState` and sync handle | Sync handle only |
-| `add_cell` | Creates cell in `NotebookState`, syncs to handle | Sync handle only, return `CellSnapshot` |
-| `delete_cell` | Deletes from `NotebookState`, syncs to handle | Sync handle only |
-| `save_notebook` | Reads cells from `NotebookState` | Read from sync handle's `get_cells()` or delegate save to daemon |
-| `format_cell` | Reads/writes source in `NotebookState` | Read from sync handle, write formatted result back |
-| `load_notebook` | Parses `.ipynb` into `NotebookState` | Parse into Automerge doc directly |
-| Various metadata commands | Read/write `NotebookState.notebook.metadata` | Use sync handle's `get_metadata`/`set_metadata` |
+- **Cell mutations** (`update_cell_source`, `add_cell`, `delete_cell`) — sync handle only, no more `NotebookState` write.
+- **Cell reads** (`load_notebook`) — reads from `handle.get_cells()`, falls back to `NotebookState` when daemon disconnected.
+- **Path reads** (`has_notebook_path`, `get_notebook_path`, `detect_pyproject`, `detect_pixi_toml`, `detect_environment_yml`, `detect_deno_config`) — read from new `context.path` field.
+- **All 16 metadata commands** — read/write via sync handle `get_metadata`/`set_metadata`. Read commands fall back to `NotebookState` when disconnected.
+- **Format cell** — reads source from sync handle, writes formatted result back.
+- **Receiver loop sync-back removed** — the block that overwrote `NotebookState` cells/metadata from Automerge on every peer update is gone.
+- **`WindowNotebookContext`** gained `path: Arc<Mutex<Option<PathBuf>>>` and `working_dir: Option<PathBuf>`. `notebook_state` retained for save (Phase 1.4).
 
-- [ ] Route all cell reads through `handle.get_cells()` instead of `state.lock()`
-- [ ] Route all cell writes through sync handle commands
-- [ ] Route all metadata reads/writes through sync handle
-- [ ] Port save-to-disk to read from Automerge (daemon already has this: `save_notebook_to_disk` at `notebook_sync_server.rs:2333`)
+### Additional fixes discovered during QA
 
-### 1.2 — Remove receiver loop state sync-back
+- **Trust signature round-trip** — `approve_notebook_trust`/`verify_notebook_trust` now use raw JSON read/write (`get_raw_metadata_additional`, `set_raw_trust_in_metadata`) to preserve `trust_signature`/`trust_timestamp` which aren't modeled in the typed `RuntMetadata` struct.
+- **Runtime detection** — `get_runtime_from_sync` now matches `NotebookState::get_runtime()` semantics: `ks.language == "python"` check and `language_info` fallback added.
+- **Initial metadata in handshake** — New `initial_metadata` field on `Handshake::NotebookSync` sends the kernelspec with the connection handshake so the daemon has it before auto-launching. Fixes Deno notebooks getting Python kernels on File → New Notebook As → Deno.
+- **`save_notebook_as` stale cells** — Refreshes `NotebookState` from Automerge before serializing (same pattern as `save_notebook`'s local fallback).
+- **`push_metadata_to_sync` removed** — Was clobbering dependency changes by pushing stale `NotebookState` metadata to the sync handle on save.
+- **`add_cell` with disconnected daemon** — Now returns `Err("Not connected to daemon")` instead of a ghost cell.
 
-The receiver loop at `lib.rs:420-424` overwrites `NotebookState` from Automerge on every peer update:
-```rust
-if let Ok(mut state) = notebook_state_for_receiver.lock() {
-    state.notebook.cells = update.cells.iter().map(cell_snapshot_to_nbformat).collect();
-}
-```
+### Remaining `NotebookState` usage (Phase 1.4 scope)
 
-- [ ] Remove this sync-back entirely
-- [ ] `notebook:updated` events continue to flow to the frontend unchanged
+| Consumer | Why it still uses `NotebookState` |
+|----------|----------------------------------|
+| `save_notebook` | Serializes to `.ipynb` (refreshes from Automerge first) |
+| `save_notebook_as` | Same, plus updates path |
+| `clone_notebook_to_path` | Clones notebook struct |
+| `initialize_notebook_sync` | First-peer population reads cells from `NotebookState` (loaded from disk) |
+| `reconnect_to_daemon` | Passes `NotebookState` to `initialize_notebook_sync` |
+| Disconnected fallbacks | ~8 metadata read commands fall back to `NotebookState` when daemon is down |
 
-### 1.3 — Simplify `WindowNotebookContext`
+- [x] Route all cell reads through `handle.get_cells()` instead of `state.lock()`
+- [x] Route all cell writes through sync handle commands
+- [x] Route all metadata reads/writes through sync handle
+- [x] Remove receiver loop sync-back
+- [x] Add `path` and `working_dir` to `WindowNotebookContext`
 
-Current:
-```rust
-struct WindowNotebookContext {
-    notebook_state: Arc<Mutex<NotebookState>>,
-    notebook_sync: SharedNotebookSync,
-    sync_generation: Arc<AtomicU64>,
-}
-```
+</details>
 
-Target:
-```rust
-struct WindowNotebookContext {
-    notebook_sync: SharedNotebookSync,
-    sync_generation: Arc<AtomicU64>,
-    path: Option<PathBuf>,
-    working_dir: Option<PathBuf>,
-}
-```
+---
 
-- [ ] Remove `NotebookState` from `WindowNotebookContext`
-- [ ] Remove `notebook_state.rs` or reduce to utility functions (metadata snapshots, nbformat conversion)
-- [ ] Update `create_window_context` and all consumers
+## Phase 1.4: Delegate save-to-disk to daemon
 
-### 1.4 — Delegate save-to-disk to daemon
+**Goal:** Move notebook save-to-disk from the Tauri process to the daemon, eliminating the last major `NotebookState` consumer.
 
-The daemon already has `save_notebook_to_disk` (`notebook_sync_server.rs:2333`) which reads from its Automerge doc and writes `.ipynb`. Instead of the Tauri process doing its own save:
+**Effort:** Medium. **Risk:** Medium — save is critical path, format-on-save needs to move too.
 
-- [ ] Add `NotebookRequest::SaveToDisk` variant
+The daemon already has `save_notebook_to_disk` (`notebook_sync_server.rs:2333`) which reads cells from its canonical Automerge doc and writes `.ipynb`. The Tauri process currently does its own save with a format-on-save step and a local fallback.
+
+- [ ] Add `NotebookRequest::SaveToDisk` variant to the protocol
+- [ ] Handle in `handle_notebook_request`: call existing `save_notebook_to_disk`, return success/failure
 - [ ] Frontend's save command sends request to daemon via sync handle
-- [ ] Daemon writes `.ipynb` from its canonical Automerge doc
-- [ ] Remove save logic from `crates/notebook/src/lib.rs`
-- [ ] Keep "save as" in Tauri (needs file dialog), but have it tell daemon the new path
+- [ ] Move format-on-save (ruff) to the daemon save path
+- [ ] For `save_notebook_as`: frontend handles file dialog (OS integration), sends new path to daemon, daemon writes, Tauri updates window title and re-derives notebook_id
+- [ ] Remove `NotebookState` serialization from `crates/notebook/src/lib.rs`
+- [ ] After this, `NotebookState` struct can be fully removed; keep only utility functions in `notebook_state.rs`
+- [ ] Fix `main_is_empty` check for macOS file association handler (dirty flag no longer set by cell mutations)
 
 ---
 
