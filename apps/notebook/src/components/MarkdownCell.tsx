@@ -12,6 +12,7 @@ import { isDarkMode as detectDarkMode } from "@/lib/dark-mode";
 import { cn } from "@/lib/utils";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
 import { useEditorRegistry } from "../hooks/useEditorRegistry";
+import { logger } from "../lib/logger";
 import type { MarkdownCell as MarkdownCellType } from "../types";
 
 interface MarkdownCellProps {
@@ -378,9 +379,7 @@ export function MarkdownCell({
             onReady={handleFrameReady}
             onLinkClick={handleLinkClick}
             onDoubleClick={handleDoubleClick}
-            onError={(err) =>
-              console.error("[MarkdownCell] iframe error:", err)
-            }
+            onError={(err) => logger.error("[MarkdownCell] iframe error:", err)}
             className="w-full"
           />
         ) : (
