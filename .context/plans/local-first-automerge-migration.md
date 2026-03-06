@@ -386,7 +386,6 @@ Not a bug in Automerge — it's a JS API design choice. The fix: `runtimed-wasm`
 
 | Task | Priority | Effort | Notes |
 |------|----------|--------|-------|
-| Remove `apps/notebook/package-lock.json` | 🔴 Now | Trivial | npm artifact, project uses pnpm — 8K lines of noise |
 | Remove `NotebookState` cell mutation methods | 🟡 Short-term | Small | `update_cell_source`, `add_cell`, `delete_cell`, `find_cell_index` on the struct — no longer called |
 | Remove `cell_snapshot_to_nbformat` helper | 🟡 Short-term | Small | Only used by the removed `notebook:updated` emission path — verify no other callers |
 | Reduce `NotebookSyncClient` to pure relay | 🟠 Medium-term | Medium | Remove its local `AutoCommit` doc — it only needs to forward frames between daemon and frontend |
