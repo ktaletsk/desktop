@@ -27,6 +27,14 @@
 - Rich outputs and error outputs
 - Multi-window usage (different notebooks)
 - Keyboard shortcuts (`Ctrl+S`, `Ctrl+O`, `Ctrl+F`, zoom shortcuts)
+- Kernel control validation on fresh notebook:
+  - Run All
+  - Restart
+  - Interrupt (with long-running cell)
+- Global Find validation:
+  - source matching
+  - output matching
+  - next/previous navigation
 - Settings panel and theme switching
 
 > Note: first-run daemon startup failed in this VM environment until I manually started `runtimed run`, after which most core notebook functionality worked well.
@@ -211,7 +219,25 @@
   - pyproject: `.../17-pyproject-execution-pass.webp`
   - pixi: `.../18-pixi-execution-pass.webp`
   - environment.yml: `.../19-environment-yml-execution-pass.webp`
+- Kernel controls worked in fresh notebook validation:
+  - Run All initial/second pass:
+    - `.../22-run-all-fresh-notebook-initial.webp`
+    - `.../23-run-all-first-pass-output.webp`
+    - `.../24-run-all-new-cell-added.webp`
+    - `.../25-run-all-second-pass-output.webp`
+  - Restart:
+    - `.../26-restart-pass-idle.webp`
+  - Interrupt:
+    - `.../27-interrupt-pass-busy-state.webp`
+    - `.../28-interrupt-pass-stopped.webp`
+- Global Find source+output search and navigation worked:
+  - `.../29-global-find-source-and-output-pass.webp`
+  - `.../30-global-find-navigation-pass.webp`
 
 ## Note on same-notebook multi-window sync testing
 - Explicit same-file two-window sync (source/output propagation between two windows on one notebook path) could not be exercised because this build appears to enforce single-window-per-file behavior.
+
+## Inconclusive investigation (not counted as confirmed bug)
+- `ipywidgets-demo.ipynb` showed unstable behavior across sessions (at times cells appeared stuck in checking/executing states), but strict reproduction from a clean, deterministic sequence was not completed conclusively.
+- Because of this inconsistency, no ipywidgets-specific defect is currently counted as a confirmed issue in this report.
 
