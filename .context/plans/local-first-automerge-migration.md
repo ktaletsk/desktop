@@ -10,9 +10,12 @@
 | 1.1–1.3: Eliminate `NotebookState` dual-write | ✅ Done | [PR #544](https://github.com/nteract/desktop/pull/544) merged |
 | 1.4: Delegate save-to-disk to daemon | ✅ Done | [PR #545](https://github.com/nteract/desktop/pull/545) merged |
 | 2.0-pre: `runtimed-wasm` bindings | ✅ Done | [PR #552](https://github.com/nteract/desktop/pull/552) merged |
-| 2: Frontend Automerge doc | ✅ Done | [PR #553](https://github.com/nteract/desktop/pull/553) — `useAutomergeNotebook` via `runtimed-wasm`, old `useNotebook` removed |
+| 2: Frontend Automerge doc | ✅ Done | [PR #553](https://github.com/nteract/desktop/pull/553) merged — `useAutomergeNotebook` via `runtimed-wasm`, old `useNotebook` removed |
+| 2D: Dead code removal | ✅ Done | [PR #554](https://github.com/nteract/desktop/pull/554) merged — dead commands removed, `notebook:updated` emissions cleaned up |
 | 3: Authority boundary hardening | ⬜ Not started | Formalize writer roles per field |
 | 4: Optimize Tauri sync relay | ⬜ Not started | Binary IPC, reduce overhead |
+
+> **🎉 The migration is complete.** The notebook is local-first. Cells mutate instantly in WASM, sync flows to the daemon via Automerge, execution works, widgets work. Everything below is post-migration cleanup and future improvements.
 
 ---
 
@@ -369,93 +372,47 @@ Not a bug in Automerge — it's a JS API design choice. The fix: `runtimed-wasm`
 
 </details>
 
-### Sub-PR 2D — Cleanup (bandaid ripped ✅)
+### Sub-PR 2D — Post-migration cleanup — [PR #554](https://github.com/nteract/desktop/pull/554)
 
-- [x] Remove `useNotebook.ts` — deleted
-- [x] Remove `useNotebookDispatch.ts` — deleted, `App.tsx` imports `useAutomergeNotebook` directly
-- [x] Remove feature flag infrastructure — no more `USE_AUTOMERGE_FRONTEND` toggle
-- [ ] Remove `@automerge/automerge` npm dependency from `package.json` (may still be in lockfile)
-- [ ] Remove dead Tauri commands (see inventory below)
-- [ ] Remove dead Tauri event emission (see inventory below)
-- [ ] Remove `NotebookSyncClient` local Automerge doc from Tauri process (reduce to relay-only)
-- [ ] Remove remaining `NotebookState` disconnected-daemon fallbacks
-- [ ] Delete `notebook_state.rs` struct and unused methods
-- [ ] Evaluate returning to `@automerge/automerge` JS with `ImmutableString` for presence/cursor support
+**Done in PR #554:**
+- [x] Remove `useNotebook.ts` — deleted (PR #553)
+- [x] Remove `useNotebookDispatch.ts` — deleted (PR #553)
+- [x] Remove feature flag infrastructure (PR #553)
+- [x] Remove dead Tauri commands: `load_notebook`, `update_cell_source`, `add_cell`, `delete_cell`, `refresh_from_automerge` (−217 lines Rust)
+- [x] Remove `cell_snapshot_to_frontend` helper
+- [x] Remove `notebook:updated` cell emissions from init and receiver loop (metadata emissions kept — 3 active listeners)
 
-### Callback audit
+**Still to do (next PR):**
 
-Callbacks in `useAutomergeNotebook` and how they connect to `useDaemonKernel`:
+| Task | Priority | Effort | Notes |
+|------|----------|--------|-------|
+| Remove `apps/notebook/package-lock.json` | 🔴 Now | Trivial | npm artifact, project uses pnpm — 8K lines of noise |
+| Remove `NotebookState` cell mutation methods | 🟡 Short-term | Small | `update_cell_source`, `add_cell`, `delete_cell`, `find_cell_index` on the struct — no longer called |
+| Remove `cell_snapshot_to_nbformat` helper | 🟡 Short-term | Small | Only used by the removed `notebook:updated` emission path — verify no other callers |
+| Reduce `NotebookSyncClient` to pure relay | 🟠 Medium-term | Medium | Remove its local `AutoCommit` doc — it only needs to forward frames between daemon and frontend |
+| Remove `NotebookState` struct entirely | 🟠 Medium-term | Medium | After relay simplification — `save_notebook` and session restore need alternative paths |
+| Extract shared `notebook-doc` crate | 🟠 Medium-term | Medium | Eliminate WASM copy drift — both `runtimed` and `runtimed-wasm` depend on one source |
 
-| Callback | Connected to | Currently wired in `App.tsx`? | Action |
-|----------|-------------|-------------------------------|--------|
-| `appendOutput` | `useDaemonKernel.onOutput` | ❌ No-opped (`() => {}`) | **Wire it** — fixes output latency |
-| `updateOutputByDisplayId` | `useDaemonKernel.onUpdateDisplayData` | ✅ Yes | Keep — progress bars, display_data |
-| `setExecutionCount` | `useDaemonKernel.onExecutionCount` | ✅ Via `handleExecutionCount` | Keep — immediate `[1]:` counter |
-| `clearCellOutputs` | `useDaemonKernel.onClearOutputs` | ✅ Yes | Keep — visual feedback before execution |
-| `formatCell` | `NotebookView.onFormatCell` | ✅ Invokes `format_cell` on daemon | Keep — needs ruff/deno fmt |
-| `save` / `openNotebook` / `cloneNotebook` | UI buttons | ✅ Invoke daemon commands | Keep — file operations |
+### Output streaming: `onOutput` stays no-opped
 
-### Dead Tauri commands (no longer called from frontend)
+`onOutput: () => {}` — wiring `appendOutput` causes duplicate outputs. Broadcast appends an output, then Automerge sync replaces all cells with doc state that already has the output. Without a stable output ID to deduplicate, both appear.
 
-| Command | Old caller | Replacement |
-|---------|-----------|-------------|
-| `add_cell` | `useNotebook.addCell` | WASM `handle.add_cell()` + Automerge sync |
-| `delete_cell` | `useNotebook.deleteCell` | WASM `handle.delete_cell()` + Automerge sync |
-| `update_cell_source` | `useNotebook.updateCellSource` | WASM `handle.update_source()` + Automerge sync |
-| `load_notebook` | `useNotebook.loadCells` | `get_automerge_doc_bytes` + WASM `NotebookHandle.load()` |
-| `refresh_from_automerge` | `useNotebook` fallback | Bootstrap via `get_automerge_doc_bytes` |
-
-These commands and their handlers in `crates/notebook/src/lib.rs` can be removed. The `NotebookState` dual-write logic in each handler is now dead code.
-
-### Dead Tauri events (frontend no longer listens)
-
-| Event | Old listener | Replacement |
-|-------|-------------|-------------|
-| `notebook:updated` | `useNotebook` | `automerge:from-daemon` → WASM `receive_sync_message()` |
-
-The `notebook:updated` emission in the receiver loop (`lib.rs`) and the `cell_snapshot_to_nbformat` / `cell_snapshot_to_frontend` helpers used only for that emission can be removed.
-
-### Known issue: output streaming latency
-
-**Priority: HIGH** — most noticeable user-facing regression.
-
-Outputs now arrive via Automerge sync (daemon writes to doc → relay forwards → frontend materializes) instead of the old `daemon:broadcast` → `appendOutput` path. This adds perceptible latency for cell execution results.
-
-**Fix:** Change `onOutput: () => {}` to `onOutput: appendOutput` in `App.tsx`. One line. The hook already has the `appendOutput` callback that does stream coalescing (consecutive stdout messages merge). Automerge sync becomes the eventual-consistency backstop — when the next sync arrives, `materializeCells` replaces the cells array with the canonical state. Between sync cycles, broadcast outputs are ahead, which is what the user wants to see.
-
-```tsx
-// In App.tsx, change:
-onOutput: () => {},
-// To:
-onOutput: appendOutput,
-```
+**Future fix:** Add a sequence number or content hash to broadcast output messages so the frontend can skip outputs already present in Automerge state. This is a new feature, not a migration task.
 
 ### Build pipeline note
 
 `crates/runtimed-wasm/src/notebook_doc.rs` is currently a copy of `crates/runtimed/src/notebook_doc.rs` with daemon-only methods removed. When `notebook_doc.rs` changes (rare — usually daemon-side output operations), the WASM copy must be updated and `wasm-pack build` re-run. Future cleanup: extract a shared `notebook-doc` crate that both depend on.
 
-### Prioritized follow-ups
+### Future improvements (post-migration)
 
-**Immediate (fixes regressions):**
-- [ ] Wire `onOutput: appendOutput` in `App.tsx` for real-time output streaming
-- [ ] Remove `@automerge/automerge` npm dependency from `package.json`
-
-**Short-term (dead code removal):**
-- [ ] Remove dead Tauri commands: `add_cell`, `delete_cell`, `update_cell_source`, `load_notebook`, `refresh_from_automerge`
-- [ ] Remove `notebook:updated` event emission from receiver loop
-- [ ] Remove `NotebookState` cell mutation methods no longer called
-
-**Medium-term (architectural simplification):**
-- [ ] Reduce `NotebookSyncClient` to pure relay — remove its local Automerge doc (it only needs to forward frames)
-- [ ] Remove remaining `NotebookState` struct and `notebook_state.rs`
-- [ ] Extract shared `notebook-doc` crate to avoid WASM copy drift
-
-**Future (ecosystem integration):**
-- [ ] Expose `splice_source(cellId, index, deleteCount, insertText)` from WASM for character-level CodeMirror integration
-- [ ] Evaluate `@automerge/codemirror` integration (requires either returning to JS Automerge with `ImmutableString` or building a CodeMirror extension that calls our WASM splice)
-- [ ] Presence / collaborative cursors — evaluate `@automerge/automerge` JS with `ImmutableString` for non-text fields
-- [ ] Profile `handle.get_cells_json()` + materialization latency on large notebooks (100 / 500 / 1000 cells)
-- [ ] Selective re-materialization — only re-read changed cells instead of full `get_cells_json()`
+| Item | Category | Notes |
+|------|----------|-------|
+| Output dedup with broadcast IDs | Performance | Fix `onOutput` latency without duplicates |
+| `splice_source` WASM export | Editor integration | Character-level CodeMirror edits instead of full-string `update_source` |
+| `@automerge/codemirror` evaluation | Editor integration | Needs either JS Automerge with `ImmutableString` or custom CM extension calling our WASM splice |
+| Presence / collaborative cursors | Collaboration | Separate spike — evaluate `@automerge/automerge` JS with `ImmutableString` for non-text fields |
+| Profile materialization on large notebooks | Performance | `get_cells_json()` + parse on 100 / 500 / 1000 cells |
+| Selective re-materialization | Performance | Only re-read changed cells instead of full `get_cells_json()` |
 
 ---
 
