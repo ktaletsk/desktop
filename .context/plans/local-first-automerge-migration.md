@@ -282,76 +282,81 @@ Full removal of the `NotebookState` struct is deferred — it still serves as th
 
 **Effort:** Large (2-4 weeks). **Risk:** Medium — WASM bundle size (~200KB gzip), performance on large notebooks needs profiling.
 
-**Strategy:** Feature flag toggle with sub-PRs. Build `useAutomergeNotebook` alongside `useNotebook`, controlled by a feature flag (debug menu setting or env var). Both exist in the codebase during development. Each sub-PR is independently mergeable and testable. When the Automerge path is stable, flip the default and delete the old path.
+**Strategy:** Feature flag toggle with sub-PRs. Build `useAutomergeNotebook` alongside `useNotebook`, controlled by a feature flag (`localStorage` or `?automerge=true` URL param). Both exist in the codebase during development. Each sub-PR is independently mergeable and testable. When the Automerge path is stable, flip the default and delete the old path.
 
-### Sub-PR 2A — WASM + schema setup
+### Hard-won lessons (from QA and debugging)
+
+| Lesson | Detail |
+|--------|--------|
+| **Must use `@automerge/automerge@^2.2.x`** | The Rust daemon uses `automerge = "0.7"` (crates.io). The JS `@automerge/automerge` v2.2.x bundles WASM from a compatible automerge-rs version. v3.x may have wire-format divergence — we hit "Cell not found in document" errors when the frontend sent v3 sync messages to the Rust 0.7 relay. Stick with v2 until the Rust crate bumps. |
+| **Use `import { next as Automerge }`** | In v2, `updateText` and `splice` live on the `next` sub-export, not the top-level. `import { next as Automerge } from "@automerge/automerge"` gives the full API. |
+| **List ops use proxy methods** | In v2 `next`, list mutations inside `Automerge.change()` use `(d.cells as any).insertAt(idx, item)` and `(d.cells as any).deleteAt(idx)` — NOT top-level `Automerge.insertAt()` / `Automerge.deleteAt()` which don't exist in v2. |
+| **Scalar strings return as `RawString`** | v2 `next` wraps scalar strings (non-Text) in `RawString` objects. Use `String(value)` for comparison, not `===`. Text CRDT fields (like `source`) return as plain strings. |
+| **Do NOT `syncToBackend()` after `Automerge.load()`** | Sending a sync message from a freshly-loaded doc with a fresh `initSyncState()` triggers a full re-sync that can corrupt the daemon's state. Let the daemon initiate sync — the bidirectional exchange starts naturally when daemon changes arrive via `automerge:from-daemon`. |
+| **Sync needs multiple roundtrips** | The Automerge sync protocol is not one-shot. `generateSyncMessage` / `receiveSyncMessage` must be called in a loop until both sides return `null` messages. The compat test validates this. |
+| **Compat test is essential** | `apps/notebook/src/__tests__/automerge-compat.test.ts` validates Rust 0.7 ↔ JS v2 interop: load fixture bytes, sync roundtrip, change+sync. Run this after any Automerge version change on either side. Fixture bytes exported from `crates/runtimed/src/notebook_doc.rs` test. |
+
+### Sub-PR 2A — WASM + schema setup ✅
 
 Add `@automerge/automerge` to the frontend build pipeline. Zero runtime behavior change.
 
-- [ ] `npm install @automerge/automerge`
-- [ ] Add Vite WASM plugins: `vite-plugin-wasm`, `vite-plugin-top-level-await`
-- [ ] Verify WASM initialization works in dev and production builds
-- [ ] Define TypeScript document schema in `apps/notebook/src/automerge/schema.ts`:
-
-```ts
-// Document schema — matches Rust NotebookDoc (notebook_doc.rs:9-23)
-interface NotebookDocSchema {
-  notebook_id: string;
-  cells: Array<{
-    id: string;
-    cell_type: string;       // "code" | "markdown" | "raw"
-    source: string;           // Automerge Text CRDT
-    execution_count: string;  // "5" or "null"
-    outputs: string[];        // JSON-encoded outputs or manifest hashes
-  }>;
-  metadata: {
-    runtime?: string;
-    notebook_metadata?: string;  // JSON-encoded NotebookMetadataSnapshot
-  };
-}
-```
-
-- [ ] Add feature flag infrastructure (setting or env var for `USE_AUTOMERGE_NOTEBOOK`)
+- [x] `pnpm add @automerge/automerge@^2.2.9` (NOT v3 — see lessons above)
+- [x] Add Vite WASM plugins: `vite-plugin-wasm`, `vite-plugin-top-level-await`
+- [x] Configure vitest in `apps/notebook/vite.config.ts` for compat tests
+- [x] Verify WASM initialization works in dev and production builds
+- [x] Define TypeScript document schema in `apps/notebook/src/lib/automerge-schema.ts`
+- [x] Add feature flag: `localStorage` + `?automerge=true` URL param (`apps/notebook/src/lib/feature-flags.ts`)
+- [x] Add Rust fixture export test (`crates/runtimed/src/notebook_doc.rs`)
+- [x] Add JS compat test (`apps/notebook/src/__tests__/automerge-compat.test.ts`) — 3 tests: load, sync roundtrip, change+sync
 - [ ] Measure WASM bundle size impact (target: <250KB gzip)
 
-### Sub-PR 2B — Sync relay infrastructure
+### Sub-PR 2B — Sync relay infrastructure ✅
 
 Tauri event plumbing for binary Automerge sync messages. The old `useNotebook` path still runs — this just adds the new pipes.
 
 | Event | Direction | Payload |
 |-------|-----------|---------|
-| `automerge:to-daemon` | Frontend → Tauri → Daemon | Binary (base64 initially, `Channel<Vec<u8>>` if needed) |
-| `automerge:from-daemon` | Daemon → Tauri → Frontend | Binary (base64 initially, `Channel<Vec<u8>>` if needed) |
+| `automerge:from-daemon` | Daemon → Tauri → Frontend | `Vec<u8>` via Tauri event (base64 encoded) |
+| `send_automerge_sync` | Frontend → Tauri → Daemon | `Vec<u8>` via Tauri command |
+| `get_automerge_doc_bytes` | Frontend ← Tauri | `Vec<u8>` one-shot bootstrap from Tauri's replica |
 
-- [ ] Add Tauri commands/events that forward binary Automerge sync messages to/from the daemon Unix socket
-- [ ] Keep `NotebookSyncHandle.send_request()` for kernel commands (execute, interrupt, save, etc.)
-- [ ] Define initialization protocol: Tauri connects to daemon, performs initial sync exchange, sends doc bytes to frontend via one-shot event
-- [ ] Handle "first peer populates room" vs "joining existing room" cases
-- [ ] Ensure Python agents already connected to the room see the frontend's initial state
+- [x] `raw_sync_tx: Option<mpsc::UnboundedSender<Vec<u8>>>` added to sync client's background task — forwards incoming `0x00` Automerge frames to channel before local application
+- [x] `connect_split_with_raw_sync()` variant on `NotebookSyncClient`
+- [x] Tauri spawns raw sync relay task: reads from `raw_sync_rx`, emits `automerge:from-daemon` events
+- [x] `get_automerge_doc_bytes` command: exports Tauri-side `AutoCommit` doc as bytes for frontend bootstrap
+- [x] `send_automerge_sync` command: receives frontend sync messages, applies via `receive_frontend_sync_message`
+- [x] `frontend_peer_state` in sync client maintains separate sync state for the frontend peer (distinct from daemon peer state)
+- [x] `NotebookSyncHandle.send_request()` preserved for kernel commands
 
-### Sub-PR 2C — Hook replacement + migration (behind feature flag)
+### Sub-PR 2C — Hook replacement + migration (behind feature flag) 🔄
 
 The core architectural change. `useAutomergeNotebook` replaces `useNotebook` when the feature flag is enabled.
 
-- [ ] Create `apps/notebook/src/hooks/useAutomergeNotebook.ts`
-- [ ] Frontend owns a local Automerge doc — all cell mutations are local `Automerge.change()` calls:
-  - `addCell` — `crypto.randomUUID()`, insert into Automerge list
-  - `deleteCell` — remove from Automerge list (last-cell guard local)
-  - `updateCellSource` — `Automerge.updateText()` (Myers diff internally)
-  - Cell reorder — Automerge list move (new capability)
-- [ ] `materializeCells()` converts Automerge doc → `NotebookCell[]` for React rendering
-- [ ] Handle output manifest hash resolution (blob store HTTP fetch) — outputs arrive via Automerge sync from daemon
-- [ ] Frontend generates sync messages after each `Automerge.change()` via `Automerge.generateSyncMessage()`
-- [ ] Frontend applies incoming sync messages via `Automerge.receiveSyncMessage()`
-- [ ] Wire into `App.tsx` behind the feature flag toggle
-- [ ] Remove `invoke()` calls for cell mutations (add, delete, source edit) — keep for: execute, interrupt, shutdown, launch kernel, format cell, save
-- [ ] Replace `notebook:updated` event handling with Automerge sync message handling
+- [x] Create `apps/notebook/src/hooks/useAutomergeNotebook.ts`
+- [x] Frontend owns a local Automerge doc — all cell mutations are local `Automerge.change()` calls:
+  - `addCell` — `crypto.randomUUID()`, insert via `(d.cells as any).insertAt(idx, {...})`
+  - `deleteCell` — remove via `(d.cells as any).deleteAt(idx)` (last-cell guard local)
+  - `updateCellSource` — `Automerge.updateText(d, ["cells", idx, "source"], newValue)`
+  - Cell reorder — Automerge list move (new capability, not yet implemented)
+- [x] `materializeCells()` converts Automerge doc → `CellSnapshot[]` → `NotebookCell[]`
+- [x] Shared utilities extracted to `apps/notebook/src/lib/automerge-utils.ts`
+- [x] Output handling: dual path — `daemon:broadcast` for real-time streaming, Automerge sync for eventual consistency
+- [x] `cell:source_updated` listener updates React state only (no Automerge doc write — formatting arrives via sync)
+- [x] Frontend generates sync messages after each `Automerge.change()` via `Automerge.generateSyncMessage()`
+- [x] Frontend applies incoming sync messages via `Automerge.receiveSyncMessage()`
+- [x] Wired into `App.tsx` behind feature flag toggle
+- [x] No `invoke()` calls for cell mutations — Automerge sync is the sole transport
+- [x] `notebook:updated` kept as transitional fallback (only active before Automerge doc initializes)
+- [x] Diagnostic logging added to daemon's `ExecuteCell` handler (cell count + available IDs on "Cell not found")
+- [ ] QA: cell editing, execution (Shift+Enter), add/delete, cross-window sync, save/load
+- [ ] QA: verify no regressions with feature flag OFF (existing `useNotebook` path)
 
 Key implementation details:
-- `Automerge.change()` returns a new immutable doc — compatible with React's `useState`
-- `Automerge.updateText()` does Myers diff on strings internally — same as the Rust `update_text`
-- `Automerge.splice()` for direct character-level edits (CodeMirror integration, future)
-- For cell source editing, `Automerge.updateText(doc, path, newValue)` computes minimal edits
+- `import { next as Automerge } from "@automerge/automerge"` — required for v2 `updateText`/`splice` access
+- `Automerge.change()` returns a new immutable doc — stored in `useRef`, React state derived via materialization
+- List mutations use proxy methods inside `change()` callback: `(d.cells as any).insertAt()` / `.deleteAt()`
+- Do NOT call `syncToBackend()` after `Automerge.load()` — let daemon initiate the sync exchange
+- Scalar strings from Automerge are `RawString` objects — use `String(value)` for comparison
 
 ### Sub-PR 2D — Cleanup (after feature flag is flipped)
 
