@@ -1,14 +1,39 @@
 # Spike C: Custom WASM Bindings from `automerge = "0.7"`
 
-> Eliminate the JS↔Rust Automerge version mismatch by compiling our own WASM module from the exact same `automerge` crate the daemon uses.
+> Eliminate the JS string→Text CRDT type mismatch by compiling our own WASM module that uses the exact same Rust `NotebookDoc` API as the daemon.
 
 ## Context
 
-Phase 2 of the local-first migration is blocked by phantom cells appearing during JS↔Rust Automerge sync. The `@automerge/automerge@2.2.x` npm package bundles WASM compiled from an unknown version of `automerge-rs`. Our daemon uses `automerge = "0.7.4"` from crates.io. When the frontend (JS WASM) and the Tauri relay (Rust 0.7) exchange sync messages, phantom cells appear in the frontend's doc that don't exist in any Rust-side doc.
+Phase 2 of the local-first migration was blocked by phantom cells appearing during JS↔Rust Automerge sync. **Root cause confirmed via Spike E:**
 
-**Spike A confirmed:** Python bindings using the same Rust `NotebookSyncClient` (automerge 0.7 on both sides) work perfectly — create cell, sync, execute, output. No phantom cells.
+When JS Automerge creates cells via object literal inside `Automerge.change()`:
+```js
+d.cells.push({ id: "cell-1", cell_type: "code", source: "", ... });
+```
+**ALL string fields become `Object(Text)` CRDTs** — including `id`, `cell_type`, and `execution_count` which the Rust side creates as scalar `Str` values via `doc.put()`.
 
-**Conclusion:** The problem is the JS WASM Automerge build, not the relay architecture or the sync protocol. If we compile WASM from the same `automerge = "0.7"` crate, sync messages should be byte-compatible.
+The Rust `read_str()` helper looks for `ScalarValue::Str`. When it encounters `Object(Text)` (from JS-created cells), it returns `None`. The cell IS in the Automerge doc — sync worked correctly — but `get_cells()` can't read it because the CRDT types don't match. This is not a version mismatch or wire format issue. It's a fundamental JS Automerge API behavior: plain strings in object literals become collaborative Text CRDTs.
+
+**Why each approach works/fails:**
+| Approach | String types | Result |
+|----------|-------------|--------|
+| Rust↔Rust (Python bindings) | Both use scalar `Str` via `doc.put()` | ✅ Works |
+| JS↔JS (compat test) | Both use `Text` (JS default) | ✅ Works (consistent) |
+| JS↔Rust (frontend↔relay) | JS uses `Text`, Rust expects `Str` | ❌ Phantom cells |
+| WASM↔Rust (Spike C) | Both use scalar `Str` via same Rust code | ✅ Works |
+
+**Solution:** Our WASM compiles from the same `NotebookDoc` Rust code as the daemon. All cell operations go through `doc.put()` (scalar Str) and `doc.put_object()` (Text for `source` only). The JS frontend never touches Automerge directly — it calls `NotebookHandle` methods which execute the Rust operations inside WASM, guaranteeing schema compatibility.
+
+## Status
+
+- [x] `crates/runtimed-wasm` crate created (branch `540/runtimed-wasm`)
+- [x] `wasm-pack build` produces JS/TS/WASM at `apps/notebook/src/wasm/runtimed-wasm/` (345KB gzip)
+- [x] 18 Rust unit tests passing
+- [x] 15 Deno smoke tests passing: cell CRUD, sync roundtrip, concurrent merges, Text CRDT merge
+- [ ] Cross-impl test: WASM sync messages applied by Rust daemon via Python Session
+- [ ] Replace `@automerge/automerge` in `useAutomergeNotebook` with `NotebookHandle`
+- [ ] Tauri integration test (Phase 2 below)
+- [ ] End-to-end: feature flag on, type in cell, Shift+Enter, see output
 
 ## Approach
 

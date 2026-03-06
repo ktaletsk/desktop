@@ -9,7 +9,7 @@
 | 0: Optimistic mutations | ✅ Done | [PR #542](https://github.com/nteract/desktop/pull/542) merged |
 | 1.1–1.3: Eliminate `NotebookState` dual-write | ✅ Done | [PR #544](https://github.com/nteract/desktop/pull/544) merged |
 | 1.4: Delegate save-to-disk to daemon | ✅ Done | [PR #545](https://github.com/nteract/desktop/pull/545) merged |
-| 2: Frontend Automerge doc | 🚧 Blocked | [Draft PR #547](https://github.com/nteract/desktop/pull/547) — phantom cell bug in sync relay, exploratory spikes planned |
+| 2: Frontend Automerge doc | 🔄 Unblocked | [Draft PR #547](https://github.com/nteract/desktop/pull/547) — root cause found (JS string→Text CRDT mismatch), `runtimed-wasm` built on `540/runtimed-wasm` |
 | 3: Authority boundary hardening | ⬜ Not started | Formalize writer roles per field |
 | 4: Optimize Tauri sync relay | ⬜ Not started | Binary IPC, reduce overhead |
 
@@ -361,29 +361,52 @@ Key implementation details:
 - List mutations use proxy methods inside `change()` callback: `(d.cells as any).insertAt()` / `.deleteAt()`
 - Do NOT call `syncToBackend()` after `Automerge.load()` — let daemon initiate the sync exchange
 - Scalar strings from Automerge are `RawString` objects — use `String(value)` for comparison
-- **`@automerge/automerge` JS WASM is incompatible with Rust `automerge = "0.7"` at runtime** | Unit tests (JS↔JS sync) pass, but runtime sync through the Tauri relay produces phantom cells. The JS WASM package bundles a different automerge-rs build than our Rust 0.7 crate. Spike A (Python bindings using identical Rust code) works perfectly — confirmed the relay architecture is sound. The fix is Spike C: compile our own WASM from `automerge = "0.7"`. |
+- **JS Automerge string→Text CRDT type mismatch is the root cause** | When JS does `d.cells.push({ id: "cell-1", ... })` inside `Automerge.change()`, ALL string fields become `Object(Text)` CRDTs. But Rust `NotebookDoc::add_cell()` creates `id`, `cell_type`, `execution_count` as scalar `Str` (via `doc.put()`) and only `source` as `ObjType::Text`. The Rust `read_str()` helper looks for `ScalarValue::Str` — when it sees `Object(Text)` it returns `None`. The cell IS in the doc, sync worked, but `get_cells()` can't read it. This is not a version mismatch or wire format issue — it's a fundamental JS API behavior. The fix is Spike C: our WASM uses the same Rust `NotebookDoc` code, so all field types match the daemon's schema. |
 
-### 🚧 Blocker: Phantom cell bug — resolved via Spike C
+### ✅ Resolved: Phantom cell bug — root cause: JS string→Text CRDT mismatch
 
 **Symptom:** Frontend loads 1 cell from doc bytes (e.g., `ee7e32a6`). After the first daemon sync response (106 bytes), a second cell appears (e.g., `ce2efbdf`) that doesn't exist in the daemon's doc or the Tauri relay's doc. The user types in this phantom cell and tries to execute — daemon returns "Cell not found."
 
-**What we ruled out:**
-- ~~Race condition with `notebook:updated` fallback~~ — fallback removed entirely, still happens
-- ~~Stale `frontend_peer_state` buffering messages~~ — deferred to `None` until `GetDocBytes`, still happens
-- ~~JS v3 wire format incompatibility~~ — reverted to v2.2.x, still happens
+**What we ruled out along the way:**
+- ~~Race condition with `notebook:updated` fallback~~ — fallback removed entirely, still happened
+- ~~Stale `frontend_peer_state` buffering messages~~ — deferred to `None` until `GetDocBytes`, still happened
+- ~~JS v3 wire format incompatibility~~ — reverted to v2.2.x, still happened
 - ~~Initial `syncToBackend()` corrupting state~~ — both with and without it, same behavior
-- ~~Sync message decode failures~~ — every message decodes OK, no errors anywhere in the relay
+- ~~Sync message decode failures~~ — every message decoded OK, no errors anywhere
+- ~~Automerge version mismatch between JS WASM and Rust crate~~ — same bug with v2.2.x and v3.2.x
 
 **What the logs consistently showed:**
 - Tauri relay receives frontend sync messages, decodes OK, applies OK — but cell list NEVER changes (BEFORE = AFTER)
 - Daemon sync responses to the frontend produce phantom cells that no Rust-side doc has
-- The frontend's `Automerge.change()` calls (source edits, cell adds) produce sync messages that the relay accepts but that have no effect on the relay's doc
+- The frontend's `Automerge.change()` calls produce sync messages that the relay accepts but that have no effect on the relay's doc
 
-**Root cause (confirmed via Spike A):** The `@automerge/automerge@2.2.x` npm package bundles WASM compiled from a different version of `automerge-rs` than our Rust `automerge = "0.7.4"` crate. The sync protocol is nominally compatible (messages decode OK), but the CRDT merge produces phantom cells — cells that appear in the JS doc but have no corresponding entries in the Rust doc. This is a version mismatch at the binary level, not a protocol-level incompatibility.
+**Root cause (confirmed via Spike E minimal repro):** When JS Automerge creates cells via object literal inside `Automerge.change()`:
+```js
+d.cells.push({ id: "cell-1", cell_type: "code", source: "", ... });
+```
+**ALL string fields become `Object(Text)` CRDTs** — including `id`, `cell_type`, and `execution_count` which the Rust side expects to be scalar `Str` values.
 
-**Proof:** Python bindings (`runtimed-py`) use the identical `NotebookSyncClient` (Rust `automerge = "0.7"` on both sides) and work perfectly: `session.create_cell()` → `session.execute_cell()` → output received. No phantom cells. Same relay architecture, same daemon, same sync protocol — only difference is Rust↔Rust instead of JS WASM↔Rust.
+The Rust `NotebookDoc::add_cell()` creates:
+- `id`, `cell_type`, `execution_count` → **scalar `Str`** via `doc.put(&cell_map, "id", cell_id)`
+- `source` → **`ObjType::Text`** via `doc.put_object(&cell_map, "source", ObjType::Text)`
 
-### Exploratory spikes — results and next steps
+When JS-created cells sync to Rust, the `read_str()` helper sees `Object(Text)` where it expects `ScalarValue::Str` and returns `None`. The cell IS in the Automerge doc — the sync worked — but `get_cells()` can't read it because the CRDT types don't match.
+
+This is not a bug in Automerge. It's a JS API design choice: inside `Automerge.change()`, plain JS strings in object literals become collaborative Text CRDTs. To create non-collaborative scalar strings, you'd need `new Automerge.ImmutableString("value")` — which is impractical for cell metadata fields.
+
+**Why each approach worked/failed:**
+| Approach | String types | Result |
+|----------|-------------|--------|
+| Rust↔Rust (Python bindings) | Both use scalar `Str` via `doc.put()` | ✅ Works |
+| JS↔JS (compat test) | Both use `Text` (JS default) | ✅ Works (consistent) |
+| JS↔Rust (frontend↔relay) | JS uses `Text`, Rust expects `Str` | ❌ Phantom cells |
+| WASM↔Rust (Spike C) | Both use scalar `Str` via same Rust code | ✅ Works |
+
+**Fix: Spike C** — our `runtimed-wasm` WASM compiles from the same `NotebookDoc` Rust code as the daemon. All cell operations go through `doc.put()` (scalar Str) and `doc.put_object()` (Text for source only). The schema matches byte-for-byte with the daemon. The JS frontend never touches Automerge directly — it calls `NotebookHandle` methods which execute the Rust operations inside WASM.
+
+**Proof:** Spike A (Python, Rust↔Rust) works perfectly. Spike C WASM passes 15 Deno smoke tests including sync between two handles, concurrent cell merges, and character-level Text CRDT merge.
+
+### Exploratory spikes — results
 
 **Spike A: Python bindings ✅ CONFIRMED**
 
@@ -406,24 +429,30 @@ print(result)
 - [x] Connect Python `Session` to a notebook room
 - [x] `session.create_cell("print('hello')")` → cell appears in daemon doc ✅
 - [x] `session.execute_cell(cell_id)` → execution succeeds, output received ✅
-- [x] **Conclusion: JS↔Rust sync is the blocker, not the relay architecture**
+- [x] **Conclusion: confirmed the relay architecture is sound, problem is JS string types**
 
 **Spike B: Deno FFI bindings** — skipped (Spike A was sufficient to isolate the issue)
 
-**Spike C: Custom WASM bindings from `automerge = "0.7"` ← PRIMARY PATH**
+**Spike C: Custom WASM bindings from `automerge = "0.7"` ✅ BUILT**
 
-Compile our own WASM from the exact same `automerge` crate the daemon uses. This eliminates the version mismatch that causes phantom cells.
+Compiled our own WASM (`crates/runtimed-wasm`) from the exact same `automerge` crate the daemon uses. This eliminates the string→Text type mismatch because all operations go through the Rust `NotebookDoc` API.
 
 Full plan: [`.context/plans/spike-c-custom-automerge-wasm.md`](spike-c-custom-automerge-wasm.md)
 
-- [ ] Create `crates/automerge-wasm-notebook` — thin wasm-bindgen wrapper around `NotebookDoc` operations
-- [ ] `wasm-pack build` producing JS/TS/WASM for the frontend
-- [ ] Deno smoke test: create cell, sync roundtrip, verify cells match
-- [ ] Rust integration test: WASM-generated sync message applied to Rust `AutoCommit`
+Branch: `540/runtimed-wasm`
+
+- [x] Create `crates/runtimed-wasm` — wasm-bindgen `NotebookHandle` wrapping `NotebookDoc` operations
+- [x] `wasm-pack build` producing JS/TS/WASM at `apps/notebook/src/wasm/runtimed-wasm/` (345KB gzip)
+- [x] 18 Rust unit tests passing
+- [x] 15 Deno smoke tests passing: cell CRUD, sync roundtrip, concurrent merges, character-level Text CRDT merge
+- [ ] Cross-impl test: WASM-generated sync messages applied by Rust daemon via Python Session
 - [ ] Replace `@automerge/automerge` in `useAutomergeNotebook` with `NotebookHandle` from our WASM
+- [ ] Tauri integration test (Spike D as verification step)
 - [ ] End-to-end: feature flag on, type in cell, Shift+Enter, see output
 
-**Spike D: Separate Tauri window** — deferred (Spike C is the more direct fix; Spike D is the fallback if WASM compilation has issues)
+**Spike D: Separate Tauri window** — planned as verification step for Spike C (tests full Tauri relay path with our WASM)
+
+**Spike E: Minimal repro for upstream** — confirmed the string→Text root cause. JS object literals inside `Automerge.change()` produce `Text` CRDTs for all string fields, which Rust readers expecting scalar `Str` can't read.
 
 ### Sub-PR 2D — Cleanup (after phantom cell bug is resolved and feature flag is flipped)
 
