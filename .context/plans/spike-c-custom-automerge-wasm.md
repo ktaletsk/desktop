@@ -233,8 +233,154 @@ Replace `@automerge/automerge` imports with `NotebookHandle`. The hook simplifie
 2. Rust test: WASM-generated sync message applied to Rust `AutoCommit` — cells match
 3. Runtime test: feature flag on, type in cell, Shift+Enter, see output — no "Cell not found"
 
+## Phase 2: Tauri integration test (Spike D as verification)
+
+Once the WASM works in Deno, verify it works through the real Tauri relay before wiring it into the notebook UI. This is Spike D scoped as a verification step, not a separate effort.
+
+### Approach
+
+Create a minimal Tauri test window that loads the `automerge-wasm-notebook` WASM, connects to the daemon via the existing relay, and exercises the full sync path. This tests everything Deno can't: Tauri event serialization, the relay's `send_automerge_sync` / `automerge:from-daemon` plumbing, and the `GetDocBytes` bootstrap through the real `NotebookSyncClient`.
+
+### Steps
+
+- [ ] Add `AUTOMERGE_TEST_WINDOW=1` env var flag on the Tauri side
+- [ ] When set, open a minimal HTML page that loads our WASM, calls `get_automerge_doc_bytes`, creates a `NotebookHandle`, and renders cells as plain text
+- [ ] Wire up: type in a textarea → `handle.update_source()` → `handle.generate_sync_message()` → `invoke("send_automerge_sync")`
+- [ ] Wire up: `listen("automerge:from-daemon")` → `handle.receive_sync_message()` → re-render cells
+- [ ] Add an "Execute" button that calls `invoke("execute_cell_via_daemon", { cellId })`
+- [ ] Test: type `print('hello')`, click Execute, see output — no "Cell not found"
+- [ ] If this works: the WASM is ready to drop into `useAutomergeNotebook`
+
+### Why this matters
+
+Deno tests prove WASM↔WASM and WASM↔Rust sync in isolation. But the Tauri relay adds: base64 encoding of binary messages in Tauri events, async command processing, the `frontend_peer_state` virtual sync handshake, and concurrent daemon sync traffic. If any of those layers corrupt the messages, Deno won't catch it but this window will.
+
+---
+
+## Spike E: Minimal repro for Automerge upstream issue
+
+Regardless of whether Spike C works, we should file an issue with the Automerge project documenting the JS WASM ↔ Rust sync incompatibility. A minimal reproduction makes it actionable.
+
+### Goal
+
+Create the smallest possible standalone repo that demonstrates: Rust `automerge = "0.7"` doc syncing with `@automerge/automerge@2.2.x` JS WASM produces phantom entries that don't exist in either doc independently.
+
+### Reproduction structure
+
+```
+automerge-sync-repro/
+├── rust-side/
+│   ├── Cargo.toml          # automerge = "0.7"
+│   └── src/main.rs          # Creates doc, adds item to list, exports bytes + sync msgs
+├── js-side/
+│   ├── package.json         # @automerge/automerge@^2.2.9
+│   └── repro.mjs            # Loads bytes, syncs, checks for phantom entries
+├── README.md                # Steps to reproduce, expected vs actual behavior
+└── run.sh                   # Builds Rust, runs JS, compares output
+```
+
+### Rust side (`main.rs`)
+
+```rust
+use automerge::{AutoCommit, ObjType, ReadDoc, transaction::Transactable};
+use automerge::sync::{self, SyncDoc};
+
+fn main() {
+    let mut doc = AutoCommit::new();
+    // Create a simple list with one item
+    let list = doc.put_object(automerge::ROOT, "items", ObjType::List).unwrap();
+    doc.insert(&list, 0, "item-1").unwrap();
+    
+    // Export doc bytes
+    let bytes = doc.save();
+    println!("DOC_BYTES={}", hex::encode(&bytes));
+    
+    // Generate sync message from a fresh state
+    let mut sync_state = sync::State::new();
+    if let Some(msg) = doc.sync().generate_sync_message(&mut sync_state) {
+        println!("SYNC_MSG={}", hex::encode(msg.encode()));
+    }
+    
+    // Print expected state
+    println!("EXPECTED_ITEMS=1");
+    println!("EXPECTED_ITEM_0=item-1");
+}
+```
+
+### JS side (`repro.mjs`)
+
+```js
+import { next as Automerge } from "@automerge/automerge";
+
+// Read hex-encoded bytes from stdin/env
+const docBytes = new Uint8Array(process.env.DOC_BYTES.match(/.{2}/g).map(b => parseInt(b, 16)));
+const syncMsg = process.env.SYNC_MSG
+  ? new Uint8Array(process.env.SYNC_MSG.match(/.{2}/g).map(b => parseInt(b, 16)))
+  : null;
+
+// Load the doc
+let doc = Automerge.load(docBytes);
+console.log(`Loaded: ${doc.items?.length} items`);
+
+// Apply sync message if provided
+if (syncMsg) {
+  let syncState = Automerge.initSyncState();
+  [doc, syncState] = Automerge.receiveSyncMessage(doc, syncState, syncMsg);
+  console.log(`After sync: ${doc.items?.length} items`);
+  
+  // Check each item
+  for (let i = 0; i < (doc.items?.length ?? 0); i++) {
+    const val = String(doc.items[i]);
+    console.log(`  items[${i}] = ${val}`);
+  }
+}
+
+// Add an item in JS and generate sync message back
+doc = Automerge.change(doc, d => {
+  (d.items).insertAt(1, "item-2");
+});
+console.log(`After JS change: ${doc.items?.length} items`);
+
+let syncState2 = Automerge.initSyncState();
+const [newState, msg] = Automerge.generateSyncMessage(doc, syncState2);
+if (msg) {
+  console.log(`JS sync message: ${msg.byteLength} bytes`);
+  console.log(`MSG_HEX=${Buffer.from(msg).toString('hex')}`);
+}
+```
+
+### What to check
+
+1. After loading Rust bytes in JS: does `doc.items.length === 1`? Or are there phantom items?
+2. After applying Rust sync message in JS: same check
+3. After JS generates a sync message and Rust applies it: does Rust see `item-2`?
+4. Compare: does the same flow work with JS↔JS (both using `@automerge/automerge`)? If yes, the issue is cross-implementation.
+
+### Filing the issue
+
+Include in the issue:
+- Rust `automerge` crate version (`0.7.4`)
+- JS `@automerge/automerge` version (`2.2.9`)
+- Platform (macOS arm64)
+- The repro repo
+- Expected behavior: sync produces identical docs on both sides
+- Actual behavior: phantom list entries appear after sync message exchange
+- Note: Rust↔Rust sync (via Python PyO3 bindings) works perfectly with the same data
+
+### Steps
+
+- [ ] Create minimal repro repo
+- [ ] Verify it reproduces the phantom entry bug outside of nteract
+- [ ] If it reproduces: file issue on [automerge/automerge](https://github.com/automerge/automerge/issues)
+- [ ] If it does NOT reproduce: the bug is in our relay architecture, not Automerge — revisit Spike D
+- [ ] Link the issue in this plan
+
+---
+
 ## Relationship to Phase 2
 
 This spike replaces Sub-PR 2A's `@automerge/automerge` dependency with our own WASM build. Sub-PRs 2B (relay infrastructure) and 2C (hook) remain largely the same — the hook just calls `NotebookHandle` methods instead of `Automerge.*` functions. The relay is unchanged.
 
-If this works, we update the Phase 2 plan to use `automerge-wasm-notebook` and unblock Sub-PR 2C.
+If Spike C works, we update the Phase 2 plan to use `automerge-wasm-notebook` and unblock Sub-PR 2C.
+
+If Spike E reproduces the bug outside nteract, we have an upstream issue to track — and Spike C is the workaround regardless.
