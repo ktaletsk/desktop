@@ -263,7 +263,7 @@ Regardless of whether Spike C works, we should file an issue with the Automerge 
 
 ### Goal
 
-Create the smallest possible standalone repo that demonstrates: Rust `automerge = "0.7"` doc syncing with `@automerge/automerge@2.2.x` JS WASM produces phantom entries that don't exist in either doc independently.
+Create the smallest possible standalone repo that demonstrates: Rust `automerge = "0.7"` doc syncing with JS WASM produces phantom entries that don't exist in either doc independently. Test both `@automerge/automerge@2.2.x` and `@automerge/automerge@3.2.x` — we hit phantom cells with both versions.
 
 ### Reproduction structure
 
@@ -273,8 +273,9 @@ automerge-sync-repro/
 │   ├── Cargo.toml          # automerge = "0.7"
 │   └── src/main.rs          # Creates doc, adds item to list, exports bytes + sync msgs
 ├── js-side/
-│   ├── package.json         # @automerge/automerge@^2.2.9
-│   └── repro.mjs            # Loads bytes, syncs, checks for phantom entries
+│   ├── package.json         # Both versions as separate deps
+│   ├── repro-v2.mjs         # Test with @automerge/automerge@^2.2.9
+│   └── repro-v3.mjs         # Test with @automerge/automerge@^3.2.4
 ├── README.md                # Steps to reproduce, expected vs actual behavior
 └── run.sh                   # Builds Rust, runs JS, compares output
 ```
@@ -307,16 +308,18 @@ fn main() {
 }
 ```
 
-### JS side (`repro.mjs`)
+### JS side — v2 (`repro-v2.mjs`)
 
 ```js
-import { next as Automerge } from "@automerge/automerge";
+import { next as Automerge } from "@automerge/automerge-v2";  // aliased in package.json
 
 // Read hex-encoded bytes from stdin/env
 const docBytes = new Uint8Array(process.env.DOC_BYTES.match(/.{2}/g).map(b => parseInt(b, 16)));
 const syncMsg = process.env.SYNC_MSG
   ? new Uint8Array(process.env.SYNC_MSG.match(/.{2}/g).map(b => parseInt(b, 16)))
   : null;
+
+console.log("=== @automerge/automerge v2.2.x ===");
 
 // Load the doc
 let doc = Automerge.load(docBytes);
@@ -328,7 +331,7 @@ if (syncMsg) {
   [doc, syncState] = Automerge.receiveSyncMessage(doc, syncState, syncMsg);
   console.log(`After sync: ${doc.items?.length} items`);
   
-  // Check each item
+  // Check each item — phantom entries will show up here
   for (let i = 0; i < (doc.items?.length ?? 0); i++) {
     const val = String(doc.items[i]);
     console.log(`  items[${i}] = ${val}`);
@@ -349,18 +352,72 @@ if (msg) {
 }
 ```
 
+### JS side — v3 (`repro-v3.mjs`)
+
+```js
+import * as Automerge from "@automerge/automerge-v3";  // aliased in package.json
+
+// Same test as v2 but with v3 API (updateText/splice are top-level)
+const docBytes = new Uint8Array(process.env.DOC_BYTES.match(/.{2}/g).map(b => parseInt(b, 16)));
+const syncMsg = process.env.SYNC_MSG
+  ? new Uint8Array(process.env.SYNC_MSG.match(/.{2}/g).map(b => parseInt(b, 16)))
+  : null;
+
+console.log("=== @automerge/automerge v3.2.x ===");
+
+let doc = Automerge.load(docBytes);
+console.log(`Loaded: ${doc.items?.length} items`);
+
+if (syncMsg) {
+  let syncState = Automerge.initSyncState();
+  [doc, syncState] = Automerge.receiveSyncMessage(doc, syncState, syncMsg);
+  console.log(`After sync: ${doc.items?.length} items`);
+  
+  for (let i = 0; i < (doc.items?.length ?? 0); i++) {
+    const val = String(doc.items[i]);
+    console.log(`  items[${i}] = ${val}`);
+  }
+}
+
+doc = Automerge.change(doc, d => {
+  Automerge.insertAt(d.items, 1, "item-2");
+});
+console.log(`After JS change: ${doc.items?.length} items`);
+
+let syncState2 = Automerge.initSyncState();
+const [newState, msg] = Automerge.generateSyncMessage(doc, syncState2);
+if (msg) {
+  console.log(`JS sync message: ${msg.byteLength} bytes`);
+  console.log(`MSG_HEX=${Buffer.from(msg).toString('hex')}`);
+}
+```
+
+### `package.json`
+
+```json
+{
+  "type": "module",
+  "dependencies": {
+    "@automerge/automerge-v2": "npm:@automerge/automerge@^2.2.9",
+    "@automerge/automerge-v3": "npm:@automerge/automerge@^3.2.4"
+  }
+}
+```
+
 ### What to check
 
 1. After loading Rust bytes in JS: does `doc.items.length === 1`? Or are there phantom items?
 2. After applying Rust sync message in JS: same check
 3. After JS generates a sync message and Rust applies it: does Rust see `item-2`?
-4. Compare: does the same flow work with JS↔JS (both using `@automerge/automerge`)? If yes, the issue is cross-implementation.
+4. Do v2 and v3 produce the same results? (We saw phantom cells with both, but the repro should confirm)
+5. Compare: does the same flow work with JS↔JS (both using `@automerge/automerge`)? If yes, the issue is cross-implementation
+6. Also test the `doc.save()` → `Automerge.load()` → `generateSyncMessage()` → Rust `receive_sync_message()` path — this is the exact bootstrap flow that produces phantom cells in our app
 
 ### Filing the issue
 
 Include in the issue:
 - Rust `automerge` crate version (`0.7.4`)
-- JS `@automerge/automerge` version (`2.2.9`)
+- JS `@automerge/automerge` versions tested (`2.2.9` AND `3.2.4` — both affected)
 - Platform (macOS arm64)
 - The repro repo
 - Expected behavior: sync produces identical docs on both sides
