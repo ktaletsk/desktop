@@ -361,68 +361,69 @@ Key implementation details:
 - List mutations use proxy methods inside `change()` callback: `(d.cells as any).insertAt()` / `.deleteAt()`
 - Do NOT call `syncToBackend()` after `Automerge.load()` — let daemon initiate the sync exchange
 - Scalar strings from Automerge are `RawString` objects — use `String(value)` for comparison
+- **`@automerge/automerge` JS WASM is incompatible with Rust `automerge = "0.7"` at runtime** | Unit tests (JS↔JS sync) pass, but runtime sync through the Tauri relay produces phantom cells. The JS WASM package bundles a different automerge-rs build than our Rust 0.7 crate. Spike A (Python bindings using identical Rust code) works perfectly — confirmed the relay architecture is sound. The fix is Spike C: compile our own WASM from `automerge = "0.7"`. |
 
-### 🚧 Blocker: Phantom cell bug
+### 🚧 Blocker: Phantom cell bug — resolved via Spike C
 
 **Symptom:** Frontend loads 1 cell from doc bytes (e.g., `ee7e32a6`). After the first daemon sync response (106 bytes), a second cell appears (e.g., `ce2efbdf`) that doesn't exist in the daemon's doc or the Tauri relay's doc. The user types in this phantom cell and tries to execute — daemon returns "Cell not found."
 
-**What we've ruled out:**
+**What we ruled out:**
 - ~~Race condition with `notebook:updated` fallback~~ — fallback removed entirely, still happens
 - ~~Stale `frontend_peer_state` buffering messages~~ — deferred to `None` until `GetDocBytes`, still happens
 - ~~JS v3 wire format incompatibility~~ — reverted to v2.2.x, still happens
 - ~~Initial `syncToBackend()` corrupting state~~ — both with and without it, same behavior
 - ~~Sync message decode failures~~ — every message decodes OK, no errors anywhere in the relay
 
-**What the logs consistently show:**
+**What the logs consistently showed:**
 - Tauri relay receives frontend sync messages, decodes OK, applies OK — but cell list NEVER changes (BEFORE = AFTER)
 - Daemon sync responses to the frontend produce phantom cells that no Rust-side doc has
 - The frontend's `Automerge.change()` calls (source edits, cell adds) produce sync messages that the relay accepts but that have no effect on the relay's doc
 
-**Root cause hypothesis:** The three-way Automerge sync architecture (Frontend JS doc ↔ Tauri Rust doc ↔ Daemon Rust doc) with `doc.save()` bootstrap is not working. The virtual sync handshake establishes peer state for identical docs, but subsequent `Automerge.change()` calls in JS produce sync messages that the Rust `receive_sync_message` accepts silently without incorporating the changes. This may be a fundamental JS v2 ↔ Rust 0.7 sync interop issue that the unit test doesn't cover because the unit test only tests JS↔JS sync, not JS→Rust relay→Rust.
+**Root cause (confirmed via Spike A):** The `@automerge/automerge@2.2.x` npm package bundles WASM compiled from a different version of `automerge-rs` than our Rust `automerge = "0.7.4"` crate. The sync protocol is nominally compatible (messages decode OK), but the CRDT merge produces phantom cells — cells that appear in the JS doc but have no corresponding entries in the Rust doc. This is a version mismatch at the binary level, not a protocol-level incompatibility.
 
-### Exploratory spikes (Phase 2 unblock)
+**Proof:** Python bindings (`runtimed-py`) use the identical `NotebookSyncClient` (Rust `automerge = "0.7"` on both sides) and work perfectly: `session.create_cell()` → `session.execute_cell()` → output received. No phantom cells. Same relay architecture, same daemon, same sync protocol — only difference is Rust↔Rust instead of JS WASM↔Rust.
 
-The current approach of JS Automerge in the webview syncing through a Rust Automerge relay to the Rust daemon is stuck. Before continuing, we need to isolate whether the problem is the JS↔Rust sync interop, the relay architecture, or something else.
+### Exploratory spikes — results and next steps
 
-**Spike A: Reproduce with Python bindings**
+**Spike A: Python bindings ✅ CONFIRMED**
 
-The Python `runtimed` package uses `NotebookSyncClient` (Rust) directly — byte-for-byte identical to the daemon's Automerge. If we can create cells from Python and execute them, the Rust↔Rust sync path is confirmed working. Then we know the problem is specifically JS↔Rust.
+Rust↔Rust sync works perfectly. The relay architecture is sound.
 
-- [ ] Connect Python `Session` to a notebook room
-- [ ] `session.create_cell("print('hello')")` → verify cell appears in daemon doc
-- [ ] `session.execute_cell(cell_id)` → verify execution succeeds
-- [ ] If this works: JS↔Rust sync is the blocker, not the relay architecture
+```
+$ RUNTIMED_SOCKET_PATH=~/Library/Caches/runt/worktrees/bbcba761f098/runtimed.sock \
+  uv run python -c "
+from runtimed import Session
+s = Session('test-spike-a-4')
+s.connect()
+s.start_kernel()
+cell_id = s.create_cell('print(\"hello from spike A\")')
+result = s.execute_cell(cell_id, timeout_secs=15)
+print(result)
+"
+# ExecutionResult(cell=cell-64664e85-..., status=ok, outputs=1)
+```
 
-**Spike B: Deno FFI bindings**
+- [x] Connect Python `Session` to a notebook room
+- [x] `session.create_cell("print('hello')")` → cell appears in daemon doc ✅
+- [x] `session.execute_cell(cell_id)` → execution succeeds, output received ✅
+- [x] **Conclusion: JS↔Rust sync is the blocker, not the relay architecture**
 
-Create Deno bindings that link to the same `runtimed` Rust library via FFI (similar to how `runtimed-py` links via PyO3). This gives us another directly-working Automerge peer without the JS WASM layer.
+**Spike B: Deno FFI bindings** — skipped (Spike A was sufficient to isolate the issue)
 
-- [ ] Prototype `runtimed-deno` FFI bindings for `NotebookSyncClient`
-- [ ] Connect from Deno, create cell, execute — does it work?
-- [ ] If yes: confirms the problem is JS WASM Automerge, not the relay
+**Spike C: Custom WASM bindings from `automerge = "0.7"` ← PRIMARY PATH**
 
-**Spike C: Custom WASM bindings for notebook protocol**
+Compile our own WASM from the exact same `automerge` crate the daemon uses. This eliminates the version mismatch that causes phantom cells.
 
-Instead of using `@automerge/automerge` (JS WASM from a separate automerge-rs build), compile our own WASM module from the same `automerge = "0.7"` crate the daemon uses. This eliminates any version mismatch between the JS WASM and Rust automerge.
+Full plan: [`.context/plans/spike-c-custom-automerge-wasm.md`](spike-c-custom-automerge-wasm.md)
 
-- [ ] Create a thin Rust crate that wraps `NotebookDoc` operations and compiles to WASM
-- [ ] Expose: `load(bytes)`, `add_cell(...)`, `update_source(...)`, `delete_cell(...)`, `generate_sync_message(...)`, `receive_sync_message(...)`
-- [ ] Test from Deno first (faster iteration than Tauri webview)
-- [ ] If sync works: the problem was `@automerge/automerge` JS package using a different automerge-rs version
+- [ ] Create `crates/automerge-wasm-notebook` — thin wasm-bindgen wrapper around `NotebookDoc` operations
+- [ ] `wasm-pack build` producing JS/TS/WASM for the frontend
+- [ ] Deno smoke test: create cell, sync roundtrip, verify cells match
+- [ ] Rust integration test: WASM-generated sync message applied to Rust `AutoCommit`
+- [ ] Replace `@automerge/automerge` in `useAutomergeNotebook` with `NotebookHandle` from our WASM
+- [ ] End-to-end: feature flag on, type in cell, Shift+Enter, see output
 
-**Spike D: Separate Tauri window with direct Automerge**
-
-Feature-flag a separate Tauri window that does Automerge work directly in the Rust process (not in the webview). The webview sends cell mutations as Tauri commands, the Rust side applies them to its Automerge doc and syncs to daemon. This tests whether the relay architecture works when there's no JS↔Rust sync boundary.
-
-- [ ] Environment variable flag on the Tauri side
-- [ ] Webview sends structured commands (`AddCell`, `UpdateSource`, `DeleteCell`)
-- [ ] Tauri applies to its Automerge doc directly (no JS Automerge involved)
-- [ ] If execution works: confirms the problem is JS→Rust sync, not the relay architecture
-
-**Decision point:** After spikes, choose one of:
-1. **Spike C worked** → Ship custom WASM bindings (guaranteed version match)
-2. **Spike D worked** → Keep mutations as Tauri commands, frontend is a thin view (hybrid approach)
-3. **Spike A/B showed Rust↔Rust works** → Focus debugging on JS WASM sync messages specifically
+**Spike D: Separate Tauri window** — deferred (Spike C is the more direct fix; Spike D is the fallback if WASM compilation has issues)
 
 ### Sub-PR 2D — Cleanup (after phantom cell bug is resolved and feature flag is flipped)
 
