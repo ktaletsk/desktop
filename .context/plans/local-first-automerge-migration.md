@@ -9,8 +9,8 @@
 | 0: Optimistic mutations | ✅ Done | [PR #542](https://github.com/nteract/desktop/pull/542) merged |
 | 1.1–1.3: Eliminate `NotebookState` dual-write | ✅ Done | [PR #544](https://github.com/nteract/desktop/pull/544) merged |
 | 1.4: Delegate save-to-disk to daemon | ✅ Done | [PR #545](https://github.com/nteract/desktop/pull/545) merged |
-| 2.0-pre: `runtimed-wasm` bindings | 🔄 In progress | [PR #552](https://github.com/nteract/desktop/pull/552) — WASM from `automerge = "0.7"`, CI pending |
-| 2: Frontend Automerge doc | ⬜ Fresh start | [Draft PR #547](https://github.com/nteract/desktop/pull/547) abandoned — clean rewrite using `runtimed-wasm` |
+| 2.0-pre: `runtimed-wasm` bindings | ✅ Done | [PR #552](https://github.com/nteract/desktop/pull/552) merged |
+| 2: Frontend Automerge doc | 🔄 In progress | [PR #553](https://github.com/nteract/desktop/pull/553) — fresh hook using `runtimed-wasm`, widgets working, ripping out old path |
 | 3: Authority boundary hardening | ⬜ Not started | Formalize writer roles per field |
 | 4: Optimize Tauri sync relay | ⬜ Not started | Binary IPC, reduce overhead |
 
@@ -277,7 +277,8 @@ Full removal of the `NotebookState` struct is deferred — it still serves as th
 
 ---
 
-## Phase 2.0-pre: `runtimed-wasm` bindings — [PR #552](https://github.com/nteract/desktop/pull/552)
+<details>
+<summary><h2>Phase 2.0-pre: <code>runtimed-wasm</code> bindings ✅</h2></summary>
 
 **Goal:** Ship the WASM bindings that solve the string→Text CRDT type mismatch. Pure additive — no changes to existing code.
 
@@ -287,21 +288,25 @@ Full removal of the `NotebookState` struct is deferred — it still serves as th
 - [x] 15 Deno smoke tests (cell CRUD, sync, concurrent merges, Text CRDT merge)
 - [x] CI: wasm-pack build + Deno test step in `build-linux`
 - [x] biome configured to exclude generated WASM output
-- [ ] CI green, merge to main
+- [x] CI green, merged to main
+
+</details>
 
 ---
 
-## Phase 2: Frontend Automerge doc — fresh start
+## Phase 2: Frontend Automerge doc — [PR #553](https://github.com/nteract/desktop/pull/553)
 
-> [Draft PR #547](https://github.com/nteract/desktop/pull/547) is abandoned. It accumulated layers of fixes for the JS string→Text mismatch we didn't understand yet. Starting clean with `runtimed-wasm`.
+> [Draft PR #547](https://github.com/nteract/desktop/pull/547) was abandoned — it accumulated layers of fixes for the JS string→Text mismatch we didn't understand yet. PR #553 is a clean rewrite using `runtimed-wasm`.
 
 **Goal:** The frontend owns a local Automerge document. All document mutations happen instantly on the local doc. React state is derived from it. The Tauri process becomes a sync relay.
 
-**Effort:** Medium (1-2 weeks — the Rust relay infrastructure from PR #547 is reusable). **Risk:** Low — the WASM eliminates the type mismatch that blocked us.
+**Effort:** Medium (1-2 weeks). **Risk:** Low — the WASM eliminates the type mismatch that blocked us. Widgets confirmed working.
 
 **Strategy:** Feature flag toggle. Build `useAutomergeNotebook` alongside `useNotebook`, controlled by `localStorage` or `?automerge=true` URL param. Fresh hook using `NotebookHandle` from `runtimed-wasm` — no `@automerge/automerge` JS dependency.
 
-**End state vs pragmatic step:** The WASM is the pragmatic unblock. The destination is the frontend owning a proper JS Automerge doc with presence, cursors, and ecosystem plugins (`@automerge/codemirror`). Once the WASM path works and the Tauri relay is simplified, switching back to `@automerge/automerge` JS with `ImmutableString` for non-text fields is a well-scoped change. We'll be off the broken path and into the paved one.
+**Status:** Hook working, widgets working, ready to rip out the old `useNotebook` path entirely.
+
+**End state vs pragmatic step:** The WASM is the pragmatic unblock. The destination is the frontend owning a proper JS Automerge doc with presence, cursors, and ecosystem plugins (`@automerge/codemirror`). Once the WASM path is stable and the Tauri relay is simplified, switching back to `@automerge/automerge` JS with `ImmutableString` for non-text fields is a well-scoped change. We'll be off the broken path and into the paved one.
 
 ### Hard-won lessons (from QA and debugging)
 
@@ -323,12 +328,13 @@ The Rust-side relay infrastructure is sound and reusable. The JS hook needs a cl
 - `frontend_peer_state` — separate sync state for the frontend peer (deferred init on `GetDocBytes`)
 - `automerge:from-daemon` Tauri event — relay to frontend
 
-**Rewrite (fresh hook using `runtimed-wasm`):**
+**Rewrite (fresh hook using `runtimed-wasm`) ✅:**
 - `useAutomergeNotebook` — loads `NotebookHandle` from WASM, not `@automerge/automerge`
 - Cell mutations: `handle.add_cell()`, `handle.delete_cell()`, `handle.update_source()` — no `Automerge.change()`, no proxy methods, no `RawString`
 - Sync: `handle.generate_sync_message()` / `handle.receive_sync_message()` — same relay, different WASM
 - Materialization: `handle.get_cells_json()` → parse → React state
 - Feature flag: `localStorage` + `?automerge=true` URL param
+- **Widgets working** — ipywidgets comm messages flow correctly through the new path
 
 **Drop:**
 - `@automerge/automerge` npm dependency
@@ -364,14 +370,15 @@ Not a bug in Automerge — it's a JS API design choice. The fix: `runtimed-wasm`
 
 </details>
 
-### Sub-PR 2D — Cleanup (after feature flag is flipped)
+### Sub-PR 2D — Cleanup (ripping the bandaid off)
 
-- [ ] Remove `useNotebook.ts`
+- [ ] Remove `useNotebook.ts` and `useNotebookDispatch.ts` toggle — `useAutomergeNotebook` becomes the only path
 - [ ] Remove feature flag infrastructure
 - [ ] Remove `@automerge/automerge` npm dependency
 - [ ] Remove `NotebookSyncClient` local Automerge doc from Tauri process (reduce to relay-only)
 - [ ] Remove remaining `NotebookState` disconnected-daemon fallbacks (frontend Automerge doc is the fallback)
 - [ ] Delete `notebook_state.rs` struct and unused methods
+- [ ] Remove old `invoke("add_cell")` / `invoke("delete_cell")` / `invoke("update_cell_source")` Tauri commands
 - [ ] Evaluate returning to `@automerge/automerge` JS with `ImmutableString` for presence/cursor support
 
 ### Build pipeline note
