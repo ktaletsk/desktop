@@ -279,51 +279,51 @@
 
 ## Additional observations (working behavior)
 - UV trust dialog and startup worked after daemon was running:
-  - `.../09-uv-trust-dialog-working-reference.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/09-uv-trust-dialog-working-reference.webp`
 - Kernel execution worked:
-  - `.../10-kernel-idle-working-reference.webp`
-  - `.../11-uv-execution-output-working-reference.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/10-kernel-idle-working-reference.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/11-uv-execution-output-working-reference.webp`
 - Rich outputs and error rendering worked:
-  - `.../12-rich-output-working-reference.webp`
-  - `.../13-error-output-working-reference.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/12-rich-output-working-reference.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/13-error-output-working-reference.webp`
 - Deno runtime worked:
-  - `.../14-deno-execution-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/14-deno-execution-pass.webp`
 - Mixed UV+Conda dependency flow worked:
-  - `.../15-both-deps-trust-dialog-pass.webp`
-  - `.../16-both-deps-execution-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/15-both-deps-trust-dialog-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/16-both-deps-execution-pass.webp`
 - Project-file environment detection worked:
-  - pyproject: `.../17-pyproject-execution-pass.webp`
-  - pixi: `.../18-pixi-execution-pass.webp`
-  - environment.yml: `.../19-environment-yml-execution-pass.webp`
+  - pyproject: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/17-pyproject-execution-pass.webp`
+  - pixi: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/18-pixi-execution-pass.webp`
+  - environment.yml: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/19-environment-yml-execution-pass.webp`
 - Kernel controls worked in fresh notebook validation:
   - Run All initial/second pass:
-    - `.../22-run-all-fresh-notebook-initial.webp`
-    - `.../23-run-all-first-pass-output.webp`
-    - `.../24-run-all-new-cell-added.webp`
-    - `.../25-run-all-second-pass-output.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/22-run-all-fresh-notebook-initial.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/23-run-all-first-pass-output.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/24-run-all-new-cell-added.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/25-run-all-second-pass-output.webp`
   - Restart:
-    - `.../26-restart-pass-idle.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/26-restart-pass-idle.webp`
   - Interrupt:
-    - `.../27-interrupt-pass-busy-state.webp`
-    - `.../28-interrupt-pass-stopped.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/27-interrupt-pass-busy-state.webp`
+    - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/28-interrupt-pass-stopped.webp`
 - Global Find source+output search and navigation worked:
-  - `.../29-global-find-source-and-output-pass.webp`
-  - `.../30-global-find-navigation-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/29-global-find-source-and-output-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/30-global-find-navigation-pass.webp`
 - Error-notebook behavior was consistent and useful:
-  - run-all continues after error: `.../44-run-all-continues-after-error.webp`
-  - restart+run-all stops at error: `.../45-restart-run-all-stops-at-error.webp`
+  - run-all continues after error: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/44-run-all-continues-after-error.webp`
+  - restart+run-all stops at error: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/45-restart-run-all-stops-at-error.webp`
 - Trust decline behavior was validated on mixed-deps notebook:
-  - prior UV-inline notebook had already been trusted in-session (no prompt): `.../42-trust-decline-inconclusive-already-trusted.webp`
-  - after `Don't Install` on mixed-deps notebook, notebook remained interactive and executable: `.../43-trust-decline-allows-execution.webp`
+  - prior UV-inline notebook had already been trusted in-session (no prompt): `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/42-trust-decline-inconclusive-already-trusted.webp`
+  - after `Don't Install` on mixed-deps notebook, notebook remained interactive and executable: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/43-trust-decline-allows-execution.webp`
 - File menu sample notebooks worked:
-  - `.../31-sample-menu-open-pass.webp`
-  - `.../32-sample-notebook-opened-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/31-sample-menu-open-pass.webp`
+  - `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/32-sample-notebook-opened-pass.webp`
 - Save and clone dialogs worked:
-  - untitled save dialog: `.../33-save-untitled-dialog-pass.webp`
-  - clone dialog: `.../34-clone-dialog-pass.webp`
+  - untitled save dialog: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/33-save-untitled-dialog-pass.webp`
+  - clone dialog: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/34-clone-dialog-pass.webp`
 - Markdown edit/view rendering worked:
-  - edit mode: `.../35-markdown-edit-mode-pass.webp`
-  - rendered mode: `.../36-markdown-render-pass.webp`
+  - edit mode: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/35-markdown-edit-mode-pass.webp`
+  - rendered mode: `qa/nteract-stable-v1.4.1-stable.202603052018/screenshots/36-markdown-render-pass.webp`
 
 ## Note on same-notebook multi-window sync testing
 - Exact same-path duplicate open is prevented (single-window-per-file-path behavior).
