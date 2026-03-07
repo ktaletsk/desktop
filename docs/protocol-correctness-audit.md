@@ -192,25 +192,27 @@ result = kernel_broadcast_rx.recv() => {
 
 ## Summary: Priority-Ordered Action Items
 
-### Critical (can cause stuck/lost state)
+### Fixed in This Audit
 
-1. **Add kernel death detection to unblock execution queue.** When iopub read loop exits, send a `KernelDied` command that resets `executing` to `None` and broadcasts an error status.
+1. **Add kernel death detection to unblock execution queue.** When iopub read loop exits, send a `KernelDied` command that resets `executing` to `None` and broadcasts an error status. Added `QueueCommand::KernelDied`, `KernelStatus::Dead`, and `kernel_died()` method.
 
-2. **Handle `Lagged` on `kernel_broadcast_rx` in the server sync loop.** Currently drops broadcasts silently. Add a catch-up sync.
+2. **Handle `Lagged` on `kernel_broadcast_rx` in the server sync loop.** Previously dropped broadcasts silently. Now triggers a full Automerge doc sync to catch the peer up.
 
-3. **Add send-side frame size check in `send_frame`.** Prevent silent truncation at the u32 boundary.
+3. **Add send-side frame size check in `send_frame`.** Prevents silent truncation at the u32 boundary. Returns `InvalidInput` error for oversized payloads.
+
+4. **Fix auto-launch `CellError` handler not clearing queue.** The auto-launch command processor only logged cell errors but didn't clear the execution queue, breaking stop-on-error for auto-launched kernels. Now matches the manual-launch handler behavior.
 
 ### Important (protocol robustness)
 
-4. **Plan relay simplification.** The three-peer merge path is the largest correctness surface area. A passthrough relay eliminates an entire class of divergence bugs.
+5. **Plan relay simplification.** The three-peer merge path is the largest correctness surface area. A passthrough relay eliminates an entire class of divergence bugs.
 
-5. **Add automatic reconnection with backoff.** Currently manual, causing friction on daemon upgrades.
+6. **Add automatic reconnection with backoff.** Currently manual, causing friction on daemon upgrades.
 
-6. **Use `watch` channel for `changed_tx` instead of `broadcast`.** Receivers only need "something changed" signals, not every intermediate notification.
+7. **Use `watch` channel for `changed_tx` instead of `broadcast`.** Receivers only need "something changed" signals, not every intermediate notification.
 
 ### Nice-to-have (hardening)
 
-7. Add request/response correlation IDs for future pipelining support.
-8. Add a keepalive/heartbeat mechanism for half-open connection detection.
-9. Add a kernel watchdog timer — if no iopub message is received within N seconds of an execute request, consider the kernel hung.
-10. Enforce protocol version in handshake — reject unknown versions.
+8. Add request/response correlation IDs for future pipelining support.
+9. Add a keepalive/heartbeat mechanism for half-open connection detection.
+10. Add a kernel watchdog timer — if no iopub message is received within N seconds of an execute request, consider the kernel hung.
+11. Enforce protocol version in handshake — reject unknown versions.
