@@ -3159,16 +3159,19 @@ pub async fn load_notebook_from_disk(
 /// Create a new empty notebook with a single code cell.
 ///
 /// Called by daemon-owned notebook creation (`CreateNotebook` handshake).
-/// Generates a new env_id and populates the doc with default metadata for
-/// the specified runtime.
+/// Uses the provided env_id or generates a new one, and populates the doc
+/// with default metadata for the specified runtime.
 ///
-/// Returns the generated env_id on success.
+/// Returns the env_id used on success.
 pub fn create_empty_notebook(
     doc: &mut NotebookDoc,
     runtime: &str,
     default_python_env: crate::settings_doc::PythonEnvType,
+    env_id: Option<&str>,
 ) -> Result<String, String> {
-    let env_id = uuid::Uuid::new_v4().to_string();
+    let env_id = env_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let cell_id = uuid::Uuid::new_v4().to_string();
 
     // Add a single empty code cell

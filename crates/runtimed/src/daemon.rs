@@ -938,11 +938,7 @@ impl Daemon {
     ///
     /// Daemon loads the .ipynb file, derives notebook_id, creates room, populates doc.
     /// Returns NotebookConnectionInfo, then continues as normal notebook sync.
-    async fn handle_open_notebook<S>(
-        self: Arc<Self>,
-        mut stream: S,
-        path: String,
-    ) -> anyhow::Result<()>
+    async fn handle_open_notebook<S>(self: Arc<Self>, stream: S, path: String) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -950,17 +946,108 @@ impl Daemon {
 
         info!("[runtimed] OpenNotebook requested for {}", path);
 
-        // TODO(#598): Implement daemon-owned loading
-        // For now, return an error to indicate this handshake is not yet implemented
+        // Canonicalize path to derive notebook_id (stable across processes)
+        let path_buf = std::path::PathBuf::from(&path);
+        let notebook_id = path_buf
+            .canonicalize()
+            .unwrap_or_else(|_| path_buf.clone())
+            .to_string_lossy()
+            .to_string();
+
+        // Get or create room for this notebook
+        let docs_dir = self.config.notebook_docs_dir.clone();
+        let room = {
+            let mut rooms = self.notebook_rooms.lock().await;
+            crate::notebook_sync_server::get_or_create_room(
+                &mut rooms,
+                &notebook_id,
+                &docs_dir,
+                self.blob_store.clone(),
+            )
+        };
+
+        // Check if this is the first connection (doc is empty)
+        let cell_count = {
+            let doc = room.doc.read().await;
+            doc.cell_count()
+        };
+
+        // If doc is empty, load from disk (first connection to this notebook)
+        let cell_count = if cell_count == 0 {
+            let mut doc = room.doc.write().await;
+            match crate::notebook_sync_server::load_notebook_from_disk(&mut doc, &path_buf).await {
+                Ok(count) => {
+                    info!("[runtimed] Loaded {} cells from {} into room", count, path);
+                    count
+                }
+                Err(e) => {
+                    // Send error response and return
+                    let (mut reader, mut writer) = tokio::io::split(stream);
+                    let response = NotebookConnectionInfo {
+                        protocol: PROTOCOL_V2.to_string(),
+                        notebook_id: String::new(),
+                        cell_count: 0,
+                        needs_trust_approval: false,
+                        error: Some(format!("Failed to load notebook: {}", e)),
+                    };
+                    send_json_frame(&mut writer, &response).await?;
+                    // Drain any remaining data from reader to avoid broken pipe
+                    let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                    return Ok(());
+                }
+            }
+        } else {
+            // Room already has cells from another connection
+            info!(
+                "[runtimed] Room for {} already has {} cells (joining existing)",
+                path, cell_count
+            );
+            cell_count
+        };
+
+        // Get trust state (already verified during room creation)
+        let trust_state = room.trust_state.read().await;
+        let needs_trust_approval = !matches!(
+            trust_state.status,
+            runt_trust::TrustStatus::Trusted | runt_trust::TrustStatus::NoDependencies
+        );
+
+        // Send NotebookConnectionInfo response
+        let (reader, mut writer) = tokio::io::split(stream);
         let response = NotebookConnectionInfo {
             protocol: PROTOCOL_V2.to_string(),
-            notebook_id: String::new(),
-            cell_count: 0,
-            needs_trust_approval: false,
-            error: Some("OpenNotebook handshake not yet implemented".to_string()),
+            notebook_id: notebook_id.clone(),
+            cell_count,
+            needs_trust_approval,
+            error: None,
         };
-        send_json_frame(&mut stream, &response).await?;
-        Ok(())
+        send_json_frame(&mut writer, &response).await?;
+
+        // Get settings for sync and auto-launch
+        let settings = self.settings.read().await.get_all();
+        let default_runtime = settings.default_runtime;
+        let default_python_env = settings.default_python_env;
+
+        // working_dir derived from path's parent directory
+        let working_dir_path = path_buf.parent().map(|p| p.to_path_buf());
+
+        // Drop the trust_state lock before continuing
+        drop(trust_state);
+
+        // Continue with normal notebook sync (handles auto-launch internally)
+        crate::notebook_sync_server::handle_notebook_sync_connection(
+            reader,
+            writer,
+            room,
+            self.notebook_rooms.clone(),
+            notebook_id,
+            default_runtime,
+            default_python_env,
+            self.clone(),
+            working_dir_path,
+            None, // No initial_metadata - doc is already populated
+        )
+        .await
     }
 
     /// Handle a CreateNotebook connection.
@@ -969,7 +1056,7 @@ impl Daemon {
     /// Returns NotebookConnectionInfo, then continues as normal notebook sync.
     async fn handle_create_notebook<S>(
         self: Arc<Self>,
-        mut stream: S,
+        stream: S,
         runtime: String,
         working_dir: Option<String>,
     ) -> anyhow::Result<()>
@@ -983,17 +1070,81 @@ impl Daemon {
             runtime, working_dir
         );
 
-        // TODO(#598): Implement daemon-owned creation
-        // For now, return an error to indicate this handshake is not yet implemented
+        // Get settings for default Python env preference
+        let settings = self.settings.read().await.get_all();
+        let default_python_env = settings.default_python_env;
+        let default_runtime = settings.default_runtime;
+
+        // Generate notebook_id (env_id) upfront - UUID for untitled notebooks
+        let notebook_id = uuid::Uuid::new_v4().to_string();
+
+        // Create room for this notebook
+        let docs_dir = self.config.notebook_docs_dir.clone();
+        let room = {
+            let mut rooms = self.notebook_rooms.lock().await;
+            crate::notebook_sync_server::get_or_create_room(
+                &mut rooms,
+                &notebook_id,
+                &docs_dir,
+                self.blob_store.clone(),
+            )
+        };
+
+        // Populate the room's doc with the empty notebook content
+        let cell_count = {
+            let mut doc = room.doc.write().await;
+            match crate::notebook_sync_server::create_empty_notebook(
+                &mut doc,
+                &runtime,
+                default_python_env.clone(),
+                Some(&notebook_id),
+            ) {
+                Ok(_) => doc.cell_count(),
+                Err(e) => {
+                    let (mut reader, mut writer) = tokio::io::split(stream);
+                    let response = NotebookConnectionInfo {
+                        protocol: PROTOCOL_V2.to_string(),
+                        notebook_id: String::new(),
+                        cell_count: 0,
+                        needs_trust_approval: false,
+                        error: Some(format!("Failed to create notebook: {}", e)),
+                    };
+                    send_json_frame(&mut writer, &response).await?;
+                    let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                    return Ok(());
+                }
+            }
+        };
+
+        // Send NotebookConnectionInfo response
+        // New notebooks have no deps, so no trust approval needed
+        let (reader, mut writer) = tokio::io::split(stream);
         let response = NotebookConnectionInfo {
             protocol: PROTOCOL_V2.to_string(),
-            notebook_id: String::new(),
-            cell_count: 0,
+            notebook_id: notebook_id.clone(),
+            cell_count,
             needs_trust_approval: false,
-            error: Some("CreateNotebook handshake not yet implemented".to_string()),
+            error: None,
         };
-        send_json_frame(&mut stream, &response).await?;
-        Ok(())
+        send_json_frame(&mut writer, &response).await?;
+
+        // working_dir for untitled notebooks (used for project file detection)
+        let working_dir_path = working_dir.map(std::path::PathBuf::from);
+
+        // Continue with normal notebook sync
+        crate::notebook_sync_server::handle_notebook_sync_connection(
+            reader,
+            writer,
+            room,
+            self.notebook_rooms.clone(),
+            notebook_id,
+            default_runtime,
+            default_python_env,
+            self.clone(),
+            working_dir_path,
+            None, // No initial_metadata - doc is already populated
+        )
+        .await
     }
 
     /// Handle a pool state subscription connection.
