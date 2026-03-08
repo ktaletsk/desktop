@@ -387,7 +387,7 @@ impl Session {
                 .ok_or_else(|| to_py_err("Not connected"))?;
 
             // Get current cell count to determine index
-            let cells = handle.get_cells().await.map_err(to_py_err)?;
+            let cells = handle.get_cells();
             let insert_index = index.unwrap_or(cells.len());
 
             // Add cell to document
@@ -476,7 +476,7 @@ impl Session {
                 let blob_base_url = state.blob_base_url.clone();
                 let blob_store_path = state.blob_store_path.clone();
 
-                let cells = handle.get_cells().await.map_err(to_py_err)?;
+                let cells = handle.get_cells();
                 let snapshot = cells
                     .into_iter()
                     .find(|c| c.id == cell_id)
@@ -514,7 +514,7 @@ impl Session {
                 let blob_base_url = state.blob_base_url.clone();
                 let blob_store_path = state.blob_store_path.clone();
 
-                let snapshots = handle.get_cells().await.map_err(to_py_err)?;
+                let snapshots = handle.get_cells();
                 (snapshots, blob_base_url, blob_store_path)
             }; // Lock released here
 
@@ -644,7 +644,7 @@ impl Session {
                 .as_ref()
                 .ok_or_else(|| to_py_err("Not connected"))?;
 
-            handle.get_metadata(&key).await.map_err(to_py_err)
+            Ok(handle.get_metadata(&key))
         })
     }
 
@@ -1664,11 +1664,16 @@ impl Session {
 impl Session {
     /// Get the current notebook metadata snapshot.
     fn get_notebook_metadata(&self) -> PyResult<NotebookMetadataSnapshot> {
-        let json_str = self.get_metadata("notebook_metadata")?;
-        match json_str {
-            Some(s) => serde_json::from_str(&s)
-                .map_err(|e| to_py_err(format!("Invalid metadata JSON: {}", e))),
-            None => Ok(NotebookMetadataSnapshot {
+        self.connect()?;
+        let state = self.state.blocking_lock();
+        let handle = state
+            .handle
+            .as_ref()
+            .ok_or_else(|| to_py_err("Not connected"))?;
+
+        Ok(handle
+            .get_notebook_metadata()
+            .unwrap_or_else(|| NotebookMetadataSnapshot {
                 kernelspec: None,
                 language_info: None,
                 runt: RuntMetadata {
@@ -1680,8 +1685,7 @@ impl Session {
                     trust_signature: None,
                     trust_timestamp: None,
                 },
-            }),
-        }
+            }))
     }
 
     /// Set the notebook metadata snapshot.
