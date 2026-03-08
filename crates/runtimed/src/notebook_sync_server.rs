@@ -3226,7 +3226,9 @@ fn build_new_notebook_metadata(
                     None,
                     Some(CondaInlineMetadata {
                         dependencies: vec![],
-                        channels: vec![],
+                        // Default to conda-forge to match launch logic normalization
+                        // (avoids false channel-drift detection)
+                        channels: vec!["conda-forge".to_string()],
                         python: None,
                     }),
                 ),
