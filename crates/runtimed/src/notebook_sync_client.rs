@@ -110,6 +110,11 @@ enum SyncCommand {
         value: String,
         reply: oneshot::Sender<Result<(), NotebookSyncError>>,
     },
+    /// Get a metadata value from the Automerge doc (async fallback for non-notebook_metadata keys).
+    GetMetadata {
+        key: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// Send a request to the daemon and wait for a response.
     SendRequest {
         request: NotebookRequest,
@@ -166,6 +171,22 @@ impl NotebookSyncHandle {
     /// no channel round-trip.
     pub fn get_notebook_metadata(&self) -> Option<String> {
         self.snapshot_rx.borrow().notebook_metadata.clone()
+    }
+
+    /// Get a metadata value by key from the local replica.
+    ///
+    /// For `notebook_metadata`, prefer `get_notebook_metadata()` which is instant.
+    /// This async method exists for arbitrary keys that aren't in the snapshot.
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, NotebookSyncError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(SyncCommand::GetMetadata {
+                key: key.to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| NotebookSyncError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| NotebookSyncError::ChannelClosed)
     }
 
     /// Subscribe to snapshot changes.
@@ -2144,6 +2165,10 @@ async fn run_sync_task<S>(
                             publish_snapshot(&client.doc, &snapshot_tx, "mutation");
                         }
                         let _ = reply.send(result);
+                    }
+                    SyncCommand::GetMetadata { key, reply } => {
+                        let value = get_metadata_from_doc(&client.doc, &key);
+                        let _ = reply.send(value);
                     }
                     SyncCommand::SendRequest {
                         request,

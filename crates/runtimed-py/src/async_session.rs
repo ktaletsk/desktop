@@ -737,7 +737,7 @@ impl AsyncSession {
     /// Currently only supports the "notebook_metadata" key for instant reads.
     ///
     /// Args:
-    ///     key: The metadata key (must be "notebook_metadata").
+    ///     key: The metadata key.
     ///
     /// Returns a coroutine that resolves to the metadata value (str) or None.
     fn get_metadata<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -745,21 +745,19 @@ impl AsyncSession {
         let key = key.to_string();
 
         future_into_py(py, async move {
-            if key != NOTEBOOK_METADATA_KEY {
-                return Err(to_py_err(format!(
-                    "get_metadata only supports '{}' key, got '{}'",
-                    NOTEBOOK_METADATA_KEY, key
-                )));
-            }
-
             let state_guard = state.lock().await;
             let handle = state_guard
                 .handle
                 .as_ref()
                 .ok_or_else(|| to_py_err("Not connected"))?;
 
-            // Instant read from watch channel - no async, no channel round-trip
-            Ok(handle.get_notebook_metadata())
+            // Fast path for notebook_metadata: instant read from watch channel
+            if key == NOTEBOOK_METADATA_KEY {
+                return Ok(handle.get_notebook_metadata());
+            }
+
+            // Fallback for other keys: async command round-trip
+            handle.get_metadata(&key).await.map_err(to_py_err)
         })
     }
 

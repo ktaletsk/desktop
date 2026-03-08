@@ -623,13 +623,7 @@ impl Session {
     ///     The metadata value (str) or None if not set.
     fn get_metadata(&self, key: &str) -> PyResult<Option<String>> {
         self.connect()?;
-
-        if key != NOTEBOOK_METADATA_KEY {
-            return Err(to_py_err(format!(
-                "get_metadata only supports '{}' key, got '{}'",
-                NOTEBOOK_METADATA_KEY, key
-            )));
-        }
+        let key = key.to_string();
 
         self.runtime.block_on(async {
             let state = self.state.lock().await;
@@ -638,8 +632,13 @@ impl Session {
                 .as_ref()
                 .ok_or_else(|| to_py_err("Not connected"))?;
 
-            // Instant read from watch channel - no async, no channel round-trip
-            Ok(handle.get_notebook_metadata())
+            // Fast path for notebook_metadata: instant read from watch channel
+            if key == NOTEBOOK_METADATA_KEY {
+                return Ok(handle.get_notebook_metadata());
+            }
+
+            // Fallback for other keys: async command round-trip
+            handle.get_metadata(&key).await.map_err(to_py_err)
         })
     }
 
