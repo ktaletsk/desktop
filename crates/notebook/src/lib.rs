@@ -4075,38 +4075,45 @@ pub fn run(
                     .unwrap_or(false);
 
                 if main_is_empty {
-                    match load_notebook_state_for_path(
-                        &path,
-                        settings::load_settings().default_runtime,
-                    ) {
-                        Ok(new_state) => {
-                            if let Ok(context) = registry_for_open.get("main") {
-                                // Update path
-                                if let Ok(mut p) = context.path.lock() {
-                                    *p = new_state.path.clone();
-                                }
-                                // Update notebook_state for save compatibility
-                                if let Ok(mut state) = context.notebook_state.lock() {
-                                    *state = new_state;
-                                }
-                            }
-
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let title = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("Untitled.ipynb");
-                                let _ = window.set_title(title);
-                                refresh_native_menu(app_handle, &registry_for_open);
-                                let _ = emit_to_label::<_, _, _>(
-                                    &window,
-                                    window.label(),
-                                    "notebook:file-opened",
-                                    (),
-                                );
-                            }
+                    // Reuse the empty main window — update path and reconnect to daemon
+                    if let Ok(context) = registry_for_open.get("main") {
+                        // Update path in context
+                        if let Ok(mut p) = context.path.lock() {
+                            *p = Some(path.clone());
                         }
-                        Err(e) => log::error!("Failed to load notebook file: {}", e),
+
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let title = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("Untitled.ipynb");
+                            let _ = window.set_title(title);
+                            refresh_native_menu(app_handle, &registry_for_open);
+
+                            // Disconnect existing sync and reconnect with the file path
+                            let notebook_sync = context.notebook_sync.clone();
+                            let sync_generation = context.sync_generation.clone();
+                            let notebook_id = context.notebook_id.clone();
+                            let open_path = path.clone();
+                            tauri::async_runtime::spawn(async move {
+                                // Clear existing handle
+                                *notebook_sync.lock().await = None;
+                                if let Err(e) = initialize_notebook_sync_open(
+                                    window,
+                                    open_path,
+                                    notebook_sync,
+                                    sync_generation,
+                                    notebook_id,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "[file-open] Daemon sync failed for reused window: {}",
+                                        e
+                                    );
+                                }
+                            });
+                        }
                     }
                 } else if let Err(e) = open_notebook_window(app_handle, &registry_for_open, &path) {
                     log::error!("Failed to open notebook in new window: {}", e);
