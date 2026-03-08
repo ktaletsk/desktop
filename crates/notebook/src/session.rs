@@ -3,7 +3,6 @@
 //! Saves the list of open windows (with their notebook paths or env_ids) on shutdown,
 //! and restores them on startup. Works with the tauri-plugin-window-state for geometry.
 
-use crate::runtime::Runtime;
 use crate::WindowNotebookRegistry;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
