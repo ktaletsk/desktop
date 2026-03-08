@@ -708,6 +708,7 @@ async fn initialize_notebook_sync_create(
 /// This is the common tail of `initialize_notebook_sync_open` and `_create`.
 /// It stores the handle, spawns the metadata/raw-sync/broadcast receiver tasks,
 /// and emits `daemon:ready` with the connection payload.
+#[allow(clippy::too_many_arguments)]
 async fn setup_sync_receivers(
     window: tauri::WebviewWindow,
     notebook_id: String,
