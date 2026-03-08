@@ -1,6 +1,6 @@
 # Protocol Security Audit
 
-**Date**: 2026-03-08
+**Date**: 2026-03-08 (updated 2026-03-08 for #595, #601)
 **Scope**: All IPC, sync, trust, and network protocols in the nteract/desktop codebase
 
 ## Executive Summary
@@ -8,6 +8,8 @@
 The codebase implements six major protocol surfaces: daemon IPC (Unix sockets / named pipes), Automerge notebook sync, HMAC-SHA256 dependency trust, a localhost blob HTTP server, Jupyter kernel wire protocol, and a singleton lock mechanism. Overall the protocol design is solid, with several good security practices already in place (constant-time HMAC comparison, content-addressed blob hashing with strict validation, SHA-256 hashed persistence filenames, socket/key file permissions set to 0600).
 
 This audit identified 1 remaining medium-severity security issue in the blob server (CORS wildcard) and several lower-priority hardening opportunities across trust, IPC, and singleton protocols.
+
+**Update (post-#595, #601):** Two new IPC handshake variants (`OpenNotebook`, `CreateNotebook`) expand the daemon's attack surface — notably, `OpenNotebook` accepts an arbitrary file path and reads it. Dead code removal (#595) reduced the Tauri relay's surface area by eliminating fallback branches and unused commands.
 
 ---
 
@@ -43,7 +45,7 @@ Signs notebook dependency metadata (`metadata.runt.uv`, `metadata.runt.conda`) w
 | **Low** | **No Windows permission protection for key file.** The `#[cfg(unix)]` permission block means Windows builds store the key with default permissions. | `runt-trust/src/lib.rs:97-102` |
 | **Low** | **`unwrap_or_default()` on canonicalization failure silently produces empty string.** If `serde_json::to_string()` fails, all notebooks with failed serialization share the same HMAC. In practice should never fail. | `runt-trust/src/lib.rs:129` |
 | **Info** | **`trust_timestamp` is written but never verified.** Stored alongside the signature but not included in signed content and never checked. Informational-only. | `notebook/src/lib.rs:296-301` |
-| **Info** | **Trust is verified from disk, not the Automerge doc, in the daemon.** Could differ from in-memory doc if another peer has modified deps but the file hasn't been saved. Acknowledged as known limitation. | `notebook_sync_server.rs:410-448` |
+| **Info** | **Trust is verified from disk, not the Automerge doc, in the daemon.** Could differ from in-memory doc if another peer has modified deps but the file hasn't been saved. Acknowledged as known limitation. Note: the Tauri-side `verify_notebook_trust` fallback to `notebook_state` was removed (#595) — trust verification now always requires a daemon connection, which is a positive simplification. | `notebook_sync_server.rs:410-448` |
 
 ---
 
@@ -53,7 +55,7 @@ Signs notebook dependency metadata (`metadata.runt.uv`, `metadata.runt.conda`) w
 
 ### What it does
 
-The daemon listens on a Unix domain socket (`~/.cache/runt/runtimed.sock`) or Windows named pipe. All channels (pool, settings sync, notebook sync, blob) are multiplexed over this single socket using a JSON handshake that declares the channel type, followed by length-prefixed binary frames.
+The daemon listens on a Unix domain socket (`~/.cache/runt/runtimed.sock`) or Windows named pipe. All channels (pool, settings sync, notebook sync, blob, open-notebook, create-notebook) are multiplexed over this single socket using a JSON handshake that declares the channel type, followed by length-prefixed binary frames. The `OpenNotebook` and `CreateNotebook` handshakes extend the protocol: the daemon loads/creates the notebook, returns a `NotebookConnectionInfo` response (with `notebook_id`, cell count, trust status), then continues as a normal notebook sync connection.
 
 ### Strengths
 
@@ -74,9 +76,13 @@ The daemon listens on a Unix domain socket (`~/.cache/runt/runtimed.sock`) or Wi
 | **Medium** | **No connection count limit.** The accept loop spawns unbounded tasks per connection with no semaphore. A local process could exhaust memory and file descriptors. | `daemon.rs:516-534` |
 | **Medium** | **No validation of `notebook_id` string length.** An arbitrary string up to 64 KiB (control frame limit) is used as a HashMap key and logged verbatim. | `connection.rs:49`, `daemon.rs:864,896-898` |
 | **Medium** | **`working_dir` used as filesystem path without sanitization.** Client-supplied path used for project file detection (directory walk-up). Could scan arbitrary filesystem locations. Same-user access limits impact. | `daemon.rs:909`, `notebook_sync_server.rs:1116-1121` |
+| **Medium** | **`OpenNotebook` path reads arbitrary files as notebook JSON.** Client-supplied `path` is passed directly to `tokio::fs::read_to_string()` with no validation. Any same-user IPC client can force the daemon to read any user-accessible file, parse it as JSON, and populate an Automerge doc with the contents. The path is canonicalized but only for ID derivation — the raw path is read. No path allowlisting or size limit on the file read. | `daemon.rs:936-966` |
+| **Medium** | **`OpenNotebook` and `CreateNotebook` error paths drain unbounded reader.** On failure, `tokio::io::copy(&mut reader, &mut tokio::io::sink())` reads all remaining data from the client. A malicious client could keep the task alive by sending data slowly. | `daemon.rs:989-990,1120-1121` |
 | **Low** | **Parent directory created with default umask.** `create_dir_all` doesn't set explicit permissions on the socket parent directory. If umask is permissive, directory could be world-readable. | `daemon.rs:423-424` |
 | **Low** | **No authentication beyond filesystem permissions.** Any same-user process has full daemon access including `Shutdown`, `FlushPool`, and kernel execution. Standard for local daemon IPC but should be documented. | `daemon.rs:502-512` |
-| **Low** | **No protocol version validation.** `protocol: "v99"` silently treated as v2. | `connection.rs:51-52` |
+| **Low** | **No protocol version validation in legacy `NotebookSync` handshake.** `protocol: "v99"` silently treated as v2. Note: the new `OpenNotebook`/`CreateNotebook` client-side code *does* validate protocol version in the `NotebookConnectionInfo` response, which is a partial improvement. | `connection.rs:51-52` |
+| **Low** | **`CreateNotebook` runtime field not validated.** Only `"deno"` is explicitly matched; all other values (including typos or unknown runtimes) silently fall through to Python via `_ =>`. | `notebook_sync_server.rs:3172-3175` |
+| **Low** | **`load_notebook_from_disk` has no file size limit.** `tokio::fs::read_to_string(path)` reads the entire file into memory with no cap. An enormous `.ipynb` file could cause OOM. The blob store has a 100 MiB limit but notebook loading does not. | `notebook_sync_server.rs:3129` |
 | **Low** | **Settings sync uses full 100 MiB frame limit.** Settings documents should be a few KB. | `sync_server.rs:64` |
 | **Info** | **Windows named pipe has no explicit security descriptor.** Default pipe security restricts to creating user's session, but explicit ACLs would provide defense-in-depth. | `daemon.rs:552-554` |
 
@@ -172,10 +178,15 @@ Uses `flock` (Unix) / `LockFileEx` (Windows) for file-based singleton enforcemen
 
 10. **Set parent directory permissions to 0700** — Defense-in-depth for socket directory.
 
+11. **Validate `OpenNotebook` path** — Restrict to files with `.ipynb` extension and/or within known directories. Add a file size limit before reading. Prevents the daemon from being used as an arbitrary file reader.
+
+12. **Replace error-path reader drain with connection close** — `tokio::io::copy` to sink on error paths in `OpenNotebook`/`CreateNotebook` should be replaced with simply dropping the stream or using a timeout.
+
 ### Low Priority
 
-11. Add key rotation support to the trust system.
-12. Validate `working_dir` is an absolute path within home directory.
-13. Add protocol version validation in handshake.
-14. Add Windows ACL protection for key file and named pipe.
-15. Fix legacy metadata extraction in `get_raw_metadata_additional`.
+13. Add key rotation support to the trust system.
+14. Validate `working_dir` and `OpenNotebook` path as absolute paths within home directory.
+15. Add protocol version validation in legacy `NotebookSync` handshake (new handshakes already validate client-side).
+16. Add Windows ACL protection for key file and named pipe.
+17. Fix legacy metadata extraction in `get_raw_metadata_additional`.
+18. Validate `CreateNotebook` runtime against an explicit allowlist (`"python"`, `"deno"`).

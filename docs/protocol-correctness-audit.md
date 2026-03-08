@@ -1,6 +1,6 @@
 # Protocol Correctness Audit
 
-**Date**: 2026-03-08
+**Date**: 2026-03-08 (updated 2026-03-08 for #595, #601)
 **Scope**: Wire protocol, sync protocol, and kernel execution protocol correctness — race conditions, ordering guarantees, error recovery, state machine gaps
 
 This audit complements `protocol-audit.md` (security). This document focuses on protocol correctness: can the system lose messages, get stuck, diverge, or misbehave under concurrent or failure conditions?
@@ -48,6 +48,7 @@ Three Automerge peers participate in sync:
 
 - WASM schema compatibility ensures no CRDT type mismatches between frontend and daemon
 - Virtual sync handshake (`GetDocBytes`) prevents phantom cells by deferring `frontend_peer_state` initialization
+- New `OpenNotebook`/`CreateNotebook` handshakes populate daemon doc before sync begins, eliminating the client-side mutation seeding path and reducing the CRDT merge complexity during init
 - Persistence uses `watch` channel with "latest value" semantics — never queues stale saves
 - Debounced persistence with both quiet-period (500ms) and max-interval (5s) guarantees
 - `Lagged` handling for `kernel_broadcast_rx` triggers full Automerge doc sync to catch up
@@ -60,12 +61,14 @@ Three Automerge peers participate in sync:
 |----------|---------|----------|
 | **High** | **`sync_to_daemon()` drops non-sync frames during ack wait.** When the relay sends a sync message to the daemon and waits for the ack, it reads exactly one frame. If a `Broadcast` frame arrives first (kernel status, output), it is silently ignored — consumed from the socket but never queued. This is distinct from `wait_for_response_with_broadcast` which properly queues broadcasts. Every `sync_to_daemon()` call risks dropping one broadcast frame. | `notebook_sync_client.rs:1289-1298` |
 | **High** | **`changed_rx.recv()` does not handle `Lagged` or `Closed` explicitly.** The `changed_tx` broadcast channel has capacity 16. In `run_sync_loop_v2`, `changed_rx.recv()` uses `_ = changed_rx.recv()`, discarding the `Result`. If the receiver lags, `recv()` returns `Err(Lagged(n))` — the branch still fires and generates a sync message (accidentally correct), but `Lagged` is never logged. More importantly, a `Closed` error is also silently swallowed, meaning the loop never terminates when the room is being evicted. | `notebook_sync_server.rs:978` |
-| **High** | **Relay doc is a full participant, not a passthrough.** The Tauri relay maintains its own `AutoCommit` document. Every mutation goes through three merge operations. The CLAUDE.md notes this is "transitional." Until simplified, the relay's doc can diverge from both peers if sync errors are silently swallowed. The `receive_and_relay_sync_message` method uses the daemon peer state for frontend messages, which could corrupt sync state if called when `frontend_peer_state` is active. | `notebook_sync_client.rs:1623-1647`, `notebook_sync_client.rs:1248-1261` |
+| **High** | **Relay doc is a full participant, not a passthrough.** The Tauri relay maintains its own `AutoCommit` document. Every mutation goes through three merge operations. The CLAUDE.md notes this is "transitional." Until simplified, the relay's doc can diverge from both peers if sync errors are silently swallowed. The `receive_and_relay_sync_message` method uses the daemon peer state for frontend messages, which could corrupt sync state if called when `frontend_peer_state` is active. **Update (#595, #601):** Dead code removal eliminated `get_preferred_kernelspec` and trust fallback branches, reducing the relay's surface area. The new `OpenNotebook`/`CreateNotebook` paths move notebook loading to the daemon, further reducing the relay's role. However, the relay still maintains a full `AutoCommit` doc. | `notebook_sync_client.rs:1623-1647`, `notebook_sync_client.rs:1248-1261` |
 | **Medium** | **`try_send` drops sync updates silently when channel full.** When the daemon sends changes, the relay uses `try_send` on `changes_tx` (capacity 32). If full, the update is silently dropped with no logging. Cell/metadata state in the Tauri layer becomes permanently stale until the next successful send. | `notebook_sync_client.rs:1878-1882` |
 | **Medium** | **`biased` select starves socket reads under command load.** The `run_sync_task` uses `biased` select prioritizing commands over socket reads. Under sustained command load (rapid typing, auto-save), daemon broadcasts accumulate in the socket buffer, delaying kernel output display. | `notebook_sync_client.rs:1677-1683` |
 | **Medium** | **Virtual sync handshake loops at most 10 times.** When initializing `frontend_peer_state` via `GetDocBytes`, convergence is bounded by `for _ in 0..10`. For documents with complex merge histories, 10 rounds may be insufficient. Incomplete convergence causes stale/duplicate data on the first real sync cycle. | `notebook_sync_client.rs:1778` |
 | **Medium** | **Frontend sync is fire-and-forget.** `syncToRelay` calls `invoke("send_automerge_sync")` with `.catch()` that only logs. If Tauri IPC fails, the mutation exists in WASM but never reaches the daemon. Lost on page reload. No retry mechanism or user-visible error indicator. | `useAutomergeNotebook.ts:101-106` |
 | **Medium** | **`raw_sync_tx` send failures silently ignored.** If the frontend receiver is dropped, sync messages to the frontend are silently lost. The relay continues running without forwarding, with no recovery mechanism. Unlike `changes_tx` failure, this does not break the loop. | `notebook_sync_client.rs:1841,1898` |
+| **Medium** | **`do_initial_sync` uses 100ms timeout for convergence.** The new `OpenNotebook`/`CreateNotebook` init path reads sync frames in a loop with a 100ms timeout. If the daemon or network is slow (large notebook, loaded system), sync terminates prematurely and the client starts with a partially-synced doc. Unlike the virtual sync handshake (bounded by 10 rounds but explicit), this is time-bounded and sensitive to scheduling jitter. | `notebook_sync_client.rs:992-1043` |
+| **Low** | **`do_initial_sync` error frame type handling is log-only.** `Response` and `Request` frames received during init are warned but otherwise ignored. If the server sends an unexpected frame type due to a bug, the client silently proceeds with potentially incomplete state. | `notebook_sync_client.rs:1032-1037` |
 | **Low** | **Document save serializes under write lock.** `doc.save()` is called while holding `room.doc.write()`. For large documents, serialization blocks all other peers. Bytes are persisted outside the lock via `persist_tx`, but serialization itself holds the lock. | `notebook_sync_server.rs:922-923` |
 | **Low** | **`format_notebook_cells` acquires write lock per cell.** Each cell formatted individually; other peers can interleave mutations between cells, leading to partially-formatted visible state. | `notebook_sync_server.rs:2459-2466` |
 
@@ -80,6 +83,11 @@ Three Automerge peers participate in sync:
 - Room creation mutex-protected, preventing double-creation races
 - Double-check eviction pattern: checks `active_peers > 0` before lock, re-checks after
 - Eviction delay clamped (5s to 7 days)
+
+### Strengths (added #601)
+
+- `handle_open_notebook` uses write lock for check-and-load atomicity, preventing double-population of cells from concurrent opens
+- Room cleanup on load/create failure prevents stale state on retry
 
 ### Findings
 
@@ -208,3 +216,4 @@ Three Automerge peers participate in sync:
 14. Enforce protocol version in handshake.
 15. Add ephemeral state snapshots for lagged peers.
 16. Clean up `pending_history`/`pending_completions` on kernel death.
+17. Replace 100ms timeout in `do_initial_sync` with explicit sync completion detection (e.g., check `generate_sync_message` returns `None` after a round with no new incoming messages).
