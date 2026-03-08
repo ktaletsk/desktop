@@ -2267,7 +2267,10 @@ async fn reconnect_to_daemon(
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
     let sync_generation = sync_generation_for_window(&window, registry.inner())?;
     let working_dir = working_dir_for_window(&window, registry.inner())?;
+    let context_path = path_for_window(&window, registry.inner())?;
     let context_notebook_id = notebook_id_for_window(&window, registry.inner())?;
+
+    let path = context_path.lock().map_err(|e| e.to_string())?.clone();
     let notebook_id = context_notebook_id
         .lock()
         .map_err(|e| e.to_string())?
@@ -2296,23 +2299,43 @@ async fn reconnect_to_daemon(
         }
     }
 
-    // Re-initialize notebook sync.
-    // The daemon persists notebook docs, so it should have the cells.
-    // Pass empty cells - daemon sends them during initial sync.
     let webview_window = window
         .app_handle()
         .get_webview_window(window.label())
         .ok_or_else(|| "Current webview window not found".to_string())?;
-    let result = initialize_notebook_sync(
-        webview_window,
-        notebook_id,
-        vec![], // Daemon persists cells, sends during initial sync
-        None,   // Daemon has metadata
-        notebook_sync,
-        sync_generation,
-        working_dir,
-    )
-    .await;
+
+    // For saved notebooks, use daemon-owned open (daemon reloads from disk).
+    // For untitled notebooks, use the old handshake with the notebook_id (env_id)
+    // so the daemon can find the persisted Automerge doc from the previous session.
+    let result = if let Some(p) = path {
+        info!(
+            "[daemon-kernel] Reconnecting via OpenNotebook: {}",
+            p.display()
+        );
+        initialize_notebook_sync_open(
+            webview_window,
+            p,
+            notebook_sync,
+            sync_generation,
+            context_notebook_id,
+        )
+        .await
+    } else {
+        info!(
+            "[daemon-kernel] Reconnecting untitled notebook: {}",
+            notebook_id
+        );
+        initialize_notebook_sync(
+            webview_window,
+            notebook_id,
+            vec![],
+            None,
+            notebook_sync,
+            sync_generation,
+            working_dir,
+        )
+        .await
+    };
 
     reset_flag();
     result
