@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -9,6 +10,7 @@ export type UpdateStatus =
   | "available"
   | "downloading"
   | "ready"
+  | "installing-daemon"
   | "error";
 
 interface UpdaterState {
@@ -71,6 +73,18 @@ export function useUpdater() {
 
   const restartToUpdate = useCallback(async () => {
     try {
+      // Install the new daemon BEFORE relaunch to prevent version mismatch.
+      // This ensures the new app launches with a compatible daemon already running,
+      // avoiding the "restart twice" problem.
+      setState((prev) => ({ ...prev, status: "installing-daemon" }));
+      try {
+        await invoke("install_daemon_for_update");
+        logger.info("[updater] daemon installed, proceeding with relaunch");
+      } catch (e) {
+        // Log but don't block - worst case, app will upgrade daemon on next launch
+        logger.warn("[updater] pre-restart daemon install failed:", e);
+      }
+
       await relaunch();
     } catch (e) {
       logger.error("[updater] relaunch failed:", e);

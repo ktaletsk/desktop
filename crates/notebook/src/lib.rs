@@ -863,6 +863,26 @@ where
     Err(error)
 }
 
+/// Install/upgrade the daemon in preparation for app restart after update.
+///
+/// Called by the frontend before `relaunch()` to ensure the new app version
+/// launches with a compatible daemon. This prevents the "restart twice" problem
+/// where the new frontend connects to an old daemon with incompatible protocol.
+#[tauri::command]
+async fn install_daemon_for_update(app: tauri::AppHandle) -> Result<(), String> {
+    log::info!("[updater] Installing daemon before app restart...");
+
+    // Force upgrade regardless of version match - we're about to restart
+    // with a new app version that expects the new daemon
+    upgrade_daemon_via_sidecar(&app, |progress| {
+        log::info!("[updater] Daemon install progress: {:?}", progress);
+    })
+    .await?;
+
+    log::info!("[updater] Daemon installed successfully, ready for app restart");
+    Ok(())
+}
+
 /// Ensure the daemon is running using Tauri's sidecar API.
 ///
 /// This replaces the old `ensure_daemon_running` flow that used ServiceManager directly.
@@ -3072,6 +3092,8 @@ pub fn run(
             reconnect_to_daemon,
             get_automerge_doc_bytes,
             send_automerge_sync,
+            // App update support
+            install_daemon_for_update,
 
             // Kernelspec discovery (used by UI)
             list_kernelspecs,
