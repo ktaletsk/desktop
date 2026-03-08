@@ -22,7 +22,9 @@ pub mod webdriver;
 pub use runtime::Runtime;
 
 use notebook_state::{FrontendCell, NotebookState};
-use runtimed::notebook_sync_client::{NotebookSyncClient, NotebookSyncHandle};
+use runtimed::notebook_sync_client::{
+    NotebookBroadcastReceiver, NotebookSyncClient, NotebookSyncHandle, NotebookSyncReceiver,
+};
 use runtimed::protocol::{CompletionItem, HistoryEntry, NotebookRequest, NotebookResponse};
 
 use log::{debug, info, warn};
@@ -37,7 +39,7 @@ type SharedNotebookSync = Arc<tokio::sync::Mutex<Option<NotebookSyncHandle>>>;
 
 #[derive(Clone)]
 struct WindowNotebookContext {
-    // TODO(phase-1.4): Remove once save is delegated to daemon
+    // TODO(phase-4): Remove once session save reads from Arc fields
     notebook_state: Arc<Mutex<NotebookState>>,
     notebook_sync: SharedNotebookSync,
     /// Generation counter to prevent stale broadcast tasks from clobbering new connections.
@@ -52,6 +54,9 @@ struct WindowNotebookContext {
     /// Notebook ID for daemon sync — derived from path (saved) or env_id (untitled).
     /// Updated on save_notebook_as when path changes.
     notebook_id: Arc<Mutex<String>>,
+    /// Runtime type for this notebook (Python or Deno).
+    /// Used by session save so it doesn't need to read from NotebookState.
+    runtime: Runtime,
 }
 
 #[derive(Clone, Default)]
@@ -97,6 +102,16 @@ struct KernelspecInfo {
     name: String,
     display_name: String,
     language: String,
+}
+
+/// Payload emitted with the `daemon:ready` event after daemon-owned notebook loading.
+/// Carries notebook identity and trust status so the frontend can show loading state (#599)
+/// and trust prompts without additional round-trips.
+#[derive(Clone, Serialize)]
+struct DaemonReadyPayload {
+    notebook_id: String,
+    cell_count: usize,
+    needs_trust_approval: bool,
 }
 
 /// Git information for debug banner display.
@@ -615,6 +630,269 @@ async fn initialize_notebook_sync(
         window_for_ready.label(),
         "daemon:ready",
         (),
+    ) {
+        warn!("[notebook-sync] Failed to emit daemon:ready: {}", e);
+    }
+
+    Ok(())
+}
+
+/// Connect to the daemon by opening an existing notebook file.
+///
+/// The daemon loads the file, derives notebook_id, creates the room, and populates
+/// the Automerge doc. Returns after sync is established and `daemon:ready` is emitted.
+async fn initialize_notebook_sync_open(
+    window: tauri::WebviewWindow,
+    path: PathBuf,
+    notebook_sync: SharedNotebookSync,
+    sync_generation: Arc<AtomicU64>,
+    notebook_id: Arc<Mutex<String>>,
+) -> Result<(), String> {
+    let current_generation = sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let socket_path = runtimed::default_socket_path();
+    info!(
+        "[notebook-sync] Opening notebook via daemon: {} ({})",
+        path.display(),
+        socket_path.display(),
+    );
+
+    let (raw_sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let (handle, receiver, broadcast_receiver, _cells, _metadata, info) =
+        NotebookSyncClient::connect_open_split(socket_path, path, Some(raw_sync_tx))
+            .await
+            .map_err(|e| format!("sync connect (open): {}", e))?;
+
+    info!(
+        "[notebook-sync] Daemon opened notebook: id={}, cells={}, trust_approval={}",
+        info.notebook_id, info.cell_count, info.needs_trust_approval,
+    );
+
+    // Update notebook_id with the daemon's canonical ID
+    if let Ok(mut id) = notebook_id.lock() {
+        *id = info.notebook_id.clone();
+    }
+
+    let ready_payload = DaemonReadyPayload {
+        notebook_id: info.notebook_id.clone(),
+        cell_count: info.cell_count,
+        needs_trust_approval: info.needs_trust_approval,
+    };
+
+    setup_sync_receivers(
+        window,
+        info.notebook_id,
+        handle,
+        receiver,
+        broadcast_receiver,
+        raw_sync_rx,
+        notebook_sync,
+        sync_generation,
+        current_generation,
+        ready_payload,
+    )
+    .await
+}
+
+/// Connect to the daemon by creating a new empty notebook.
+///
+/// The daemon creates an empty notebook with one code cell, generates a notebook_id
+/// (UUID/env_id), and returns it. Returns after sync is established and `daemon:ready` is emitted.
+async fn initialize_notebook_sync_create(
+    window: tauri::WebviewWindow,
+    runtime: String,
+    working_dir: Option<PathBuf>,
+    notebook_sync: SharedNotebookSync,
+    sync_generation: Arc<AtomicU64>,
+    notebook_id: Arc<Mutex<String>>,
+) -> Result<(), String> {
+    let current_generation = sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let socket_path = runtimed::default_socket_path();
+    info!(
+        "[notebook-sync] Creating notebook via daemon: runtime={}, working_dir={:?} ({})",
+        runtime,
+        working_dir,
+        socket_path.display(),
+    );
+
+    let (raw_sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    let (handle, receiver, broadcast_receiver, _cells, _metadata, info) =
+        NotebookSyncClient::connect_create_split(
+            socket_path,
+            runtime,
+            working_dir,
+            Some(raw_sync_tx),
+        )
+        .await
+        .map_err(|e| format!("sync connect (create): {}", e))?;
+
+    info!(
+        "[notebook-sync] Daemon created notebook: id={}, cells={}",
+        info.notebook_id, info.cell_count,
+    );
+
+    // Update notebook_id with the daemon's generated UUID
+    if let Ok(mut id) = notebook_id.lock() {
+        *id = info.notebook_id.clone();
+    }
+
+    let ready_payload = DaemonReadyPayload {
+        notebook_id: info.notebook_id.clone(),
+        cell_count: info.cell_count,
+        needs_trust_approval: info.needs_trust_approval,
+    };
+
+    setup_sync_receivers(
+        window,
+        info.notebook_id,
+        handle,
+        receiver,
+        broadcast_receiver,
+        raw_sync_rx,
+        notebook_sync,
+        sync_generation,
+        current_generation,
+        ready_payload,
+    )
+    .await
+}
+
+/// Store the sync handle and spawn relay tasks for an established daemon connection.
+///
+/// This is the common tail of `initialize_notebook_sync_open` and `_create`.
+/// It stores the handle, spawns the metadata/raw-sync/broadcast receiver tasks,
+/// and emits `daemon:ready` with the connection payload.
+async fn setup_sync_receivers(
+    window: tauri::WebviewWindow,
+    notebook_id: String,
+    handle: NotebookSyncHandle,
+    mut receiver: NotebookSyncReceiver,
+    mut broadcast_receiver: NotebookBroadcastReceiver,
+    mut raw_sync_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    notebook_sync: SharedNotebookSync,
+    sync_generation: Arc<AtomicU64>,
+    current_generation: u64,
+    ready_payload: DaemonReadyPayload,
+) -> Result<(), String> {
+    // Store the handle for commands to use
+    *notebook_sync.lock().await = Some(handle);
+    info!(
+        "[notebook-sync] Handle stored for {} (gen {})",
+        notebook_id, current_generation,
+    );
+
+    // Spawn receiver task — forwards metadata updates to frontend
+    let window_for_receiver = window.clone();
+    let notebook_id_for_receiver = notebook_id.clone();
+    tokio::spawn(async move {
+        while let Some(update) = receiver.recv().await {
+            if let Some(ref metadata_json) = update.notebook_metadata {
+                match serde_json::from_str::<runtimed::notebook_metadata::NotebookMetadataSnapshot>(
+                    metadata_json,
+                ) {
+                    Ok(_) => {
+                        if let Err(e) = emit_to_label::<_, _, _>(
+                            &window_for_receiver,
+                            window_for_receiver.label(),
+                            "notebook:metadata_updated",
+                            metadata_json,
+                        ) {
+                            warn!("[notebook-sync] Failed to emit metadata_updated: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[notebook-sync] Failed to deserialize metadata: {}", e);
+                    }
+                }
+            }
+        }
+        info!(
+            "[notebook-sync] Receiver loop ended for {}",
+            notebook_id_for_receiver,
+        );
+    });
+
+    // Spawn raw sync relay task — forwards Automerge sync messages to frontend WASM
+    let window_for_raw_sync = window.clone();
+    let notebook_id_for_raw_sync = notebook_id.clone();
+    tokio::spawn(async move {
+        while let Some(sync_bytes) = raw_sync_rx.recv().await {
+            if let Err(e) = emit_to_label::<_, _, _>(
+                &window_for_raw_sync,
+                window_for_raw_sync.label(),
+                "automerge:from-daemon",
+                &sync_bytes,
+            ) {
+                warn!(
+                    "[notebook-sync] Failed to emit automerge:from-daemon: {}",
+                    e
+                );
+            }
+        }
+        info!(
+            "[notebook-sync] Raw sync relay ended for {}",
+            notebook_id_for_raw_sync,
+        );
+    });
+
+    // Spawn broadcast receiver task — forwards daemon kernel events to frontend.
+    // On disconnect, conditionally clears the handle using the generation counter
+    // to avoid clobbering a newer connection's handle.
+    let window_for_ready = window.clone();
+    let notebook_sync_for_disconnect = notebook_sync.clone();
+    let notebook_id_for_broadcast = notebook_id.clone();
+    let sync_generation_for_cleanup = sync_generation.clone();
+    tokio::spawn(async move {
+        while let Some(broadcast) = broadcast_receiver.recv().await {
+            debug!(
+                "[notebook-sync] Broadcast for {}: {:?}",
+                notebook_id_for_broadcast, broadcast,
+            );
+            if let Err(e) =
+                emit_to_label::<_, _, _>(&window, window.label(), "daemon:broadcast", &broadcast)
+            {
+                warn!("[notebook-sync] Failed to emit daemon:broadcast: {}", e);
+            }
+        }
+        warn!(
+            "[notebook-sync] Broadcast ended for {} (gen {}) — daemon disconnected",
+            notebook_id_for_broadcast, current_generation,
+        );
+
+        let current_gen = sync_generation_for_cleanup.load(Ordering::SeqCst);
+        if current_gen == current_generation {
+            info!(
+                "[notebook-sync] Clearing handle for {} (gen {})",
+                notebook_id_for_broadcast, current_generation,
+            );
+            *notebook_sync_for_disconnect.lock().await = None;
+            if let Err(e) =
+                emit_to_label::<_, _, _>(&window, window.label(), "daemon:disconnected", ())
+            {
+                warn!("[notebook-sync] Failed to emit daemon:disconnected: {}", e);
+            }
+        } else {
+            info!(
+                "[notebook-sync] Skipping cleanup for {} (gen {} != {})",
+                notebook_id_for_broadcast, current_generation, current_gen,
+            );
+        }
+    });
+
+    info!(
+        "[notebook-sync] Sync receivers established for {}",
+        notebook_id,
+    );
+
+    // Emit daemon:ready with connection info so frontend can show loading state / trust prompt
+    if let Err(e) = emit_to_label::<_, _, _>(
+        &window_for_ready,
+        window_for_ready.label(),
+        "daemon:ready",
+        &ready_payload,
     ) {
         warn!("[notebook-sync] Failed to emit daemon:ready: {}", e);
     }
@@ -2735,6 +3013,7 @@ fn create_window_context(state: NotebookState) -> WindowNotebookContext {
     let working_dir = state.working_dir.clone();
     let dirty = state.dirty;
     let notebook_id = derive_notebook_id(&state);
+    let runtime = state.get_runtime();
     WindowNotebookContext {
         notebook_state: Arc::new(Mutex::new(state)),
         notebook_sync: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2743,6 +3022,33 @@ fn create_window_context(state: NotebookState) -> WindowNotebookContext {
         working_dir,
         dirty: Arc::new(AtomicBool::new(dirty)),
         notebook_id: Arc::new(Mutex::new(notebook_id)),
+        runtime,
+    }
+}
+
+/// Create a window context for daemon-owned notebook loading.
+///
+/// Unlike `create_window_context`, this doesn't require a fully-parsed `NotebookState`.
+/// The daemon owns the notebook content — Tauri just needs enough state for window management.
+/// The `notebook_id` starts as a placeholder and is updated after the daemon responds.
+fn create_window_context_for_daemon(
+    path: Option<PathBuf>,
+    working_dir: Option<PathBuf>,
+    placeholder_notebook_id: String,
+    runtime: Runtime,
+) -> WindowNotebookContext {
+    // Create a minimal stub NotebookState for transitional code that still reads it
+    // (session save, file-open handler). Will be removed in Phase 4f.
+    let stub_state = NotebookState::new_empty_with_runtime(runtime.clone());
+    WindowNotebookContext {
+        notebook_state: Arc::new(Mutex::new(stub_state)),
+        notebook_sync: Arc::new(tokio::sync::Mutex::new(None)),
+        sync_generation: Arc::new(AtomicU64::new(0)),
+        path: Arc::new(Mutex::new(path)),
+        working_dir: working_dir.clone(),
+        dirty: Arc::new(AtomicBool::new(false)),
+        notebook_id: Arc::new(Mutex::new(placeholder_notebook_id)),
+        runtime,
     }
 }
 
