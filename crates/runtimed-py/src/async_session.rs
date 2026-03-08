@@ -232,6 +232,7 @@ impl AsyncSession {
                     runtime,
                     working_dir_buf,
                     None,
+                    None,
                 )
                 .await
                 .map_err(to_py_err)?;
