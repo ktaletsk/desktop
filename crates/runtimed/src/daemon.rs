@@ -923,7 +923,77 @@ impl Daemon {
             }
             Handshake::Blob => self.handle_blob_connection(stream).await,
             Handshake::PoolStateSubscribe => self.handle_pool_state_subscription(stream).await,
+            Handshake::OpenNotebook { path } => self.handle_open_notebook(stream, path).await,
+            Handshake::CreateNotebook {
+                runtime,
+                working_dir,
+            } => {
+                self.handle_create_notebook(stream, runtime, working_dir)
+                    .await
+            }
         }
+    }
+
+    /// Handle an OpenNotebook connection.
+    ///
+    /// Daemon loads the .ipynb file, derives notebook_id, creates room, populates doc.
+    /// Returns NotebookConnectionInfo, then continues as normal notebook sync.
+    async fn handle_open_notebook<S>(
+        self: Arc<Self>,
+        mut stream: S,
+        path: String,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use crate::connection::{send_json_frame, NotebookConnectionInfo, PROTOCOL_V2};
+
+        info!("[runtimed] OpenNotebook requested for {}", path);
+
+        // TODO(#598): Implement daemon-owned loading
+        // For now, return an error to indicate this handshake is not yet implemented
+        let response = NotebookConnectionInfo {
+            protocol: PROTOCOL_V2.to_string(),
+            notebook_id: String::new(),
+            cell_count: 0,
+            needs_trust_approval: false,
+            error: Some("OpenNotebook handshake not yet implemented".to_string()),
+        };
+        send_json_frame(&mut stream, &response).await?;
+        Ok(())
+    }
+
+    /// Handle a CreateNotebook connection.
+    ///
+    /// Daemon creates empty room with one code cell, generates env_id as notebook_id.
+    /// Returns NotebookConnectionInfo, then continues as normal notebook sync.
+    async fn handle_create_notebook<S>(
+        self: Arc<Self>,
+        mut stream: S,
+        runtime: String,
+        working_dir: Option<String>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use crate::connection::{send_json_frame, NotebookConnectionInfo, PROTOCOL_V2};
+
+        info!(
+            "[runtimed] CreateNotebook requested (runtime={}, working_dir={:?})",
+            runtime, working_dir
+        );
+
+        // TODO(#598): Implement daemon-owned creation
+        // For now, return an error to indicate this handshake is not yet implemented
+        let response = NotebookConnectionInfo {
+            protocol: PROTOCOL_V2.to_string(),
+            notebook_id: String::new(),
+            cell_count: 0,
+            needs_trust_approval: false,
+            error: Some("CreateNotebook handshake not yet implemented".to_string()),
+        };
+        send_json_frame(&mut stream, &response).await?;
+        Ok(())
     }
 
     /// Handle a pool state subscription connection.
