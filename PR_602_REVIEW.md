@@ -86,6 +86,81 @@ The entire `format.rs` module is deleted. This contained `format_python()` and `
 
 The `get_preferred_kernelspec` Tauri command is removed from the command list and its implementation deleted. This was used as a fallback path reading from `notebook_state`. If the frontend calls `invoke("get_preferred_kernelspec")`, it will now get an error. Ensure the frontend has been updated to no longer call this command.
 
+### 7. Inconsistent `daemon:ready` payload for Restore path (Medium)
+
+**File:** `crates/notebook/src/lib.rs`
+
+The `OpenMode::Restore` path uses the legacy `initialize_notebook_sync()` which does **not** call `setup_sync_receivers()` and therefore does **not** emit `daemon:ready` with a `DaemonReadyPayload`. If the frontend expects this event to know when the notebook is ready, restored untitled notebooks will hang in a loading state. The Open/Create paths both emit this event via `setup_sync_receivers()`.
+
+**Fix:** Either unify the Restore path to also call `setup_sync_receivers()`, or have the legacy `initialize_notebook_sync()` emit `daemon:ready` with an equivalent payload.
+
+### 8. Wrong `runtime` recorded for opened notebooks (Medium)
+
+**File:** `crates/notebook/src/lib.rs`, `create_notebook_window_for_daemon()`
+
+In the `OpenMode::Open` branch:
+```rust
+let runtime = settings::load_settings().default_runtime;
+```
+
+This uses the user's *default* runtime instead of the notebook's *actual* runtime (which is embedded in the kernelspec metadata). A Deno notebook opened by a user whose default is Python will have `runtime: Python` in `WindowNotebookContext`, causing incorrect session save data. The actual runtime isn't known until the daemon responds with `NotebookConnectionInfo`, so this may need to be updated after the daemon connection completes.
+
+### 9. Heartbeat monitor creates a new ZMQ connection every 5 seconds (Medium)
+
+**File:** `crates/runtimed/src/kernel_manager.rs`
+
+```rust
+loop {
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let check = async {
+        let mut hb = runtimelib::create_client_heartbeat_connection(&hb_conn_info).await?;
+        hb.single_heartbeat().await
+    };
+    ...
+}
+```
+
+Each heartbeat check creates a new ZMQ connection, sends a heartbeat, and drops it. With many kernels, this creates significant connection churn. The connection should be created once and reused across heartbeat checks, falling back to reconnection only on error.
+
+### 10. Single heartbeat failure kills the kernel (Medium)
+
+**File:** `crates/runtimed/src/kernel_manager.rs`
+
+A single heartbeat timeout or connection error immediately triggers `QueueCommand::KernelDied`. Transient network issues or heavy computation (which may delay the kernel's ZMQ event loop) will cause false positives. Consider requiring 2-3 consecutive failures before declaring the kernel dead.
+
+### 11. Empty notebooks (0 cells) cause re-load on every connection (Low-Medium)
+
+**File:** `crates/runtimed/src/daemon.rs`, `handle_open_notebook()`
+
+```rust
+if existing_count == 0 {
+    // First connection - load from disk
+```
+
+Using `cell_count == 0` as a proxy for "not loaded yet" means a legitimately empty `.ipynb` file (or one with only metadata) will trigger a re-load from disk on every new connection. Consider using a `loaded: bool` flag in the room instead.
+
+### 12. Error-path stream drain has no timeout (Low)
+
+**File:** `crates/runtimed/src/daemon.rs`, `handle_open_notebook()` and `handle_create_notebook()`
+
+```rust
+let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+```
+
+If the client never closes the connection after receiving an error response, this drain will block the task indefinitely. Add a timeout (e.g., 5 seconds) or simply drop the stream.
+
+### 13. Silent failure on poisoned mutex (Low)
+
+**File:** `crates/notebook/src/lib.rs`, `initialize_notebook_sync_open()` / `_create()`
+
+```rust
+if let Ok(mut id) = notebook_id.lock() {
+    *id = info.notebook_id.clone();
+}
+```
+
+A poisoned mutex silently leaves a stale placeholder ID. This should at least log a warning on the `Err` branch.
+
 ---
 
 ## Positive Observations
@@ -145,3 +220,13 @@ The `skip_capabilities` boolean parameter on `handle_notebook_sync_connection` i
 3. **Extract common connection logic** in `notebook_sync_client.rs` — the `init_open_notebook`, `init_create_notebook`, and existing `init` all share the pattern of sending a handshake, receiving a response, and calling `do_initial_sync`. A helper that takes a handshake enum and response parser could reduce the duplication.
 
 4. **The `build_new_notebook_metadata` function** in `notebook_sync_server.rs` duplicates logic that previously lived in `NotebookState::new_empty_with_runtime`. Consider whether both are still needed or if one can be removed.
+
+5. **Unify receiver spawning** — `initialize_notebook_sync` (Restore path) inlines the same receiver/broadcast/raw-sync spawning that `setup_sync_receivers` extracts for Open/Create. This is the root cause of the inconsistent `daemon:ready` behavior and should be unified.
+
+6. **Reuse heartbeat ZMQ connection** — create it once and reuse across checks, with reconnection on error. Add a consecutive-failure threshold (e.g., 3) before declaring the kernel dead.
+
+7. **Replace 6-element tuple return type** in `connect_open_split` / `connect_create_split` with a named struct for readability.
+
+8. **Add a timeout** to the error-path `tokio::io::copy` drain, or simply drop the stream.
+
+9. **Document the invariant** that `notebook_id == env_id` for untitled notebooks — session restore silently fails if this breaks.
