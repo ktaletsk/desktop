@@ -3101,6 +3101,172 @@ fn parse_cells_from_ipynb(json: &serde_json::Value) -> Option<Vec<CellSnapshot>>
     Some(parsed_cells)
 }
 
+/// Parse notebook metadata from a .ipynb JSON value.
+///
+/// Uses `NotebookMetadataSnapshot::from_metadata_value` which extracts
+/// kernelspec, language_info, and runt namespace from the metadata.
+fn parse_metadata_from_ipynb(json: &serde_json::Value) -> Option<NotebookMetadataSnapshot> {
+    let metadata = json.get("metadata")?;
+    Some(NotebookMetadataSnapshot::from_metadata_value(metadata))
+}
+
+/// Load notebook cells and metadata from a .ipynb file into a NotebookDoc.
+///
+/// Called by daemon-owned notebook loading (`OpenNotebook` handshake).
+/// Parses the file and populates the Automerge doc with cells and metadata.
+///
+/// Returns the cell count on success.
+pub async fn load_notebook_from_disk(
+    doc: &mut NotebookDoc,
+    path: &std::path::Path,
+) -> Result<usize, String> {
+    // Read the file
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("Failed to read notebook: {}", e))?;
+
+    // Parse JSON
+    let json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Invalid notebook JSON: {}", e))?;
+
+    // Parse cells
+    let cells = parse_cells_from_ipynb(&json)
+        .ok_or_else(|| "Failed to parse cells from notebook".to_string())?;
+
+    // Populate cells in the doc
+    for (i, cell) in cells.iter().enumerate() {
+        doc.add_cell(i, &cell.id, &cell.cell_type)
+            .map_err(|e| format!("Failed to add cell: {}", e))?;
+        doc.update_source(&cell.id, &cell.source)
+            .map_err(|e| format!("Failed to update source: {}", e))?;
+        if !cell.outputs.is_empty() {
+            doc.set_outputs(&cell.id, &cell.outputs)
+                .map_err(|e| format!("Failed to set outputs: {}", e))?;
+        }
+        doc.set_execution_count(&cell.id, &cell.execution_count)
+            .map_err(|e| format!("Failed to set execution count: {}", e))?;
+    }
+
+    // Parse and set metadata
+    if let Some(metadata_snapshot) = parse_metadata_from_ipynb(&json) {
+        doc.set_metadata_snapshot(&metadata_snapshot)
+            .map_err(|e| format!("Failed to set metadata: {}", e))?;
+    }
+
+    Ok(cells.len())
+}
+
+/// Create a new empty notebook with a single code cell.
+///
+/// Called by daemon-owned notebook creation (`CreateNotebook` handshake).
+/// Generates a new env_id and populates the doc with default metadata for
+/// the specified runtime.
+///
+/// Returns the generated env_id on success.
+pub fn create_empty_notebook(
+    doc: &mut NotebookDoc,
+    runtime: &str,
+    default_python_env: crate::settings_doc::PythonEnvType,
+) -> Result<String, String> {
+    let env_id = uuid::Uuid::new_v4().to_string();
+    let cell_id = uuid::Uuid::new_v4().to_string();
+
+    // Add a single empty code cell
+    doc.add_cell(0, &cell_id, "code")
+        .map_err(|e| format!("Failed to add cell: {}", e))?;
+
+    // Build metadata based on runtime
+    let metadata_snapshot = build_new_notebook_metadata(runtime, &env_id, default_python_env);
+
+    doc.set_metadata_snapshot(&metadata_snapshot)
+        .map_err(|e| format!("Failed to set metadata: {}", e))?;
+
+    Ok(env_id)
+}
+
+/// Build default metadata for a new notebook based on runtime.
+fn build_new_notebook_metadata(
+    runtime: &str,
+    env_id: &str,
+    default_python_env: crate::settings_doc::PythonEnvType,
+) -> NotebookMetadataSnapshot {
+    use crate::notebook_metadata::{
+        CondaInlineMetadata, KernelspecSnapshot, LanguageInfoSnapshot, RuntMetadata,
+        UvInlineMetadata,
+    };
+
+    let (kernelspec, language_info, runt) = match runtime {
+        "deno" => (
+            KernelspecSnapshot {
+                name: "deno".to_string(),
+                display_name: "Deno".to_string(),
+                language: Some("typescript".to_string()),
+            },
+            LanguageInfoSnapshot {
+                name: "typescript".to_string(),
+                version: None,
+            },
+            RuntMetadata {
+                schema_version: "1".to_string(),
+                env_id: Some(env_id.to_string()),
+                uv: None,
+                conda: None,
+                deno: None,
+                trust_signature: None,
+                trust_timestamp: None,
+            },
+        ),
+        _ => {
+            // Python (default)
+            let (uv, conda) = match default_python_env {
+                crate::settings_doc::PythonEnvType::Conda => (
+                    None,
+                    Some(CondaInlineMetadata {
+                        dependencies: vec![],
+                        channels: vec![],
+                        python: None,
+                    }),
+                ),
+                crate::settings_doc::PythonEnvType::Uv
+                | crate::settings_doc::PythonEnvType::Other(_) => (
+                    Some(UvInlineMetadata {
+                        dependencies: vec![],
+                        requires_python: None,
+                    }),
+                    None,
+                ),
+            };
+
+            (
+                KernelspecSnapshot {
+                    name: "python3".to_string(),
+                    display_name: "Python 3".to_string(),
+                    language: Some("python".to_string()),
+                },
+                LanguageInfoSnapshot {
+                    name: "python".to_string(),
+                    version: None,
+                },
+                RuntMetadata {
+                    schema_version: "1".to_string(),
+                    env_id: Some(env_id.to_string()),
+                    uv,
+                    conda,
+                    deno: None,
+                    trust_signature: None,
+                    trust_timestamp: None,
+                },
+            )
+        }
+    };
+
+    NotebookMetadataSnapshot {
+        kernelspec: Some(kernelspec),
+        language_info: Some(language_info),
+        runt,
+    }
+}
+
 /// Apply external .ipynb changes to the Automerge doc.
 ///
 /// Compares cells by ID and:
