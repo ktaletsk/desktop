@@ -20,6 +20,11 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
 import { Slider } from "@/components/ui/slider";
 import type { ThemeMode } from "@/hooks/useSyncedSettings";
 import { isKnownPythonEnv, isKnownRuntime } from "@/hooks/useSyncedSettings";
@@ -351,6 +356,61 @@ export function NotebookToolbar({
             : "uv"
         : (envTypeHint ?? null)
       : null;
+  const showKernelErrorTooltip =
+    !envProgress?.isActive &&
+    !envProgress?.error &&
+    kernelStatus === KERNEL_STATUS.ERROR &&
+    Boolean(kernelErrorMessage?.trim());
+  const kernelStatusAriaLabel = envProgress?.isActive
+    ? envProgress.statusText
+    : envProgress?.error
+      ? envProgress.statusText
+      : showKernelErrorTooltip
+        ? `Error \u2014 ${kernelErrorMessage}`
+        : kernelStatusText;
+  const kernelStatusTitle = envProgress?.isActive
+    ? envProgress.statusText
+    : envProgress?.error
+      ? envProgress.error
+      : showKernelErrorTooltip
+        ? undefined
+        : kernelStatusText;
+  const kernelStatusIndicator = (
+    <>
+      <div
+        className={cn(
+          "h-2 w-2 shrink-0 rounded-full",
+          kernelStatus === KERNEL_STATUS.IDLE && "bg-green-500",
+          kernelStatus === KERNEL_STATUS.BUSY && "bg-amber-500",
+          kernelStatus === KERNEL_STATUS.STARTING &&
+            "bg-blue-500 animate-pulse",
+          isKernelNotStarted && "bg-gray-400 dark:bg-gray-500",
+          kernelStatus === KERNEL_STATUS.ERROR && "bg-red-500",
+        )}
+      />
+      <span className="text-xs text-muted-foreground whitespace-nowrap">
+        {envProgress?.isActive ? (
+          envProgress.statusText
+        ) : envProgress?.error ? (
+          <span className="text-red-600 dark:text-red-400">
+            {envProgress.statusText}
+          </span>
+        ) : (
+          <span
+            className={cn(
+              "capitalize",
+              kernelStatus === KERNEL_STATUS.ERROR &&
+                "text-red-600 dark:text-red-400",
+              showKernelErrorTooltip &&
+                "cursor-help underline decoration-dotted underline-offset-2",
+            )}
+          >
+            {kernelStatusText}
+          </span>
+        )}
+      </span>
+    </>
+  );
 
   return (
     <Collapsible open={settingsOpen} onOpenChange={setSettingsOpen}>
@@ -554,59 +614,44 @@ export function NotebookToolbar({
           </button>
 
           {/* Kernel status */}
-          <div
-            className="flex items-center gap-1.5 whitespace-nowrap"
-            role="status"
-            aria-label={`Kernel: ${
-              envProgress?.isActive
-                ? envProgress.statusText
-                : envProgress?.error
-                  ? envProgress.statusText
-                  : kernelStatus === KERNEL_STATUS.ERROR && kernelErrorMessage
-                    ? `Error \u2014 ${kernelErrorMessage}`
-                    : kernelStatusText
-            }`}
-            title={
-              envProgress?.isActive
-                ? envProgress.statusText
-                : envProgress?.error
-                  ? envProgress.error
-                  : kernelStatus === KERNEL_STATUS.ERROR && kernelErrorMessage
-                    ? `Error \u2014 ${kernelErrorMessage}`
-                    : kernelStatusText
-            }
-          >
-            <div
-              className={cn(
-                "h-2 w-2 shrink-0 rounded-full",
-                kernelStatus === KERNEL_STATUS.IDLE && "bg-green-500",
-                kernelStatus === KERNEL_STATUS.BUSY && "bg-amber-500",
-                kernelStatus === KERNEL_STATUS.STARTING &&
-                  "bg-blue-500 animate-pulse",
-                isKernelNotStarted && "bg-gray-400 dark:bg-gray-500",
-                kernelStatus === KERNEL_STATUS.ERROR && "bg-red-500",
-              )}
-            />
-            <span className="text-xs text-muted-foreground whitespace-nowrap">
-              {envProgress?.isActive ? (
-                envProgress.statusText
-              ) : envProgress?.error ? (
-                <span className="text-red-600 dark:text-red-400">
-                  {envProgress.statusText}
-                </span>
-              ) : (
-                <span
-                  className={cn(
-                    "capitalize",
-                    kernelStatus === KERNEL_STATUS.ERROR &&
-                      "text-red-600 dark:text-red-400",
-                  )}
+          {showKernelErrorTooltip ? (
+            <div role="status" aria-label={`Kernel: ${kernelStatusAriaLabel}`}>
+              <HoverCard openDelay={0} closeDelay={0}>
+                <HoverCardTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`Kernel: ${kernelStatusAriaLabel}`}
+                    className="flex items-center gap-1.5 whitespace-nowrap rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    data-testid="kernel-error-status"
+                  >
+                    {kernelStatusIndicator}
+                  </button>
+                </HoverCardTrigger>
+                <HoverCardContent
+                  align="end"
+                  side="bottom"
+                  className="w-80 max-w-[min(24rem,calc(100vw-1rem))] space-y-1 p-3"
+                  data-testid="kernel-error-tooltip"
                 >
-                  {kernelStatusText}
-                </span>
-              )}
-            </span>
-          </div>
+                  <p className="text-xs font-medium text-red-600 dark:text-red-400">
+                    Kernel error
+                  </p>
+                  <p className="text-xs text-foreground whitespace-pre-wrap break-words">
+                    {kernelErrorMessage}
+                  </p>
+                </HoverCardContent>
+              </HoverCard>
+            </div>
+          ) : (
+            <div
+              className="flex items-center gap-1.5 whitespace-nowrap"
+              role="status"
+              aria-label={`Kernel: ${kernelStatusAriaLabel}`}
+              title={kernelStatusTitle}
+            >
+              {kernelStatusIndicator}
+            </div>
+          )}
 
           <div className="h-4 w-px bg-border" />
 

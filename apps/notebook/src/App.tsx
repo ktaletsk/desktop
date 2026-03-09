@@ -123,6 +123,9 @@ function AppContent() {
   const [showIsolationTest, setShowIsolationTest] = useState(false);
   const [trustDialogOpen, setTrustDialogOpen] = useState(false);
   const [clearingDeps, setClearingDeps] = useState(false);
+  const [kernelErrorMessage, setKernelErrorMessage] = useState<string | null>(
+    null,
+  );
   // Track when sync/restart just completed for success feedback
   const [justSynced, setJustSynced] = useState(false);
 
@@ -271,6 +274,12 @@ function AppContent() {
     onUpdateDisplayData: updateOutputByDisplayId,
     onClearOutputs: clearCellOutputs, // Handle broadcast from other windows
     onCommMessage: handleCommMessage, // Route comm messages to widget store
+    onKernelError: setKernelErrorMessage,
+    onStatusChange: (status) => {
+      if (status !== KERNEL_STATUS.ERROR) {
+        setKernelErrorMessage(null);
+      }
+    },
   });
 
   // Derive values from daemon kernel
@@ -403,6 +412,7 @@ function AppContent() {
     if (info.status === "trusted" || info.status === "no_dependencies") {
       // Trusted - launch kernel via daemon
       // Both kernel_type and env_source use "auto" - daemon detects from Automerge doc
+      setKernelErrorMessage(null);
       const response = await launchKernel("auto", "auto");
       if (response.result === "error") {
         logger.error("[App] tryStartKernel: daemon error", response.error);
@@ -524,6 +534,7 @@ function AppContent() {
       pendingKernelStartRef.current = false;
       // Fire and forget - dialog closes immediately, kernel starts in background
       // Use "auto" for both - daemon detects from Automerge doc
+      setKernelErrorMessage(null);
       launchKernel("auto", "auto").catch((e) => {
         logger.error("[App] kernel launch after trust approval failed:", e);
       });
@@ -539,6 +550,7 @@ function AppContent() {
 
   // Start kernel explicitly with pyproject.toml (user action from DependencyHeader)
   const handleStartKernelWithPyproject = useCallback(async () => {
+    setKernelErrorMessage(null);
     const response = await launchKernel("python", "uv:pyproject");
     if (response.result === "error") {
       logger.error(
@@ -923,6 +935,7 @@ function AppContent() {
       )}
       <NotebookToolbar
         kernelStatus={kernelStatus}
+        kernelErrorMessage={kernelErrorMessage}
         envSource={envSource}
         envTypeHint={envTypeHint}
         dirty={dirty}
