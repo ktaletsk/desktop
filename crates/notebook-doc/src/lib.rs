@@ -372,6 +372,53 @@ impl NotebookDoc {
         Ok(())
     }
 
+    /// Insert a fully-populated cell at the given index in a single operation.
+    ///
+    /// Unlike calling `add_cell` + `update_source` + `set_outputs` +
+    /// `set_execution_count` sequentially, this method reuses the `ObjId`
+    /// returned by each Automerge insertion — no `find_cell_index` lookup
+    /// is needed. This eliminates the O(n) linear scan per operation that
+    /// makes sequential calls O(n²) during bulk loads.
+    pub fn add_cell_full(
+        &mut self,
+        index: usize,
+        cell_id: &str,
+        cell_type: &str,
+        source: &str,
+        outputs: &[String],
+        execution_count: &str,
+    ) -> Result<(), AutomergeError> {
+        let cells_id = self
+            .cells_list_id()
+            .ok_or_else(|| AutomergeError::InvalidObjId("cells list not found".into()))?;
+
+        let len = self.doc.length(&cells_id);
+        let index = index.min(len);
+
+        let cell_map = self.doc.insert_object(&cells_id, index, ObjType::Map)?;
+        self.doc.put(&cell_map, "id", cell_id)?;
+        self.doc.put(&cell_map, "cell_type", cell_type)?;
+
+        let source_id = self.doc.put_object(&cell_map, "source", ObjType::Text)?;
+        if !source.is_empty() {
+            // splice_text directly inserts into the empty Text CRDT.
+            // update_text would run a Myers diff from "" → source, which is
+            // O(n) per character and gets progressively slower as the
+            // Automerge document grows.
+            self.doc.splice_text(&source_id, 0, 0, source)?;
+        }
+
+        self.doc
+            .put(&cell_map, "execution_count", execution_count)?;
+
+        let outputs_id = self.doc.put_object(&cell_map, "outputs", ObjType::List)?;
+        for (i, output) in outputs.iter().enumerate() {
+            self.doc.insert(&outputs_id, i, output.as_str())?;
+        }
+
+        Ok(())
+    }
+
     /// Delete a cell by ID. Returns `true` if the cell was found and deleted.
     pub fn delete_cell(&mut self, cell_id: &str) -> Result<bool, AutomergeError> {
         let cells_id = match self.cells_list_id() {
@@ -385,6 +432,21 @@ impl NotebookDoc {
             }
             None => Ok(false),
         }
+    }
+
+    /// Remove all cells from the document.
+    ///
+    /// Used to clean up after a failed streaming load so the next
+    /// connection can retry from a clean state.
+    pub fn clear_all_cells(&mut self) -> Result<(), AutomergeError> {
+        if let Some(cells_id) = self.cells_list_id() {
+            let len = self.doc.length(&cells_id);
+            // Delete from the end to avoid index shifting
+            for i in (0..len).rev() {
+                self.doc.delete(&cells_id, i)?;
+            }
+        }
+        Ok(())
     }
 
     // ── Source editing ───────────────────────────────────────────────
@@ -1806,5 +1868,75 @@ mod tests {
             client.get_metadata("custom_key"),
             Some("custom_value".to_string())
         );
+    }
+
+    #[test]
+    fn test_add_cell_full_populates_all_fields() {
+        let mut doc = NotebookDoc::new("nb-full");
+        doc.add_cell_full(
+            0,
+            "cell-full",
+            "code",
+            "print('hello')",
+            &["hash1".to_string(), "hash2".to_string()],
+            "42",
+        )
+        .unwrap();
+
+        assert_eq!(doc.cell_count(), 1);
+        let cell = doc.get_cell("cell-full").unwrap();
+        assert_eq!(cell.id, "cell-full");
+        assert_eq!(cell.cell_type, "code");
+        assert_eq!(cell.source, "print('hello')");
+        assert_eq!(cell.execution_count, "42");
+        assert_eq!(cell.outputs, vec!["hash1", "hash2"]);
+    }
+
+    #[test]
+    fn test_add_cell_full_empty_source() {
+        let mut doc = NotebookDoc::new("nb-empty-src");
+        doc.add_cell_full(0, "cell-es", "code", "", &[], "null")
+            .unwrap();
+
+        let cell = doc.get_cell("cell-es").unwrap();
+        assert_eq!(cell.source, "");
+        assert_eq!(cell.execution_count, "null");
+        assert!(cell.outputs.is_empty());
+    }
+
+    #[test]
+    fn test_add_cell_full_index_ordering() {
+        let mut doc = NotebookDoc::new("nb-order");
+        doc.add_cell_full(0, "a", "code", "first", &[], "null")
+            .unwrap();
+        doc.add_cell_full(1, "b", "code", "second", &[], "null")
+            .unwrap();
+        doc.add_cell_full(2, "c", "code", "third", &[], "null")
+            .unwrap();
+
+        let cells = doc.get_cells();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].id, "a");
+        assert_eq!(cells[0].source, "first");
+        assert_eq!(cells[1].id, "b");
+        assert_eq!(cells[1].source, "second");
+        assert_eq!(cells[2].id, "c");
+        assert_eq!(cells[2].source, "third");
+    }
+
+    #[test]
+    fn test_clear_all_cells() {
+        let mut doc = NotebookDoc::new("nb-clear");
+        doc.add_cell(0, "c1", "code").unwrap();
+        doc.add_cell(1, "c2", "code").unwrap();
+        doc.add_cell(2, "c3", "markdown").unwrap();
+        assert_eq!(doc.cell_count(), 3);
+
+        doc.clear_all_cells().unwrap();
+        assert_eq!(doc.cell_count(), 0);
+        assert_eq!(doc.get_cells(), vec![]);
+
+        // notebook_id metadata should be preserved
+        assert_eq!(doc.notebook_id(), Some("nb-clear".to_string()));
     }
 }
