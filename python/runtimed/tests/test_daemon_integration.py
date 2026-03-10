@@ -1122,9 +1122,7 @@ class TestKernelLaunchMetadata:
         """Non-notebook metadata keys remain readable after the watch refactor."""
         session.set_metadata("custom_key", "custom_value")
 
-        wait_for_metadata(
-            session, "custom_key", check=lambda v: v == "custom_value"
-        )
+        wait_for_metadata(session, "custom_key", check=lambda v: v == "custom_value")
 
     def test_python_kernel_with_python_kernelspec(self, session):
         """A notebook with python kernelspec launches a Python kernel."""
@@ -1254,7 +1252,9 @@ class TestKernelLaunchMetadata:
 
     def test_kernel_prewarmed_env_source(self, session):
         """Default kernel launch uses prewarmed pool."""
-        start_kernel_with_retry(session, kernel_type="python", env_source="uv:prewarmed")
+        start_kernel_with_retry(
+            session, kernel_type="python", env_source="uv:prewarmed"
+        )
 
         assert session.env_source == "uv:prewarmed"
 
@@ -1426,8 +1426,11 @@ class TestCondaInlineDeps:
 
         # Start kernel once for all tests in class (longer retry for conda env creation)
         start_kernel_with_retry(
-            sess, kernel_type="python", env_source="conda:inline",
-            retries=8, delay=2.0,
+            sess,
+            kernel_type="python",
+            env_source="conda:inline",
+            retries=8,
+            delay=2.0,
         )
 
         yield sess
@@ -1841,7 +1844,9 @@ class TestAsyncMultiClientSync:
             found = [c for c in cells if c.id == cell_id]
             return len(found) == 1 and found[0].source == "async_shared_var = 42"
 
-        await async_wait_for_sync(cell_synced, description="cell with source sync to s2")
+        await async_wait_for_sync(
+            cell_synced, description="cell with source sync to s2"
+        )
 
         cells = await s2.get_cells()
         found = [c for c in cells if c.id == cell_id]
@@ -2391,7 +2396,12 @@ class TestOpenNotebook:
     def test_open_notebook_returns_connection_info(
         self, daemon_process, monkeypatch, tmp_path
     ):
-        """NotebookConnectionInfo includes cell_count."""
+        """NotebookConnectionInfo includes cell_count.
+
+        With streaming load, cell_count is 0 in the handshake because
+        loading is deferred to the sync loop. Cells arrive via Automerge
+        sync messages after the connection is established.
+        """
         import json
 
         socket_path, _ = daemon_process
@@ -2436,7 +2446,9 @@ class TestOpenNotebook:
         session = runtimed.Session.open_notebook(str(nb_path))
         info = session.connection_info
         assert info is not None
-        assert info.cell_count == 3
+        # Streaming load defers cell loading to the sync loop, so the
+        # handshake reports 0 cells. Cells arrive via sync messages.
+        assert info.cell_count == 0
         assert info.notebook_id == session.notebook_id
 
     def test_open_nonexistent_file_errors(self, daemon_process, monkeypatch, tmp_path):
