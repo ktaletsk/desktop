@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from threading import Event as ThreadEvent
 
 import runtimed
+
+log = logging.getLogger("notebook_tui")
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -286,20 +289,59 @@ class NotebookApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Show loading state immediately so the user doesn't see a blank screen
+        self._show_loading()
         if self._notebook_path_arg:
             self._open_notebook(self._notebook_path_arg)
         else:
             self._create_new_notebook()
+
+    def _show_loading(self) -> None:
+        """Show a loading message while connecting to daemon."""
+        try:
+            container = self.query_one("#notebook-container", VerticalScroll)
+            container.mount(
+                Static(
+                    "[bold]Connecting to runtimed...[/]\n\n"
+                    "[dim]Waiting for daemon connection.[/]",
+                    classes="empty-notebook",
+                    id="loading-message",
+                )
+            )
+        except NoMatches:
+            pass
+
+    def _remove_loading(self) -> None:
+        """Remove the loading message."""
+        try:
+            self.query_one("#loading-message").remove()
+        except (NoMatches, Exception):
+            pass
+
+    def _update_loading(self, message: str) -> None:
+        """Update the loading message text."""
+        try:
+            loading = self.query_one("#loading-message", Static)
+            loading.update(
+                f"[bold]{message}[/]\n\n"
+                "[dim]Waiting for daemon connection.[/]"
+            )
+        except (NoMatches, Exception):
+            pass
 
     @work(thread=True, group="session")
     def _open_notebook(self, path: str) -> None:
         """Open an existing notebook file."""
         try:
             resolved = str(Path(path).resolve())
+            log.info("Opening notebook: %s", resolved)
+            self.call_from_thread(self._update_loading, f"Opening {Path(path).name}...")
             self._session = runtimed.Session.open_notebook(resolved)
+            log.info("Session connected for: %s", resolved)
             self.call_from_thread(setattr, self, "notebook_path", resolved)
             self._post_connect()
         except Exception as e:
+            log.exception("Error opening notebook: %s", path)
             self.call_from_thread(self._show_error, f"Error opening notebook: {e}")
             self.call_from_thread(self._update_kernel_status, "error")
 
@@ -307,10 +349,14 @@ class NotebookApp(App):
     def _create_new_notebook(self) -> None:
         """Create a new empty notebook."""
         try:
+            log.info("Creating new notebook")
+            self.call_from_thread(self._update_loading, "Creating new notebook...")
             self._session = runtimed.Session.create_notebook(runtime="python")
+            log.info("New notebook session created")
             self.call_from_thread(setattr, self, "notebook_path", None)
             self._post_connect()
         except Exception as e:
+            log.exception("Error creating notebook")
             self.call_from_thread(self._show_error, f"Error creating notebook: {e}")
             self.call_from_thread(self._update_kernel_status, "error")
 
@@ -324,25 +370,33 @@ class NotebookApp(App):
 
         # Load existing cells
         try:
+            log.info("Loading cells from session")
             cells = session.get_cells()
+            log.info("Loaded %d cells", len(cells))
             self.call_from_thread(self._load_cells, cells)
         except Exception as e:
+            log.exception("Error loading cells")
             self.call_from_thread(
                 self.notify, f"Error loading cells: {e}", severity="error"
             )
 
         # Start kernel
         try:
+            log.info("Starting kernel")
+            self.call_from_thread(self._update_loading, "Starting kernel...")
             session.start_kernel()
+            log.info("Kernel started")
             self.call_from_thread(self._update_kernel_status, "idle")
             self._kernel_ready.set()
         except Exception as e:
+            log.exception("Kernel start failed")
             self.call_from_thread(self._update_kernel_status, "error")
             self.call_from_thread(
                 self.notify, f"Kernel start failed: {e}", severity="error"
             )
 
         # Start listening for broadcasts
+        log.info("Starting broadcast listener")
         self._listen_for_broadcasts()
 
     def _listen_for_broadcasts(self) -> None:
@@ -353,8 +407,10 @@ class NotebookApp(App):
 
         try:
             for event in session.subscribe():
+                log.debug("Broadcast: %s cell=%s", event.event_type, event.cell_id)
                 self._handle_broadcast(event)
         except Exception:
+            log.exception("Broadcast listener disconnected")
             self.call_from_thread(self._update_kernel_status, "disconnected")
 
     def _handle_broadcast(self, event: runtimed.ExecutionEvent) -> None:
@@ -397,6 +453,7 @@ class NotebookApp(App):
 
     def _load_cells(self, cells: list[runtimed.Cell]) -> None:
         """Load cells into the UI."""
+        self._remove_loading()
         container = self.query_one("#notebook-container", VerticalScroll)
         container.remove_children()
         self._cell_ids.clear()
@@ -435,6 +492,7 @@ class NotebookApp(App):
 
     def _show_error(self, message: str) -> None:
         """Show an error message in the content area and as a notification."""
+        self._remove_loading()
         self.notify(message, severity="error", timeout=10)
         try:
             container = self.query_one("#notebook-container", VerticalScroll)
@@ -853,6 +911,8 @@ def _find_dev_daemon_socket() -> str | None:
 
 def run():
     """CLI entry point with argument parsing."""
+    import os
+
     parser = argparse.ArgumentParser(
         description="A rich notebook TUI powered by runtimed"
     )
@@ -865,11 +925,23 @@ def run():
         "--socket",
         help="Path to runtimed socket (auto-detected if not set)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging to /tmp/notebook-tui.log",
+    )
     args = parser.parse_args()
 
-    # Set socket path: explicit flag > env var > auto-detect dev daemon
-    import os
+    # Set up logging if --debug is passed
+    if args.debug:
+        logging.basicConfig(
+            filename="/tmp/notebook-tui.log",
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        log.info("Debug logging enabled")
 
+    # Set socket path: explicit flag > env var > auto-detect dev daemon
     if args.socket:
         os.environ["RUNTIMED_SOCKET_PATH"] = args.socket
     elif "RUNTIMED_SOCKET_PATH" not in os.environ:
@@ -879,6 +951,9 @@ def run():
             dev_sock = _find_dev_daemon_socket()
             if dev_sock:
                 os.environ["RUNTIMED_SOCKET_PATH"] = dev_sock
+
+    socket_path = os.environ.get("RUNTIMED_SOCKET_PATH", str(Path.home() / ".cache" / "runt" / "runtimed.sock"))
+    log.info("Using socket: %s (exists: %s)", socket_path, Path(socket_path).exists())
 
     app = NotebookApp(notebook_path=args.notebook)
     app.run()
