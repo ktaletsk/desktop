@@ -1006,17 +1006,26 @@ impl Daemon {
 
         // Check if this is first connection (needs streaming load) or joining existing room.
         // For first connection, we defer loading to the sync loop for streaming.
+        // Use try_start_loading() to atomically claim loading rights and prevent
+        // duplicate loads when multiple connections race.
         let (cell_count, needs_streaming_load) = {
             let doc = room.doc.read().await;
             let existing_count = doc.cell_count();
-            if existing_count == 0 {
-                // First connection - will do streaming load in sync loop
+            if existing_count == 0 && room.try_start_loading() {
+                // First connection and we won the race - will do streaming load in sync loop
                 // Send cell_count=0 initially; cells will stream via sync messages
                 info!(
                     "[runtimed] First connection to {}, will stream-load cells",
                     path
                 );
                 (0, true)
+            } else if existing_count == 0 {
+                // Another connection is already loading
+                info!(
+                    "[runtimed] Room for {} is being loaded by another connection",
+                    path
+                );
+                (0, false)
             } else {
                 // Room already has cells from another connection
                 info!(

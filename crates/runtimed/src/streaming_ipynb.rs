@@ -283,12 +283,13 @@ fn process_cell_field(
                     "null".to_string()
                 }
                 _ => {
-                    // Could be number
+                    // Could be number (execution_count must be integer or null per nbformat)
                     let val = jiter.next_value()?;
                     match val {
                         JsonValue::Int(n) => n.to_string(),
                         JsonValue::BigInt(n) => n.to_string(),
-                        JsonValue::Float(n) => (n as i64).to_string(),
+                        // Float is invalid for execution_count, treat as null
+                        JsonValue::Float(_) => "null".to_string(),
                         _ => "null".to_string(),
                     }
                 }

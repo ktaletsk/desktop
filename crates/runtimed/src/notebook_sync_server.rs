@@ -544,6 +544,17 @@ impl NotebookRoom {
         self.is_loading.store(loading, Ordering::Release);
     }
 
+    /// Atomically try to start loading. Returns true if this caller won the race
+    /// and should perform the load; false if another caller already started loading.
+    ///
+    /// Uses compare_exchange to prevent duplicate loads when multiple connections
+    /// try to load the same notebook simultaneously.
+    pub fn try_start_loading(&self) -> bool {
+        self.is_loading
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Create a new room by loading a persisted document or creating a fresh one.
     ///
     /// Note: This method is kept for tests that verify persistence behavior.
@@ -882,46 +893,51 @@ where
     // Load notebook cells incrementally, emitting sync messages after each batch.
     // This allows the frontend to render cells progressively during load.
     if let Some(path) = load_path {
-        // Parse first to get cell count for the broadcast
-        let data = tokio::fs::read(&path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read notebook: {}", e))?;
-        let parsed = crate::streaming_ipynb::parse_notebook(&data)
-            .map_err(|e| anyhow::anyhow!("Failed to parse notebook: {}", e))?;
-        let total_cells = parsed.cells.len();
-
-        // Broadcast streaming load started
+        // Broadcast streaming load started immediately (before parsing)
         let _ = room
             .kernel_broadcast_tx
-            .send(NotebookBroadcast::StreamingLoadStarted { total_cells });
+            .send(NotebookBroadcast::StreamingLoadStarted);
         connection::send_typed_json_frame(
             writer,
             NotebookFrameType::Broadcast,
-            &NotebookBroadcast::StreamingLoadStarted { total_cells },
+            &NotebookBroadcast::StreamingLoadStarted,
         )
         .await?;
 
         room.set_loading(true);
         let mut doc = room.doc.write().await;
         let result =
-            load_notebook_streaming_parsed(&mut doc, &mut peer_state, reader, writer, parsed).await;
+            load_notebook_streaming(&mut doc, &mut peer_state, reader, writer, &path).await;
         drop(doc); // Release lock before setting loading=false
         room.set_loading(false);
 
-        // Broadcast streaming load complete
-        let _ = room
-            .kernel_broadcast_tx
-            .send(NotebookBroadcast::StreamingLoadComplete { total_cells });
-        connection::send_typed_json_frame(
-            writer,
-            NotebookFrameType::Broadcast,
-            &NotebookBroadcast::StreamingLoadComplete { total_cells },
-        )
-        .await?;
-
-        if let Err(e) = result {
-            error!("[notebook-sync] Streaming load failed: {}", e);
-            return Err(anyhow::anyhow!("Streaming load failed: {}", e));
+        match result {
+            Ok(total_cells) => {
+                // Broadcast streaming load complete with final count
+                let _ = room
+                    .kernel_broadcast_tx
+                    .send(NotebookBroadcast::StreamingLoadComplete { total_cells });
+                connection::send_typed_json_frame(
+                    writer,
+                    NotebookFrameType::Broadcast,
+                    &NotebookBroadcast::StreamingLoadComplete { total_cells },
+                )
+                .await?;
+            }
+            Err(e) => {
+                error!("[notebook-sync] Streaming load failed: {}", e);
+                // Clear partial state so another connection can retry from scratch
+                {
+                    let mut doc = room.doc.write().await;
+                    if let Err(clear_err) = doc.clear_all_cells() {
+                        warn!(
+                            "[notebook-sync] Failed to clear partial cells: {}",
+                            clear_err
+                        );
+                    }
+                }
+                return Err(anyhow::anyhow!("Streaming load failed: {}", e));
+            }
         }
     }
 
@@ -3222,34 +3238,21 @@ pub async fn load_notebook_from_disk(
 
     // Use streaming parser to parse cells incrementally
     let result = crate::streaming_ipynb::stream_notebook_cells(&data, |cell, idx| {
-        // Add each cell to the doc as it's parsed
-        doc.add_cell(idx, &cell.id, &cell.cell_type).map_err(|e| {
+        // Add cell with all content in one operation (avoids O(n²) lookups)
+        doc.add_cell_full(
+            idx,
+            &cell.id,
+            &cell.cell_type,
+            &cell.source,
+            &cell.outputs,
+            &cell.execution_count,
+        )
+        .map_err(|e| {
             crate::streaming_ipynb::StreamError::CellProcessing(format!(
                 "Failed to add cell: {}",
                 e
             ))
         })?;
-        doc.update_source(&cell.id, &cell.source).map_err(|e| {
-            crate::streaming_ipynb::StreamError::CellProcessing(format!(
-                "Failed to update source: {}",
-                e
-            ))
-        })?;
-        if !cell.outputs.is_empty() {
-            doc.set_outputs(&cell.id, &cell.outputs).map_err(|e| {
-                crate::streaming_ipynb::StreamError::CellProcessing(format!(
-                    "Failed to set outputs: {}",
-                    e
-                ))
-            })?;
-        }
-        doc.set_execution_count(&cell.id, &cell.execution_count)
-            .map_err(|e| {
-                crate::streaming_ipynb::StreamError::CellProcessing(format!(
-                    "Failed to set execution count: {}",
-                    e
-                ))
-            })?;
         Ok(())
     })
     .map_err(|e| format!("Failed to parse notebook: {}", e))?;
@@ -3306,17 +3309,16 @@ where
     // Add cells in batches, emitting sync messages between batches
     let mut batch_start = std::time::Instant::now();
     for (idx, cell) in parsed.cells.into_iter().enumerate() {
-        // Add cell to doc
-        doc.add_cell(idx, &cell.id, &cell.cell_type)
-            .map_err(|e| format!("Failed to add cell: {}", e))?;
-        doc.update_source(&cell.id, &cell.source)
-            .map_err(|e| format!("Failed to update source: {}", e))?;
-        if !cell.outputs.is_empty() {
-            doc.set_outputs(&cell.id, &cell.outputs)
-                .map_err(|e| format!("Failed to set outputs: {}", e))?;
-        }
-        doc.set_execution_count(&cell.id, &cell.execution_count)
-            .map_err(|e| format!("Failed to set execution count: {}", e))?;
+        // Add cell to doc with all content in one operation (avoids O(n²) lookups)
+        doc.add_cell_full(
+            idx,
+            &cell.id,
+            &cell.cell_type,
+            &cell.source,
+            &cell.outputs,
+            &cell.execution_count,
+        )
+        .map_err(|e| format!("Failed to add cell: {}", e))?;
 
         // Emit sync message after each batch (or on last cell)
         let is_batch_complete = (idx + 1) % STREAMING_BATCH_SIZE == 0;
@@ -3389,124 +3391,6 @@ where
     }
 
     // Set metadata after all cells (metadata goes in final sync message)
-    doc.set_metadata_snapshot(&parsed.metadata)
-        .map_err(|e| format!("Failed to set metadata: {}", e))?;
-
-    // Send final sync message with metadata
-    if let Some(msg) = doc.generate_sync_message(peer_state) {
-        let encoded = msg.encode();
-        connection::send_typed_frame(writer, NotebookFrameType::AutomergeSync, &encoded)
-            .await
-            .map_err(|e| format!("Failed to send final sync message: {}", e))?;
-    }
-
-    Ok(total_cells)
-}
-
-/// Load pre-parsed notebook cells with streaming sync message emission.
-///
-/// Same as `load_notebook_streaming` but takes already-parsed cells.
-/// Used when we need to know the cell count before starting (for broadcasts).
-async fn load_notebook_streaming_parsed<R, W>(
-    doc: &mut NotebookDoc,
-    peer_state: &mut sync::State,
-    reader: &mut R,
-    writer: &mut W,
-    parsed: crate::streaming_ipynb::ParsedNotebook,
-) -> Result<usize, String>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let total_cells = parsed.cells.len();
-    info!(
-        "[notebook-sync] Streaming load of {} cells (pre-parsed)",
-        total_cells
-    );
-
-    // Add cells in batches, emitting sync messages between batches
-    let mut batch_start = std::time::Instant::now();
-    for (idx, cell) in parsed.cells.into_iter().enumerate() {
-        // Add cell to doc
-        doc.add_cell(idx, &cell.id, &cell.cell_type)
-            .map_err(|e| format!("Failed to add cell: {}", e))?;
-        doc.update_source(&cell.id, &cell.source)
-            .map_err(|e| format!("Failed to update source: {}", e))?;
-        if !cell.outputs.is_empty() {
-            doc.set_outputs(&cell.id, &cell.outputs)
-                .map_err(|e| format!("Failed to set outputs: {}", e))?;
-        }
-        doc.set_execution_count(&cell.id, &cell.execution_count)
-            .map_err(|e| format!("Failed to set execution count: {}", e))?;
-
-        // Emit sync message after each batch (or on last cell)
-        let is_batch_complete = (idx + 1) % STREAMING_BATCH_SIZE == 0;
-        let is_last_cell = idx + 1 == total_cells;
-
-        if is_batch_complete || is_last_cell {
-            let add_elapsed = batch_start.elapsed();
-
-            // Generate and send sync message with the new cells
-            let gen_start = std::time::Instant::now();
-            let sync_msg = doc.generate_sync_message(peer_state);
-            let gen_elapsed = gen_start.elapsed();
-
-            if let Some(msg) = sync_msg {
-                let encoded = msg.encode();
-                let msg_size = encoded.len();
-
-                let send_start = std::time::Instant::now();
-                connection::send_typed_frame(writer, NotebookFrameType::AutomergeSync, &encoded)
-                    .await
-                    .map_err(|e| format!("Failed to send sync message: {}", e))?;
-                let send_elapsed = send_start.elapsed();
-
-                // Drain any incoming frames to prevent buffer deadlock
-                let mut drained = 0;
-                loop {
-                    use tokio::time::{timeout, Duration};
-                    match timeout(
-                        Duration::from_millis(1),
-                        connection::recv_typed_frame(reader),
-                    )
-                    .await
-                    {
-                        Ok(Ok(Some(frame))) => {
-                            if frame.frame_type == NotebookFrameType::AutomergeSync {
-                                if let Ok(msg) = sync::Message::decode(&frame.payload) {
-                                    let _ = doc.receive_sync_message(peer_state, msg);
-                                }
-                            }
-                            drained += 1;
-                        }
-                        _ => break,
-                    }
-                }
-
-                info!(
-                    "[notebook-sync] Batch {}-{}/{}: add={:?} gen={:?} send={:?} size={}KB drained={}",
-                    idx + 1 - (idx % STREAMING_BATCH_SIZE),
-                    idx + 1,
-                    total_cells,
-                    add_elapsed,
-                    gen_elapsed,
-                    send_elapsed,
-                    msg_size / 1024,
-                    drained
-                );
-            } else {
-                warn!(
-                    "[notebook-sync] Batch {}-{}/{}: generate_sync_message returned None",
-                    idx + 1 - (idx % STREAMING_BATCH_SIZE),
-                    idx + 1,
-                    total_cells
-                );
-            }
-            batch_start = std::time::Instant::now();
-        }
-    }
-
-    // Set metadata after all cells
     doc.set_metadata_snapshot(&parsed.metadata)
         .map_err(|e| format!("Failed to set metadata: {}", e))?;
 

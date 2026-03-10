@@ -526,18 +526,16 @@ pub enum NotebookBroadcast {
 
     /// Streaming notebook load started.
     ///
-    /// Broadcast when a large notebook begins loading incrementally.
+    /// Broadcast when a notebook begins loading incrementally.
     /// Cells will arrive via sync messages. Frontend should show loading UI.
-    StreamingLoadStarted {
-        /// Total number of cells to be loaded.
-        total_cells: usize,
-    },
+    /// Total cell count is unknown until parsing completes.
+    StreamingLoadStarted,
 
     /// Streaming notebook load completed.
     ///
     /// All cells have been loaded and synced. Frontend can hide loading UI.
     StreamingLoadComplete {
-        /// Total cells loaded.
+        /// Total cells loaded (known after parsing completes).
         total_cells: usize,
     },
 }

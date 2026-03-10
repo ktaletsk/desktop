@@ -372,6 +372,50 @@ impl NotebookDoc {
         Ok(())
     }
 
+    /// Add a cell with full content in a single operation.
+    ///
+    /// This is optimized for bulk loading - it avoids the O(n) cell lookup that
+    /// separate `update_source`/`set_outputs`/`set_execution_count` calls require.
+    /// Use this when loading notebooks to avoid O(n²) performance degradation.
+    pub fn add_cell_full(
+        &mut self,
+        index: usize,
+        cell_id: &str,
+        cell_type: &str,
+        source: &str,
+        outputs: &[String],
+        execution_count: &str,
+    ) -> Result<(), AutomergeError> {
+        let cells_id = self
+            .cells_list_id()
+            .ok_or_else(|| AutomergeError::InvalidObjId("cells list not found".into()))?;
+
+        // Clamp index to list length
+        let len = self.doc.length(&cells_id);
+        let index = index.min(len);
+
+        // Create cell object
+        let cell_map = self.doc.insert_object(&cells_id, index, ObjType::Map)?;
+        self.doc.put(&cell_map, "id", cell_id)?;
+        self.doc.put(&cell_map, "cell_type", cell_type)?;
+        self.doc
+            .put(&cell_map, "execution_count", execution_count)?;
+
+        // Set source text directly (no Myers diff needed for initial load)
+        let source_id = self.doc.put_object(&cell_map, "source", ObjType::Text)?;
+        if !source.is_empty() {
+            self.doc.splice_text(&source_id, 0, 0, source)?;
+        }
+
+        // Set outputs
+        let outputs_id = self.doc.put_object(&cell_map, "outputs", ObjType::List)?;
+        for (i, output) in outputs.iter().enumerate() {
+            self.doc.insert(&outputs_id, i, output.as_str())?;
+        }
+
+        Ok(())
+    }
+
     /// Delete a cell by ID. Returns `true` if the cell was found and deleted.
     pub fn delete_cell(&mut self, cell_id: &str) -> Result<bool, AutomergeError> {
         let cells_id = match self.cells_list_id() {
@@ -385,6 +429,22 @@ impl NotebookDoc {
             }
             None => Ok(false),
         }
+    }
+
+    /// Delete all cells from the document.
+    ///
+    /// Used to reset a partially loaded document on failure, allowing
+    /// another connection to retry loading from scratch.
+    pub fn clear_all_cells(&mut self) -> Result<(), AutomergeError> {
+        let cells_id = match self.cells_list_id() {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        // Delete from end to avoid index shifting issues
+        while self.doc.length(&cells_id) > 0 {
+            self.doc.delete(&cells_id, 0)?;
+        }
+        Ok(())
     }
 
     // ── Source editing ───────────────────────────────────────────────

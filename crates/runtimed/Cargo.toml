@@ -66,7 +66,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 automerge = "0.7"
 
 # Fast streaming JSON parser for incremental notebook loading
-jiter = "0.13"
+# default-features = false avoids pyo3, but we need num-bigint for BigInt support
+jiter = { version = "0.13", default-features = false, features = ["num-bigint"] }
 
 # Shared notebook document types (cell CRUD, metadata, sync)
 notebook-doc = { path = "../notebook-doc", features = ["persistence"] }
