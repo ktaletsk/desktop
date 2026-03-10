@@ -523,6 +523,23 @@ pub enum NotebookBroadcast {
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<EnvSyncDiff>,
     },
+
+    /// Streaming notebook load started.
+    ///
+    /// Broadcast when a large notebook begins loading incrementally.
+    /// Cells will arrive via sync messages. Frontend should show loading UI.
+    StreamingLoadStarted {
+        /// Total number of cells to be loaded.
+        total_cells: usize,
+    },
+
+    /// Streaming notebook load completed.
+    ///
+    /// All cells have been loaded and synced. Frontend can hide loading UI.
+    StreamingLoadComplete {
+        /// Total cells loaded.
+        total_cells: usize,
+    },
 }
 
 /// Difference between launched environment config and current metadata.
