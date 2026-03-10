@@ -900,8 +900,12 @@ where
                 Err(e) => {
                     room.finish_loading();
                     // Clear partial cells so the next connection can retry
-                    let mut doc = room.doc.write().await;
-                    doc.clear_all_cells();
+                    {
+                        let mut doc = room.doc.write().await;
+                        let _ = doc.clear_all_cells();
+                    }
+                    // Notify other peers so they converge to the cleared state
+                    let _ = room.changed_tx.send(());
                     warn!(
                         "[notebook-sync] Streaming load failed for {}: {}",
                         load_path.display(),
@@ -3420,40 +3424,28 @@ async fn output_value_to_manifest_ref(
     }
 }
 
-/// Drain any pending incoming frames from the client.
+/// Placeholder for draining incoming sync replies during streaming load.
 ///
-/// During streaming load, the daemon sends sync messages after each batch.
-/// The client replies with its own sync messages. If we don't drain these,
-/// the socket buffer fills up — the client blocks on send, the daemon blocks
-/// on send, deadlock.
+/// In theory, the client sends sync replies after each batch and we should
+/// drain them to prevent socket buffer deadlock. In practice:
 ///
-/// Uses a short timeout to avoid blocking: we just want to clear whatever's
-/// already in the buffer.
-async fn drain_incoming_frames<R>(reader: &mut R, room: &NotebookRoom, peer_state: &mut sync::State)
-where
+/// 1. `recv_typed_frame` uses `read_exact` internally, which is NOT
+///    cancellation-safe. Wrapping it in `tokio::time::timeout` risks
+///    cancelling mid-frame, leaving the stream desynchronized.
+/// 2. With release-mode load times (~56ms for 50 cells), the OS socket
+///    buffer (typically 64KB+) easily absorbs the client's sync replies.
+/// 3. Non-sync frames (requests) would be silently dropped.
+///
+/// The sync replies are processed normally once the main select loop starts
+/// after streaming completes.
+async fn drain_incoming_frames<R>(
+    _reader: &mut R,
+    _room: &NotebookRoom,
+    _peer_state: &mut sync::State,
+) where
     R: AsyncRead + Unpin,
 {
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(1),
-            connection::recv_typed_frame(reader),
-        )
-        .await
-        {
-            Ok(Ok(Some(frame))) => {
-                if matches!(frame.frame_type, NotebookFrameType::AutomergeSync) {
-                    if let Ok(msg) = sync::Message::decode(&frame.payload) {
-                        let mut doc = room.doc.write().await;
-                        let _ = doc.receive_sync_message(peer_state, msg);
-                    }
-                }
-                // Ignore non-sync frames during load (requests will be
-                // handled once the main sync loop starts).
-            }
-            // Timeout or error or EOF — stop draining
-            _ => break,
-        }
-    }
+    // No-op. See doc comment above.
 }
 
 /// Stream notebook cells into the Automerge doc in batches, sending sync

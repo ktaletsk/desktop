@@ -438,14 +438,15 @@ impl NotebookDoc {
     ///
     /// Used to clean up after a failed streaming load so the next
     /// connection can retry from a clean state.
-    pub fn clear_all_cells(&mut self) {
+    pub fn clear_all_cells(&mut self) -> Result<(), AutomergeError> {
         if let Some(cells_id) = self.cells_list_id() {
             let len = self.doc.length(&cells_id);
             // Delete from the end to avoid index shifting
             for i in (0..len).rev() {
-                let _ = self.doc.delete(&cells_id, i);
+                self.doc.delete(&cells_id, i)?;
             }
         }
+        Ok(())
     }
 
     // ── Source editing ───────────────────────────────────────────────
@@ -1867,5 +1868,75 @@ mod tests {
             client.get_metadata("custom_key"),
             Some("custom_value".to_string())
         );
+    }
+
+    #[test]
+    fn test_add_cell_full_populates_all_fields() {
+        let mut doc = NotebookDoc::new("nb-full");
+        doc.add_cell_full(
+            0,
+            "cell-full",
+            "code",
+            "print('hello')",
+            &["hash1".to_string(), "hash2".to_string()],
+            "42",
+        )
+        .unwrap();
+
+        assert_eq!(doc.cell_count(), 1);
+        let cell = doc.get_cell("cell-full").unwrap();
+        assert_eq!(cell.id, "cell-full");
+        assert_eq!(cell.cell_type, "code");
+        assert_eq!(cell.source, "print('hello')");
+        assert_eq!(cell.execution_count, "42");
+        assert_eq!(cell.outputs, vec!["hash1", "hash2"]);
+    }
+
+    #[test]
+    fn test_add_cell_full_empty_source() {
+        let mut doc = NotebookDoc::new("nb-empty-src");
+        doc.add_cell_full(0, "cell-es", "code", "", &[], "null")
+            .unwrap();
+
+        let cell = doc.get_cell("cell-es").unwrap();
+        assert_eq!(cell.source, "");
+        assert_eq!(cell.execution_count, "null");
+        assert!(cell.outputs.is_empty());
+    }
+
+    #[test]
+    fn test_add_cell_full_index_ordering() {
+        let mut doc = NotebookDoc::new("nb-order");
+        doc.add_cell_full(0, "a", "code", "first", &[], "null")
+            .unwrap();
+        doc.add_cell_full(1, "b", "code", "second", &[], "null")
+            .unwrap();
+        doc.add_cell_full(2, "c", "code", "third", &[], "null")
+            .unwrap();
+
+        let cells = doc.get_cells();
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].id, "a");
+        assert_eq!(cells[0].source, "first");
+        assert_eq!(cells[1].id, "b");
+        assert_eq!(cells[1].source, "second");
+        assert_eq!(cells[2].id, "c");
+        assert_eq!(cells[2].source, "third");
+    }
+
+    #[test]
+    fn test_clear_all_cells() {
+        let mut doc = NotebookDoc::new("nb-clear");
+        doc.add_cell(0, "c1", "code").unwrap();
+        doc.add_cell(1, "c2", "code").unwrap();
+        doc.add_cell(2, "c3", "markdown").unwrap();
+        assert_eq!(doc.cell_count(), 3);
+
+        doc.clear_all_cells().unwrap();
+        assert_eq!(doc.cell_count(), 0);
+        assert_eq!(doc.get_cells(), vec![]);
+
+        // notebook_id metadata should be preserved
+        assert_eq!(doc.notebook_id(), Some("nb-clear".to_string()));
     }
 }
