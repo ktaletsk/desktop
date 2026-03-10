@@ -46,7 +46,6 @@ interface NotebookToolbarProps {
   listKernelspecs?: () => Promise<KernelspecInfo[]>;
   updateStatus?: UpdateStatus;
   updateVersion?: string | null;
-  onDownloadUpdate?: () => void;
   onRestartToUpdate?: () => void;
 }
 
@@ -72,7 +71,6 @@ export function NotebookToolbar({
   listKernelspecs,
   updateStatus,
   updateVersion,
-  onDownloadUpdate,
   onRestartToUpdate,
 }: NotebookToolbarProps) {
   const [kernelspecs, setKernelspecs] = useState<KernelspecInfo[]>([]);
@@ -239,37 +237,16 @@ export function NotebookToolbar({
         <div className="flex-1" />
 
         {/* Update available */}
-        {updateStatus === "available" && onDownloadUpdate && (
-          <button
-            type="button"
-            onClick={onDownloadUpdate}
-            data-testid="update-download-button"
-            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/10 text-violet-600 hover:bg-violet-500/20 dark:text-violet-400 transition-colors"
-            title={`Download update v${updateVersion}`}
-          >
-            <ArrowDownToLine className="h-3 w-3" />
-            <span>Update {updateVersion}</span>
-          </button>
-        )}
-        {updateStatus === "downloading" && (
-          <div
-            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/10 text-violet-500 dark:text-violet-400"
-            title="Downloading update…"
-          >
-            <ArrowDownToLine className="h-3 w-3 animate-bounce" />
-            <span>Updating…</span>
-          </div>
-        )}
-        {updateStatus === "ready" && onRestartToUpdate && (
+        {updateStatus === "available" && onRestartToUpdate && (
           <button
             type="button"
             onClick={onRestartToUpdate}
-            data-testid="update-restart-button"
-            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-green-500/15 text-green-600 hover:bg-green-500/25 dark:text-green-400 transition-colors"
-            title={`Prepare to install v${updateVersion}`}
+            data-testid="update-download-button"
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/10 text-violet-600 hover:bg-violet-500/20 dark:text-violet-400 transition-colors"
+            title={`Prepare to update to v${updateVersion}`}
           >
-            <RotateCcw className="h-3 w-3" />
-            <span>Prepare for Update</span>
+            <ArrowDownToLine className="h-3 w-3" />
+            <span>Update {updateVersion}</span>
           </button>
         )}
 
