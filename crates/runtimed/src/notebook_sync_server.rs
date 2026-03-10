@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use automerge::sync;
@@ -451,6 +451,10 @@ pub struct NotebookRoom {
     /// Wrapped in Mutex to allow setting after Arc creation.
     /// Sent when the room is evicted to stop the watcher.
     watcher_shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    /// Flag indicating whether the notebook is currently being loaded from disk.
+    /// When true, persistence is disabled to prevent saving incomplete documents.
+    /// Set to true before streaming load, false after all cells and metadata are loaded.
+    is_loading: AtomicBool,
 }
 
 impl NotebookRoom {
@@ -522,7 +526,22 @@ impl NotebookRoom {
             comm_state: Arc::new(CommState::new()),
             last_self_write: Arc::new(AtomicU64::new(0)),
             watcher_shutdown_tx: Mutex::new(None),
+            is_loading: AtomicBool::new(false),
         }
+    }
+
+    /// Check if the notebook is currently being loaded from disk.
+    ///
+    /// When true, persistence should be skipped to avoid saving incomplete documents.
+    pub fn is_loading(&self) -> bool {
+        self.is_loading.load(Ordering::Acquire)
+    }
+
+    /// Set the loading state.
+    ///
+    /// Set to true before streaming load, false after all cells and metadata are loaded.
+    pub fn set_loading(&self, loading: bool) {
+        self.is_loading.store(loading, Ordering::Release);
     }
 
     /// Create a new room by loading a persisted document or creating a fresh one.
@@ -558,6 +577,7 @@ impl NotebookRoom {
             comm_state: Arc::new(CommState::new()),
             last_self_write: Arc::new(AtomicU64::new(0)),
             watcher_shutdown_tx: Mutex::new(None),
+            is_loading: AtomicBool::new(false),
         }
     }
 
@@ -928,8 +948,10 @@ where
                                     .await?;
                                 }
 
-                                // Send to debounced persistence task
-                                let _ = room.persist_tx.send(Some(persist_bytes));
+                                // Send to debounced persistence task (skip during load)
+                                if !room.is_loading() {
+                                    let _ = room.persist_tx.send(Some(persist_bytes));
+                                }
 
                                 // Check if metadata changed and kernel is running - broadcast sync state
                                 check_and_broadcast_sync_state(room).await;
@@ -1949,8 +1971,10 @@ async fn handle_notebook_request(
                 bytes
             };
 
-            // 2. Send to debounced persistence task
-            let _ = room.persist_tx.send(Some(persist_bytes));
+            // 2. Send to debounced persistence task (skip during load)
+            if !room.is_loading() {
+                let _ = room.persist_tx.send(Some(persist_bytes));
+            }
 
             // 3. Broadcast for cross-window UI sync (fast path)
             let _ = room
@@ -2161,9 +2185,11 @@ async fn handle_notebook_request(
                 Ok(()) => {
                     // Notify peers of the change
                     let _ = room.changed_tx.send(());
-                    // Persist
-                    let bytes = doc.save();
-                    let _ = room.persist_tx.send(Some(bytes));
+                    // Persist (skip during load)
+                    if !room.is_loading() {
+                        let bytes = doc.save();
+                        let _ = room.persist_tx.send(Some(bytes));
+                    }
                     NotebookResponse::MetadataSet {}
                 }
                 Err(e) => NotebookResponse::Error {
@@ -3129,15 +3155,6 @@ fn parse_cells_from_ipynb(json: &serde_json::Value) -> Option<Vec<CellSnapshot>>
     Some(parsed_cells)
 }
 
-/// Parse notebook metadata from a .ipynb JSON value.
-///
-/// Uses `NotebookMetadataSnapshot::from_metadata_value` which extracts
-/// kernelspec, language_info, and runt namespace from the metadata.
-fn parse_metadata_from_ipynb(json: &serde_json::Value) -> Option<NotebookMetadataSnapshot> {
-    let metadata = json.get("metadata")?;
-    Some(NotebookMetadataSnapshot::from_metadata_value(metadata))
-}
-
 /// Load notebook cells and metadata from a .ipynb file into a NotebookDoc.
 ///
 /// Called by daemon-owned notebook loading (`OpenNotebook` handshake).
@@ -4021,6 +4038,7 @@ mod tests {
             comm_state: Arc::new(crate::comm_state::CommState::new()),
             last_self_write: Arc::new(AtomicU64::new(0)),
             watcher_shutdown_tx: Mutex::new(None),
+            is_loading: AtomicBool::new(false),
         };
 
         (room, notebook_path)
