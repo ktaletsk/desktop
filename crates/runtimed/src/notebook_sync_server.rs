@@ -884,7 +884,8 @@ where
     if let Some(path) = load_path {
         room.set_loading(true);
         let mut doc = room.doc.write().await;
-        let result = load_notebook_streaming(&mut doc, &mut peer_state, writer, &path).await;
+        let result =
+            load_notebook_streaming(&mut doc, &mut peer_state, reader, writer, &path).await;
         drop(doc); // Release lock before setting loading=false
         room.set_loading(false);
 
@@ -3245,13 +3246,15 @@ const STREAMING_BATCH_SIZE: usize = 10;
 /// so calling generate_sync_message() after each batch sends just the new cells.
 ///
 /// Returns the cell count on success.
-pub async fn load_notebook_streaming<W>(
+pub async fn load_notebook_streaming<R, W>(
     doc: &mut NotebookDoc,
     peer_state: &mut sync::State,
+    reader: &mut R,
     writer: &mut W,
     path: &std::path::Path,
 ) -> Result<usize, String>
 where
+    R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     // Read the file as bytes
@@ -3270,6 +3273,7 @@ where
     );
 
     // Add cells in batches, emitting sync messages between batches
+    let mut batch_start = std::time::Instant::now();
     for (idx, cell) in parsed.cells.into_iter().enumerate() {
         // Add cell to doc
         doc.add_cell(idx, &cell.id, &cell.cell_type)
@@ -3288,19 +3292,68 @@ where
         let is_last_cell = idx + 1 == total_cells;
 
         if is_batch_complete || is_last_cell {
+            let add_elapsed = batch_start.elapsed();
+
             // Generate and send sync message with the new cells
-            if let Some(msg) = doc.generate_sync_message(peer_state) {
+            let gen_start = std::time::Instant::now();
+            let sync_msg = doc.generate_sync_message(peer_state);
+            let gen_elapsed = gen_start.elapsed();
+
+            if let Some(msg) = sync_msg {
                 let encoded = msg.encode();
+                let msg_size = encoded.len();
+
+                let send_start = std::time::Instant::now();
                 connection::send_typed_frame(writer, NotebookFrameType::AutomergeSync, &encoded)
                     .await
                     .map_err(|e| format!("Failed to send sync message: {}", e))?;
+                let send_elapsed = send_start.elapsed();
 
-                debug!(
-                    "[notebook-sync] Streamed batch: cells 1-{} of {}",
+                // Drain any incoming frames to prevent buffer deadlock.
+                // The frontend sends sync replies that pile up while we're streaming.
+                // Without draining, the socket buffers fill and sends block.
+                let mut drained = 0;
+                loop {
+                    use tokio::time::{timeout, Duration};
+                    match timeout(
+                        Duration::from_millis(1),
+                        connection::recv_typed_frame(reader),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(frame))) => {
+                            // Process sync replies to update peer_state
+                            if frame.frame_type == NotebookFrameType::AutomergeSync {
+                                if let Ok(msg) = sync::Message::decode(&frame.payload) {
+                                    let _ = doc.receive_sync_message(peer_state, msg);
+                                }
+                            }
+                            drained += 1;
+                        }
+                        _ => break, // Timeout or error/EOF - no more frames ready
+                    }
+                }
+
+                info!(
+                    "[notebook-sync] Batch {}-{}/{}: add={:?} gen={:?} send={:?} size={}KB drained={}",
+                    idx + 1 - (idx % STREAMING_BATCH_SIZE),
+                    idx + 1,
+                    total_cells,
+                    add_elapsed,
+                    gen_elapsed,
+                    send_elapsed,
+                    msg_size / 1024,
+                    drained
+                );
+            } else {
+                warn!(
+                    "[notebook-sync] Batch {}-{}/{}: generate_sync_message returned None",
+                    idx + 1 - (idx % STREAMING_BATCH_SIZE),
                     idx + 1,
                     total_cells
                 );
             }
+            batch_start = std::time::Instant::now();
         }
     }
 
