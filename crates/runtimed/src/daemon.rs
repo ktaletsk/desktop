@@ -952,6 +952,7 @@ impl Daemon {
                     working_dir_path,
                     initial_metadata,
                     false, // Send ProtocolCapabilities for legacy NotebookSync handshake
+                    None,  // No streaming load for legacy handshake
                 )
                 .await
             }
@@ -1003,59 +1004,34 @@ impl Daemon {
             )
         };
 
-        // Check-and-load atomically under write lock to prevent race conditions.
-        // Two concurrent opens could both see cell_count == 0 if we check with
-        // read lock first, leading to duplicate cells.
-        let cell_count = {
-            let mut doc = room.doc.write().await;
+        // Check if this is first connection (needs streaming load) or joining existing room.
+        // For first connection, we defer loading to the sync loop for streaming.
+        let (cell_count, needs_streaming_load) = {
+            let doc = room.doc.read().await;
             let existing_count = doc.cell_count();
             if existing_count == 0 {
-                // First connection - load from disk
-                // Set loading flag to prevent persistence during load
-                room.set_loading(true);
-                let result =
-                    crate::notebook_sync_server::load_notebook_from_disk(&mut doc, &path_buf).await;
-                room.set_loading(false);
-
-                match result {
-                    Ok(count) => {
-                        info!("[runtimed] Loaded {} cells from {} into room", count, path);
-                        count
-                    }
-                    Err(e) => {
-                        // Drop the doc lock before removing room
-                        drop(doc);
-                        // Remove the room to prevent stale trust state on retry
-                        {
-                            let mut rooms = self.notebook_rooms.lock().await;
-                            rooms.remove(&notebook_id);
-                            info!("[runtimed] Removed room {} after load failure", notebook_id);
-                        }
-                        // Send error response and return
-                        let (mut reader, mut writer) = tokio::io::split(stream);
-                        let response = NotebookConnectionInfo {
-                            protocol: PROTOCOL_V2.to_string(),
-                            protocol_version: Some(PROTOCOL_VERSION),
-                            daemon_version: Some(crate::daemon_version().to_string()),
-                            notebook_id: String::new(),
-                            cell_count: 0,
-                            needs_trust_approval: false,
-                            error: Some(format!("Failed to load notebook: {}", e)),
-                        };
-                        send_json_frame(&mut writer, &response).await?;
-                        // Drain any remaining data from reader to avoid broken pipe
-                        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-                        return Ok(());
-                    }
-                }
+                // First connection - will do streaming load in sync loop
+                // Send cell_count=0 initially; cells will stream via sync messages
+                info!(
+                    "[runtimed] First connection to {}, will stream-load cells",
+                    path
+                );
+                (0, true)
             } else {
                 // Room already has cells from another connection
                 info!(
                     "[runtimed] Room for {} already has {} cells (joining existing)",
                     path, existing_count
                 );
-                existing_count
+                (existing_count, false)
             }
+        };
+
+        // Set load path for streaming (only if first connection to saved notebook)
+        let load_path = if needs_streaming_load {
+            Some(path_buf.clone())
+        } else {
+            None
         };
 
         // Get trust state (already verified during room creation)
@@ -1089,7 +1065,8 @@ impl Daemon {
         // Drop the trust_state lock before continuing
         drop(trust_state);
 
-        // Continue with normal notebook sync (handles auto-launch internally)
+        // Continue with notebook sync (handles auto-launch internally)
+        // If load_path is Some, the sync loop will stream-load cells from disk.
         crate::notebook_sync_server::handle_notebook_sync_connection(
             reader,
             writer,
@@ -1100,8 +1077,9 @@ impl Daemon {
             default_python_env,
             self.clone(),
             working_dir_path,
-            None, // No initial_metadata - doc is already populated
+            None, // No initial_metadata - will be set from streaming load
             true, // Skip ProtocolCapabilities - already sent in NotebookConnectionInfo
+            load_path,
         )
         .await
     }
@@ -1230,6 +1208,7 @@ impl Daemon {
             working_dir_path,
             None, // No initial_metadata - doc is already populated
             true, // Skip ProtocolCapabilities - already sent in NotebookConnectionInfo
+            None, // No streaming load - doc is already populated by create_empty_notebook
         )
         .await
     }

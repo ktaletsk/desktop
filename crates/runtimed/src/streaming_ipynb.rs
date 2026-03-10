@@ -46,6 +46,33 @@ pub struct StreamParseResult {
     pub cell_count: usize,
 }
 
+/// Result of parsing all cells at once.
+pub struct ParsedNotebook {
+    pub metadata: NotebookMetadataSnapshot,
+    pub cells: Vec<CellSnapshot>,
+}
+
+/// Parse a notebook and return all cells as a Vec.
+///
+/// This is useful when you need to batch-process cells (e.g., add cells to
+/// an Automerge doc in batches and emit sync messages between batches).
+///
+/// For very large notebooks, consider using `stream_notebook_cells` with a
+/// callback if you need to process cells one at a time.
+pub fn parse_notebook(data: &[u8]) -> Result<ParsedNotebook, StreamError> {
+    let mut cells = Vec::new();
+
+    let result = stream_notebook_cells(data, |cell, _idx| {
+        cells.push(cell);
+        Ok(())
+    })?;
+
+    Ok(ParsedNotebook {
+        metadata: result.metadata,
+        cells,
+    })
+}
+
 /// Parse a .ipynb file incrementally, calling `on_cell` for each cell.
 ///
 /// This function uses jiter to parse the notebook JSON without building
