@@ -1,0 +1,20 @@
+[project]
+name = "notebook-tui"
+version = "0.1.0"
+description = "A rich notebook TUI powered by runtimed and Textual"
+requires-python = ">=3.10"
+dependencies = [
+    "runtimed>=0.1.4",
+    "textual>=3.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+notebook-tui = "notebook_tui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/notebook_tui"]
