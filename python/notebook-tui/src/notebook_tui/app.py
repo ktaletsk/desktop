@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 from threading import Event as ThreadEvent
 
@@ -296,21 +295,24 @@ class NotebookApp(App):
     def _open_notebook(self, path: str) -> None:
         """Open an existing notebook file."""
         try:
-            self._session = runtimed.Session.open_notebook(path)
-            self.notebook_path = path
+            resolved = str(Path(path).resolve())
+            self._session = runtimed.Session.open_notebook(resolved)
+            self.call_from_thread(setattr, self, "notebook_path", resolved)
             self._post_connect()
-        except runtimed.RuntimedError as e:
-            self.notify(f"Error opening notebook: {e}", severity="error")
+        except Exception as e:
+            self.call_from_thread(self._show_error, f"Error opening notebook: {e}")
+            self.call_from_thread(self._update_kernel_status, "error")
 
     @work(thread=True, group="session")
     def _create_new_notebook(self) -> None:
         """Create a new empty notebook."""
         try:
             self._session = runtimed.Session.create_notebook(runtime="python")
-            self.notebook_path = None
+            self.call_from_thread(setattr, self, "notebook_path", None)
             self._post_connect()
-        except runtimed.RuntimedError as e:
-            self.notify(f"Error creating notebook: {e}", severity="error")
+        except Exception as e:
+            self.call_from_thread(self._show_error, f"Error creating notebook: {e}")
+            self.call_from_thread(self._update_kernel_status, "error")
 
     def _post_connect(self) -> None:
         """After connecting, load cells and start kernel."""
@@ -318,23 +320,23 @@ class NotebookApp(App):
         if session is None:
             return
 
-        self.kernel_status = "connecting"
         self.call_from_thread(self._update_kernel_status, "connecting")
 
         # Load existing cells
         try:
             cells = session.get_cells()
             self.call_from_thread(self._load_cells, cells)
-        except runtimed.RuntimedError:
-            pass
+        except Exception as e:
+            self.call_from_thread(
+                self.notify, f"Error loading cells: {e}", severity="error"
+            )
 
         # Start kernel
         try:
             session.start_kernel()
-            self.kernel_status = "idle"
             self.call_from_thread(self._update_kernel_status, "idle")
             self._kernel_ready.set()
-        except runtimed.RuntimedError as e:
+        except Exception as e:
             self.call_from_thread(self._update_kernel_status, "error")
             self.call_from_thread(
                 self.notify, f"Kernel start failed: {e}", severity="error"
@@ -352,7 +354,7 @@ class NotebookApp(App):
         try:
             for event in session.subscribe():
                 self._handle_broadcast(event)
-        except runtimed.RuntimedError:
+        except Exception:
             self.call_from_thread(self._update_kernel_status, "disconnected")
 
     def _handle_broadcast(self, event: runtimed.ExecutionEvent) -> None:
@@ -381,7 +383,7 @@ class NotebookApp(App):
                         cell_id,
                         cell.execution_count,
                     )
-                except runtimed.RuntimedError:
+                except Exception:
                     pass
             if not self._executing_cells:
                 self.call_from_thread(self._update_kernel_status, "idle")
@@ -430,6 +432,22 @@ class NotebookApp(App):
                 classes="empty-notebook",
             )
         )
+
+    def _show_error(self, message: str) -> None:
+        """Show an error message in the content area and as a notification."""
+        self.notify(message, severity="error", timeout=10)
+        try:
+            container = self.query_one("#notebook-container", VerticalScroll)
+            container.remove_children()
+            container.mount(
+                Static(
+                    f"[bold red]Error[/]\n\n{message}\n\n"
+                    "[dim]Press Ctrl+O to open a notebook or Ctrl+Q to quit.[/]",
+                    classes="empty-notebook",
+                )
+            )
+        except NoMatches:
+            pass
 
     def _update_kernel_status(self, status: str) -> None:
         """Update kernel status display."""
@@ -556,7 +574,7 @@ class NotebookApp(App):
         if self._session:
             try:
                 self._session.set_source(cell_id, source)
-            except runtimed.RuntimedError as e:
+            except Exception as e:
                 self.call_from_thread(
                     self.notify, f"Sync error: {e}", severity="warning"
                 )
@@ -583,7 +601,7 @@ class NotebookApp(App):
                 source="", cell_type="code", index=index
             )
             self.call_from_thread(self._insert_cell_widget, cell_id, index, "code")
-        except runtimed.RuntimedError as e:
+        except Exception as e:
             self.call_from_thread(
                 self.notify, f"Error adding cell: {e}", severity="error"
             )
@@ -643,7 +661,7 @@ class NotebookApp(App):
         try:
             self._session.delete_cell(cell_id)
             self.call_from_thread(self._remove_cell_widget, cell_id, index)
-        except runtimed.RuntimedError as e:
+        except Exception as e:
             self.call_from_thread(
                 self.notify, f"Error deleting cell: {e}", severity="error"
             )
@@ -700,7 +718,7 @@ class NotebookApp(App):
             self.call_from_thread(self._clear_cell_outputs, cell_id)
             # Queue for execution (outputs arrive via broadcast)
             self._session.queue_cell(cell_id)
-        except runtimed.RuntimedError as e:
+        except Exception as e:
             self.call_from_thread(
                 self.notify, f"Execution error: {e}", severity="error"
             )
@@ -732,7 +750,7 @@ class NotebookApp(App):
                 except NoMatches:
                     pass
             self._session.run_all_cells()
-        except runtimed.RuntimedError as e:
+        except Exception as e:
             self.call_from_thread(
                 self.notify, f"Error running all: {e}", severity="error"
             )
@@ -749,7 +767,7 @@ class NotebookApp(App):
                 self.call_from_thread(
                     self.notify, "Kernel interrupted", severity="information"
                 )
-            except runtimed.RuntimedError as e:
+            except Exception as e:
                 self.call_from_thread(
                     self.notify, f"Interrupt failed: {e}", severity="error"
                 )
@@ -775,7 +793,7 @@ class NotebookApp(App):
             self.call_from_thread(
                 self.notify, f"Saved: {path}", severity="information"
             )
-        except runtimed.RuntimedError as e:
+        except Exception as e:
             self.call_from_thread(
                 self.notify, f"Save error: {e}", severity="error"
             )
@@ -821,6 +839,18 @@ class NotebookApp(App):
         )
 
 
+def _find_dev_daemon_socket() -> str | None:
+    """Try to find a dev daemon socket in worktree directories."""
+    cache_dir = Path.home() / ".cache" / "runt" / "worktrees"
+    if not cache_dir.exists():
+        return None
+    for worktree_dir in cache_dir.iterdir():
+        sock = worktree_dir / "runtimed.sock"
+        if sock.exists():
+            return str(sock)
+    return None
+
+
 def run():
     """CLI entry point with argument parsing."""
     parser = argparse.ArgumentParser(
@@ -831,7 +861,24 @@ def run():
         nargs="?",
         help="Path to .ipynb file to open",
     )
+    parser.add_argument(
+        "--socket",
+        help="Path to runtimed socket (auto-detected if not set)",
+    )
     args = parser.parse_args()
+
+    # Set socket path: explicit flag > env var > auto-detect dev daemon
+    import os
+
+    if args.socket:
+        os.environ["RUNTIMED_SOCKET_PATH"] = args.socket
+    elif "RUNTIMED_SOCKET_PATH" not in os.environ:
+        # Auto-detect: check default path first, then dev worktree sockets
+        default_sock = Path.home() / ".cache" / "runt" / "runtimed.sock"
+        if not default_sock.exists():
+            dev_sock = _find_dev_daemon_socket()
+            if dev_sock:
+                os.environ["RUNTIMED_SOCKET_PATH"] = dev_sock
 
     app = NotebookApp(notebook_path=args.notebook)
     app.run()
