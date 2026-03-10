@@ -906,8 +906,15 @@ where
 
         room.set_loading(true);
         let mut doc = room.doc.write().await;
-        let result =
-            load_notebook_streaming(&mut doc, &mut peer_state, reader, writer, &path).await;
+        let result = load_notebook_streaming(
+            &mut doc,
+            &mut peer_state,
+            reader,
+            writer,
+            &path,
+            &room.blob_store,
+        )
+        .await;
         drop(doc); // Release lock before setting loading=false
         room.set_loading(false);
 
@@ -3279,6 +3286,9 @@ const STREAMING_BATCH_SIZE: usize = 3;
 /// The sync protocol sends deltas (changes since last sync with this peer),
 /// so calling generate_sync_message() after each batch sends just the new cells.
 ///
+/// Outputs are stored in the blob store (like kernel execution) so only
+/// small hash references go into Automerge, not megabytes of base64 images.
+///
 /// Returns the cell count on success.
 pub async fn load_notebook_streaming<R, W>(
     doc: &mut NotebookDoc,
@@ -3286,6 +3296,7 @@ pub async fn load_notebook_streaming<R, W>(
     reader: &mut R,
     writer: &mut W,
     path: &std::path::Path,
+    blob_store: &BlobStore,
 ) -> Result<usize, String>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -3309,13 +3320,43 @@ where
     // Add cells in batches, emitting sync messages between batches
     let mut batch_start = std::time::Instant::now();
     for (idx, cell) in parsed.cells.into_iter().enumerate() {
-        // Add cell to doc with all content in one operation (avoids O(n²) lookups)
+        // Process outputs through blob store (like kernel execution does)
+        // This stores large base64 images in blobs, only small hashes go into Automerge
+        let mut output_refs = Vec::with_capacity(cell.outputs.len());
+        for output_json in &cell.outputs {
+            let output_ref = match serde_json::from_str::<serde_json::Value>(output_json) {
+                Ok(output_value) => {
+                    // Create manifest (blobs large data) and store it
+                    match crate::output_store::create_manifest(
+                        &output_value,
+                        blob_store,
+                        crate::output_store::DEFAULT_INLINE_THRESHOLD,
+                    )
+                    .await
+                    {
+                        Ok(manifest_json) => {
+                            match crate::output_store::store_manifest(&manifest_json, blob_store)
+                                .await
+                            {
+                                Ok(hash) => hash,
+                                Err(_) => output_json.clone(), // Fallback to raw JSON
+                            }
+                        }
+                        Err(_) => output_json.clone(), // Fallback to raw JSON
+                    }
+                }
+                Err(_) => output_json.clone(), // Invalid JSON, keep as-is
+            };
+            output_refs.push(output_ref);
+        }
+
+        // Add cell to doc with blob references instead of raw outputs
         doc.add_cell_full(
             idx,
             &cell.id,
             &cell.cell_type,
             &cell.source,
-            &cell.outputs,
+            &output_refs,
             &cell.execution_count,
         )
         .map_err(|e| format!("Failed to add cell: {}", e))?;
