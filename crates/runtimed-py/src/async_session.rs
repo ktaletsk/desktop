@@ -192,8 +192,8 @@ impl AsyncSession {
             let connection_info = NotebookConnectionInfo::from_protocol(info);
             let (blob_base_url, blob_store_path) = get_blob_paths_async(&socket_path).await;
 
-            let state = AsyncSessionState {
-                handle: Some(handle),
+            let mut state = AsyncSessionState {
+                handle: Some(handle.clone()),
                 sync_rx: Some(sync_rx),
                 broadcast_rx: Some(broadcast_rx),
                 kernel_started: false,
@@ -203,6 +203,9 @@ impl AsyncSession {
                 connection_info: Some(connection_info),
                 notebook_path: Some(path),
             };
+
+            // Sync kernel state (handles connecting to already-running kernels)
+            sync_kernel_state_from_daemon(&handle, &mut state).await;
 
             Ok(AsyncSession {
                 state: Arc::new(Mutex::new(state)),
@@ -272,8 +275,8 @@ impl AsyncSession {
             let connection_info = NotebookConnectionInfo::from_protocol(info);
             let (blob_base_url, blob_store_path) = get_blob_paths_async(&socket_path).await;
 
-            let state = AsyncSessionState {
-                handle: Some(handle),
+            let mut state = AsyncSessionState {
+                handle: Some(handle.clone()),
                 sync_rx: Some(sync_rx),
                 broadcast_rx: Some(broadcast_rx),
                 kernel_started: false,
@@ -283,6 +286,9 @@ impl AsyncSession {
                 connection_info: Some(connection_info),
                 notebook_path: working_dir_str,
             };
+
+            // Sync kernel state (handles connecting to already-running kernels)
+            sync_kernel_state_from_daemon(&handle, &mut state).await;
 
             Ok(AsyncSession {
                 state: Arc::new(Mutex::new(state)),

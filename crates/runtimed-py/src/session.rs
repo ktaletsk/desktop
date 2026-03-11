@@ -181,8 +181,8 @@ impl Session {
             let connection_info = NotebookConnectionInfo::from_protocol(info);
             let (blob_base_url, blob_store_path) = get_blob_paths_sync(&socket_path);
 
-            let state = SessionState {
-                handle: Some(handle),
+            let mut state = SessionState {
+                handle: Some(handle.clone()),
                 sync_rx: Some(sync_rx),
                 broadcast_rx: Some(broadcast_rx),
                 kernel_started: false,
@@ -192,6 +192,9 @@ impl Session {
                 connection_info: Some(connection_info),
                 notebook_path: Some(path_str),
             };
+
+            // Sync kernel state (handles connecting to already-running kernels)
+            sync_kernel_state_from_daemon(&handle, &mut state).await;
 
             Ok((notebook_id, state))
         })?;
@@ -262,8 +265,8 @@ impl Session {
             let connection_info = NotebookConnectionInfo::from_protocol(info);
             let (blob_base_url, blob_store_path) = get_blob_paths_sync(&socket_path);
 
-            let state = SessionState {
-                handle: Some(handle),
+            let mut state = SessionState {
+                handle: Some(handle.clone()),
                 sync_rx: Some(sync_rx),
                 broadcast_rx: Some(broadcast_rx),
                 kernel_started: false,
@@ -273,6 +276,9 @@ impl Session {
                 connection_info: Some(connection_info),
                 notebook_path: working_dir_str,
             };
+
+            // Sync kernel state (handles connecting to already-running kernels)
+            sync_kernel_state_from_daemon(&handle, &mut state).await;
 
             Ok((notebook_id, state))
         })?;

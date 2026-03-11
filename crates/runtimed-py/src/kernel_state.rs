@@ -27,10 +27,14 @@ pub async fn sync_kernel_state_from_daemon<S: KernelState>(
         env_source, status, ..
     }) = handle.send_request(NotebookRequest::GetKernelInfo {}).await
     {
-        let is_running = matches!(status.as_str(), "idle" | "busy" | "starting");
+        // Any status other than "not_started" means a kernel exists
+        let is_running = status.as_str() != "not_started";
         state.set_kernel_started(is_running);
         if is_running {
             state.set_env_source(env_source);
+        } else {
+            // Clear stale env_source when kernel not running
+            state.set_env_source(None);
         }
     }
 }
