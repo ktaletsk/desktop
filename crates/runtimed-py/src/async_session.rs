@@ -17,6 +17,7 @@ use runtimed::protocol::{NotebookBroadcast, NotebookRequest, NotebookResponse};
 use crate::daemon_paths::{get_blob_paths_async, get_socket_path};
 use crate::error::to_py_err;
 use crate::event_stream::ExecutionEventStream;
+use crate::kernel_state::{query_kernel_status, sync_kernel_state_from_daemon, KernelState};
 use crate::output::{Cell, ExecutionResult, NotebookConnectionInfo, Output, SyncEnvironmentResult};
 use crate::output_resolver;
 use crate::subscription::EventSubscription;
@@ -73,6 +74,16 @@ impl AsyncSessionState {
             connection_info: None,
             notebook_path: None,
         }
+    }
+}
+
+impl KernelState for AsyncSessionState {
+    fn set_kernel_started(&mut self, started: bool) {
+        self.kernel_started = started;
+    }
+
+    fn set_env_source(&mut self, source: Option<String>) {
+        self.env_source = source;
     }
 }
 
@@ -311,23 +322,31 @@ impl AsyncSession {
             state.blob_base_url = blob_base_url;
             state.blob_store_path = blob_store_path;
 
-            // Query daemon for current kernel state (handles connecting to already-running kernels)
-            if let Some(ref handle) = state.handle {
-                if let Ok(response) = handle.send_request(NotebookRequest::GetKernelInfo {}).await {
-                    if let NotebookResponse::KernelInfo {
-                        env_source, status, ..
-                    } = response
-                    {
-                        let is_running = matches!(status.as_str(), "idle" | "busy" | "starting");
-                        state.kernel_started = is_running;
-                        if is_running {
-                            state.env_source = env_source;
-                        }
-                    }
-                }
+            // Sync kernel state from daemon (handles connecting to already-running kernels)
+            if let Some(handle) = state.handle.clone() {
+                sync_kernel_state_from_daemon(&handle, &mut *state).await;
             }
 
             Ok(())
+        })
+    }
+
+    /// Get the current kernel status string.
+    ///
+    /// Queries the daemon for real-time kernel status. Returns the status
+    /// string ("idle", "busy", "starting", "not_started", etc.) or None
+    /// if the query fails or no kernel is running.
+    ///
+    /// Returns a coroutine that resolves to Optional[str].
+    fn kernel_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        future_into_py(py, async move {
+            let state = state.lock().await;
+            if let Some(ref handle) = state.handle {
+                Ok(query_kernel_status(handle).await)
+            } else {
+                Ok(None)
+            }
         })
     }
 

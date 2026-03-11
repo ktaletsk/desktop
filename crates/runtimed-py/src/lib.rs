@@ -16,6 +16,7 @@ mod client;
 mod daemon_paths;
 mod error;
 mod event_stream;
+mod kernel_state;
 mod output;
 mod output_resolver;
 mod session;
