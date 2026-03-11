@@ -9,8 +9,10 @@ import { logger } from "../lib/logger";
 import {
   type CellSnapshot,
   cellSnapshotsToNotebookCells,
+  cellSnapshotsToNotebookCellsSync,
 } from "../lib/materialize-cells";
 import {
+  getNotebookCellsSnapshot,
   replaceNotebookCells,
   resetNotebookCells,
   updateNotebookCells,
@@ -20,7 +22,7 @@ import {
   notifyMetadataChanged,
   setNotebookHandle,
 } from "../lib/notebook-metadata";
-import type { JupyterOutput, NotebookCell } from "../types";
+import type { JupyterOutput } from "../types";
 import init, { NotebookHandle } from "../wasm/runtimed-wasm/runtimed_wasm.js";
 
 // ---------------------------------------------------------------------------
@@ -104,6 +106,20 @@ export function useAutomergeNotebook() {
         logger.warn("[automerge-notebook] sync to relay failed:", e),
       );
     }
+  }, []);
+
+  /**
+   * Synchronously re-read cells from WASM after a local mutation.
+   * Uses cache-only output resolution (no blob fetches).
+   */
+  const rematerializeCellsSync = useCallback((handle: NotebookHandle) => {
+    const json = handle.get_cells_json();
+    const snapshots: CellSnapshot[] = JSON.parse(json);
+    const newCells = cellSnapshotsToNotebookCellsSync(
+      snapshots,
+      outputCacheRef.current,
+    );
+    replaceNotebookCells(newCells);
   }, []);
 
   // ── Bootstrap ──────────────────────────────────────────────────────
@@ -257,16 +273,23 @@ export function useAutomergeNotebook() {
 
   const updateCellSource = useCallback(
     (cellId: string, source: string) => {
-      // Optimistic store update (instant keystroke feedback).
+      const handle = handleRef.current;
+      if (!handle || awaitingInitialSyncRef.current) return;
+
+      // Mutate WASM (instant, local-first)
+      const updated = handle.update_source(cellId, source);
+      if (!updated) return;
+
+      // Fast-path: update only the affected cell in the store (avoids full
+      // rematerialization on every keystroke, which would cause typing lag)
       updateNotebookCells((prev) =>
         prev.map((c) => (c.id === cellId ? { ...c, source } : c)),
       );
-      setDirty(true);
 
-      const handle = handleRef.current;
-      if (!handle) return;
-      handle.update_source(cellId, source);
+      // Sync to daemon (fire-and-forget)
       syncToRelay(handle);
+
+      setDirty(true);
     },
     [syncToRelay],
   );
@@ -283,86 +306,100 @@ export function useAutomergeNotebook() {
 
   const addCell = useCallback(
     (cellType: "code" | "markdown", afterCellId?: string | null) => {
-      const cellId = crypto.randomUUID();
-      const newCell: NotebookCell =
-        cellType === "code"
+      const handle = handleRef.current;
+
+      // Don't allow adding cells while bootstrapping or if no handle
+      if (!handle || awaitingInitialSyncRef.current) {
+        // Return a placeholder cell without mutating state
+        const placeholderId = crypto.randomUUID();
+        return cellType === "code"
           ? {
-              cell_type: "code",
-              id: cellId,
+              cell_type: "code" as const,
+              id: placeholderId,
               source: "",
               outputs: [],
               execution_count: null,
               metadata: {},
             }
-          : { cell_type: "markdown", id: cellId, source: "", metadata: {} };
-
-      // Mutate the WASM doc first — this is the source of truth.
-      // Uses fractional indexing: afterCellId=null inserts at start.
-      const handle = handleRef.current;
-      if (handle) {
-        handle.add_cell_after(cellId, cellType, afterCellId ?? null);
-        syncToRelay(handle);
+          : {
+              cell_type: cellType,
+              id: placeholderId,
+              source: "",
+              metadata: {},
+            };
       }
 
-      // Optimistic store update.
-      updateNotebookCells((prev) => {
-        if (!afterCellId) return [newCell, ...prev];
-        const i = prev.findIndex((c) => c.id === afterCellId);
-        if (i === -1) return [newCell, ...prev];
-        const next = [...prev];
-        next.splice(i + 1, 0, newCell);
-        return next;
-      });
+      const cellId = crypto.randomUUID();
+
+      // Mutate WASM (instant, local-first)
+      handle.add_cell_after(cellId, cellType, afterCellId ?? null);
+
+      // Re-read from WASM (single source of truth)
+      rematerializeCellsSync(handle);
+
+      // Sync to daemon (fire-and-forget)
+      syncToRelay(handle);
 
       setFocusedCellId(cellId);
       setDirty(true);
-      return newCell;
+
+      // Return the cell from the store (derived from WASM)
+      const cell = getNotebookCellsSnapshot().find((c) => c.id === cellId);
+      return (
+        cell ?? {
+          cell_type: cellType,
+          id: cellId,
+          source: "",
+          ...(cellType === "code"
+            ? { outputs: [], execution_count: null }
+            : {}),
+          metadata: {},
+        }
+      );
     },
-    [syncToRelay],
+    [rematerializeCellsSync, syncToRelay],
   );
 
   const moveCell = useCallback(
     (cellId: string, afterCellId?: string | null) => {
       const handle = handleRef.current;
-      if (handle) {
-        handle.move_cell(cellId, afterCellId ?? null);
-        syncToRelay(handle);
-      }
+      if (!handle || awaitingInitialSyncRef.current) return;
 
-      // Optimistic store update: remove cell from old position, insert after target.
-      updateNotebookCells((prev) => {
-        const cellIdx = prev.findIndex((c) => c.id === cellId);
-        if (cellIdx === -1) return prev;
-        const cell = prev[cellIdx];
-        const without = prev.filter((c) => c.id !== cellId);
-        if (!afterCellId) return [cell, ...without];
-        const targetIdx = without.findIndex((c) => c.id === afterCellId);
-        if (targetIdx === -1) return [cell, ...without];
-        const next = [...without];
-        next.splice(targetIdx + 1, 0, cell);
-        return next;
-      });
+      // Mutate WASM (instant, local-first)
+      handle.move_cell(cellId, afterCellId ?? null);
+
+      // Re-read from WASM (single source of truth)
+      rematerializeCellsSync(handle);
+
+      // Sync to daemon (fire-and-forget)
+      syncToRelay(handle);
 
       setDirty(true);
     },
-    [syncToRelay],
+    [rematerializeCellsSync, syncToRelay],
   );
 
   const deleteCell = useCallback(
     (cellId: string) => {
-      // Guard: never delete the last cell.
-      updateNotebookCells((prev) => {
-        if (prev.length <= 1) return prev;
-        return prev.filter((c) => c.id !== cellId);
-      });
-      setDirty(true);
-
       const handle = handleRef.current;
-      if (!handle) return;
-      handle.delete_cell(cellId);
+      if (!handle || awaitingInitialSyncRef.current) return;
+
+      // Guard: never delete the last cell
+      if (handle.cell_count() <= 1) return;
+
+      // Mutate WASM (instant, local-first)
+      const deleted = handle.delete_cell(cellId);
+      if (!deleted) return;
+
+      // Re-read from WASM (single source of truth)
+      rematerializeCellsSync(handle);
+
+      // Sync to daemon (fire-and-forget)
       syncToRelay(handle);
+
+      setDirty(true);
     },
-    [syncToRelay],
+    [rematerializeCellsSync, syncToRelay],
   );
 
   // ── Save / Open / Clone ────────────────────────────────────────────
