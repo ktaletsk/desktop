@@ -16,6 +16,7 @@ import {
   waitForAppReady,
   waitForCellOutput,
   waitForKernelReady,
+  waitForNotebookSynced,
 } from "../helpers.js";
 
 describe("E2E Smoke Test", () => {
@@ -33,6 +34,9 @@ describe("E2E Smoke Test", () => {
   });
 
   it("should execute code and show output", async () => {
+    // Wait for the notebook to finish Automerge sync and render cells.
+    await waitForNotebookSynced();
+
     // Find the first code cell
     const codeCell = await $('[data-cell-type="code"]');
     await codeCell.waitForExist({ timeout: 5000 });
