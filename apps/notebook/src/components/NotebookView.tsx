@@ -13,6 +13,7 @@ import type { NotebookCell } from "../types";
 import { CellSkeleton } from "./CellSkeleton";
 import { CodeCell } from "./CodeCell";
 import { MarkdownCell } from "./MarkdownCell";
+import { RawCell } from "./RawCell";
 
 interface NotebookViewProps {
   cells: NotebookCell[];
@@ -264,13 +265,20 @@ function NotebookViewContent({
         );
       }
 
-      // Raw cells rendered as plain text for now
       return (
-        <div key={cell.id} className="px-4 py-2">
-          <pre className="text-sm text-muted-foreground whitespace-pre-wrap">
-            {cell.source}
-          </pre>
-        </div>
+        <RawCell
+          key={cell.id}
+          cell={cell}
+          isFocused={isFocused}
+          isFirstCell={index === 0}
+          isPreviousCellFromFocused={cell.id === previousCellId}
+          searchQuery={searchQuery}
+          onFocus={() => onFocusCell(cell.id)}
+          onUpdateSource={(source) => onUpdateCellSource(cell.id, source)}
+          onDelete={() => onDeleteCell(cell.id)}
+          onFocusPrevious={onFocusPrevious}
+          onFocusNext={onFocusNext}
+        />
       );
     },
     [

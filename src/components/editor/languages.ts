@@ -4,7 +4,9 @@ import { json } from "@codemirror/lang-json";
 import { markdown } from "@codemirror/lang-markdown";
 import { python } from "@codemirror/lang-python";
 import { sql } from "@codemirror/lang-sql";
-import { indentUnit } from "@codemirror/language";
+import { yaml } from "@codemirror/lang-yaml";
+import { toml as tomlMode } from "@codemirror/legacy-modes/mode/toml";
+import { indentUnit, StreamLanguage } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 
 import {
@@ -29,6 +31,8 @@ export type SupportedLanguage =
   | "javascript"
   | "typescript"
   | "json"
+  | "yaml"
+  | "toml"
   | "plain";
 
 /**
@@ -36,6 +40,7 @@ export type SupportedLanguage =
  */
 // PEP 8 specifies 4-space indentation for Python
 const pythonIndent = indentUnit.of("    ");
+const toml = StreamLanguage.define(tomlMode);
 
 export function getLanguageExtension(language: SupportedLanguage): Extension {
   switch (language) {
@@ -62,6 +67,10 @@ export function getLanguageExtension(language: SupportedLanguage): Extension {
       return javascript({ typescript: true });
     case "json":
       return json();
+    case "yaml":
+      return yaml();
+    case "toml":
+      return toml;
     default:
       return [];
   }
@@ -137,6 +146,8 @@ export const languageDisplayNames: Record<SupportedLanguage, string> = {
   javascript: "JavaScript",
   typescript: "TypeScript",
   json: "JSON",
+  yaml: "YAML",
+  toml: "TOML",
   plain: "Plain Text",
 };
 
@@ -156,6 +167,9 @@ export const fileExtensionToLanguage: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
   ".tsx": "typescript",
   ".json": "json",
+  ".yaml": "yaml",
+  ".yml": "yaml",
+  ".toml": "toml",
   ".txt": "plain",
 };
 
