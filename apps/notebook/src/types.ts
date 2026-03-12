@@ -15,6 +15,8 @@ export interface MarkdownCell {
   id: string;
   source: string;
   metadata: CellMetadata;
+  /** Resolved markdown asset refs (`attachment:...`, relative paths) → blob hash */
+  resolvedAssets?: Record<string, string>;
 }
 
 export interface RawCell {

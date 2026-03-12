@@ -12,7 +12,9 @@ import { isDarkMode as detectDarkMode } from "@/lib/dark-mode";
 import { cn } from "@/lib/utils";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
 import { useEditorRegistry } from "../hooks/useEditorRegistry";
+import { useBlobPort } from "../hooks/useManifestResolver";
 import { logger } from "../lib/logger";
+import { rewriteMarkdownAssetRefs } from "../lib/markdown-assets";
 import { openUrl } from "../lib/open-url";
 import type { MarkdownCell as MarkdownCellType } from "../types";
 
@@ -140,6 +142,8 @@ export function MarkdownCell({
     return () => observer.disconnect();
   }, []);
 
+  const blobPort = useBlobPort();
+
   // Register editor with the registry for cross-cell navigation
   useEffect(() => {
     if (editing && editorRef.current) {
@@ -165,25 +169,35 @@ export function MarkdownCell({
   // Render markdown content when iframe is ready
   const handleFrameReady = useCallback(() => {
     if (!frameRef.current || !cell.source) return;
+    const processedSource = rewriteMarkdownAssetRefs(
+      cell.source,
+      cell.resolvedAssets,
+      blobPort,
+    );
     frameRef.current.render({
       mimeType: "text/markdown",
-      data: cell.source,
+      data: processedSource,
       cellId: cell.id,
       replace: true,
     });
-  }, [cell.source, cell.id]);
+  }, [cell.source, cell.id, cell.resolvedAssets, blobPort]);
 
-  // Sync markdown to iframe whenever source changes (supports RTC updates)
+  // Sync markdown to iframe whenever source or resolved assets change (supports RTC updates)
   useEffect(() => {
     if (frameRef.current?.isReady && cell.source) {
+      const processedSource = rewriteMarkdownAssetRefs(
+        cell.source,
+        cell.resolvedAssets,
+        blobPort,
+      );
       frameRef.current.render({
         mimeType: "text/markdown",
-        data: cell.source,
+        data: processedSource,
         cellId: cell.id,
         replace: true,
       });
     }
-  }, [cell.source, cell.id]);
+  }, [cell.source, cell.id, cell.resolvedAssets, blobPort]);
 
   // Handle link clicks from iframe - open in system browser
   const handleLinkClick = useCallback((url: string) => {

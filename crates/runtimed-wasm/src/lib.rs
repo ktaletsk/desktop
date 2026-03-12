@@ -34,6 +34,7 @@ pub struct JsCell {
     execution_count: String,
     outputs: Vec<String>,
     metadata: serde_json::Value,
+    resolved_assets: std::collections::HashMap<String, String>,
 }
 
 #[wasm_bindgen]
@@ -75,6 +76,12 @@ impl JsCell {
     pub fn metadata_json(&self) -> String {
         serde_json::to_string(&self.metadata).unwrap_or_else(|_| "{}".to_string())
     }
+
+    /// Get resolved asset refs as a JSON object string (`ref` → blob hash).
+    #[wasm_bindgen(getter)]
+    pub fn resolved_assets_json(&self) -> String {
+        serde_json::to_string(&self.resolved_assets).unwrap_or_else(|_| "{}".to_string())
+    }
 }
 
 impl From<(usize, CellSnapshot)> for JsCell {
@@ -88,6 +95,7 @@ impl From<(usize, CellSnapshot)> for JsCell {
             execution_count: snap.execution_count,
             outputs: snap.outputs,
             metadata: snap.metadata,
+            resolved_assets: snap.resolved_assets,
         }
     }
 }
