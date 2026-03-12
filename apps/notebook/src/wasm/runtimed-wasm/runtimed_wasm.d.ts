@@ -106,7 +106,8 @@ export class NotebookHandle {
      * Generate a sync message to send to the daemon (via the Tauri relay pipe).
      *
      * Returns the message as a byte array, or undefined if already in sync.
-     * The caller should send these bytes via `invoke("send_automerge_sync", { syncMessage })`.
+     * The caller should prepend the frame type byte (0x00 for AutomergeSync)
+     * and send via `invoke("send_frame", { frameData })`.
      */
     generate_sync_message(): Uint8Array | undefined;
     /**
@@ -150,6 +151,24 @@ export class NotebookHandle {
      * Create a new empty notebook document.
      */
     constructor(notebook_id: string);
+    /**
+     * Receive a typed frame from the daemon, demux by type byte, return events for the frontend.
+     *
+     * The input is the raw frame bytes from the `notebook:frame` Tauri event:
+     * `[frame_type_byte, ...payload]`.
+     *
+     * Returns a JSON array of `FrameEvent` objects. Usually one event, but sync
+     * frames may produce both a `sync_applied` and a `sync_reply` if the local
+     * doc needs to send a response.
+     *
+     * When a `SyncReply` event is returned, its `reply` field contains raw
+     * Automerge sync bytes (no frame type prefix). The frontend must prepend
+     * the frame type byte (`0x00` for AutomergeSync) to form a complete typed
+     * frame, then send it back via `invoke("send_frame", { frameData })`.
+     *
+     * Returns `undefined` if the frame is empty or cannot be processed.
+     */
+    receive_frame(frame_bytes: Uint8Array): string | undefined;
     /**
      * Receive and apply a sync message from the daemon (via the Tauri relay pipe).
      *
@@ -199,6 +218,19 @@ export class NotebookHandle {
     update_source(cell_id: string, source: string): boolean;
 }
 
+/**
+ * Encode a cursor position as a presence frame payload (CBOR).
+ *
+ * The frontend should prepend the frame type byte (0x04) and send
+ * via `invoke("send_frame", { frameData })`.
+ */
+export function encode_cursor_presence(peer_id: string, cell_id: string, line: number, column: number): Uint8Array;
+
+/**
+ * Encode a selection range as a presence frame payload (CBOR).
+ */
+export function encode_selection_presence(peer_id: string, cell_id: string, anchor_line: number, anchor_col: number, head_line: number, head_col: number): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -244,11 +276,14 @@ export interface InitOutput {
     readonly notebookhandle_receive_sync_message: (a: number, b: number, c: number, d: number) => void;
     readonly notebookhandle_save: (a: number, b: number) => void;
     readonly notebookhandle_reset_sync_state: (a: number) => void;
+    readonly notebookhandle_receive_frame: (a: number, b: number, c: number, d: number) => void;
+    readonly encode_cursor_presence: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly encode_selection_presence: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export3: (a: number, b: number) => number;
-    readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number) => number;
+    readonly __wbindgen_export3: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
