@@ -19,6 +19,7 @@ import {
 import { DebugBanner } from "./components/DebugBanner";
 import { DenoDependencyHeader } from "./components/DenoDependencyHeader";
 import { DependencyHeader } from "./components/DependencyHeader";
+import { DocumentSettingsDialog } from "./components/DocumentSettingsDialog";
 import { GlobalFindBar } from "./components/GlobalFindBar";
 import { NotebookToolbar } from "./components/NotebookToolbar";
 import { NotebookView } from "./components/NotebookView";
@@ -34,6 +35,7 @@ import { useDaemonInfo, useGitInfo } from "./hooks/useGitInfo";
 import { useGlobalFind } from "./hooks/useGlobalFind";
 import { useTrust } from "./hooks/useTrust";
 import { useUpdater } from "./hooks/useUpdater";
+import { getDocumentFrontmatterState } from "./lib/frontmatter";
 import { KERNEL_STATUS } from "./lib/kernel-status";
 import { logger } from "./lib/logger";
 import { useDetectRuntime } from "./lib/notebook-metadata";
@@ -109,6 +111,7 @@ function AppContent() {
   const globalFind = useGlobalFind(cells);
 
   const [dependencyHeaderOpen, setDependencyHeaderOpen] = useState(false);
+  const [documentSettingsOpen, setDocumentSettingsOpen] = useState(false);
   const [showIsolationTest, setShowIsolationTest] = useState(false);
   const [trustDialogOpen, setTrustDialogOpen] = useState(false);
   const [clearingDeps, setClearingDeps] = useState(false);
@@ -149,6 +152,10 @@ function AppContent() {
   const [pagePayloads, setPagePayloads] = useState<
     Map<string, CellPagePayload>
   >(new Map());
+  const documentFrontmatterKind = useMemo(
+    () => getDocumentFrontmatterState(cells).kind,
+    [cells],
+  );
 
   // UV Dependency management
   const {
@@ -570,6 +577,19 @@ function AppContent() {
     [addCell],
   );
 
+  const handleSaveFrontmatter = useCallback(
+    (source: string, cellId?: string | null) => {
+      if (cellId) {
+        updateCellSource(cellId, source);
+        return;
+      }
+
+      const frontmatterCell = addCell("raw", null);
+      updateCellSource(frontmatterCell.id, source);
+    },
+    [addCell, updateCellSource],
+  );
+
   // Wrapper for toolbar's start kernel - uses trust check before starting
   const handleStartKernel = useCallback(
     async (_name: string) => {
@@ -918,6 +938,8 @@ function AppContent() {
         focusedCellId={focusedCellId}
         lastCellId={cells.length > 0 ? cells[cells.length - 1].id : null}
         onAddCell={handleAddCell}
+        onOpenDocumentSettings={() => setDocumentSettingsOpen(true)}
+        documentFrontmatterKind={documentFrontmatterKind}
         onToggleDependencies={() => setDependencyHeaderOpen((prev) => !prev)}
         isDepsOpen={dependencyHeaderOpen}
         updateStatus={updateStatus}
@@ -1053,6 +1075,12 @@ function AppContent() {
         onDecline={handleTrustDecline}
         loading={trustLoading}
         daemonMode={true}
+      />
+      <DocumentSettingsDialog
+        open={documentSettingsOpen}
+        onOpenChange={setDocumentSettingsOpen}
+        cells={cells}
+        onSaveFrontmatter={handleSaveFrontmatter}
       />
       <NotebookView
         cells={cells}

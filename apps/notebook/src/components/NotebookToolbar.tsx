@@ -1,6 +1,7 @@
 import {
   ArrowDownToLine,
   ChevronsRight,
+  FileText,
   Info,
   Play,
   Plus,
@@ -12,6 +13,7 @@ import { useCallback, useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import type { EnvProgressState } from "../hooks/useEnvProgress";
 import type { UpdateStatus } from "../hooks/useUpdater";
+import type { DocumentFrontmatterKind } from "../lib/frontmatter";
 import {
   getKernelStatusLabel,
   KERNEL_STATUS,
@@ -41,6 +43,8 @@ interface NotebookToolbarProps {
   focusedCellId?: string | null;
   lastCellId?: string | null;
   onAddCell: (type: "code" | "markdown", afterCellId?: string | null) => void;
+  onOpenDocumentSettings: () => void;
+  documentFrontmatterKind?: DocumentFrontmatterKind;
   onToggleDependencies: () => void;
   isDepsOpen?: boolean;
   listKernelspecs?: () => Promise<KernelspecInfo[]>;
@@ -66,6 +70,8 @@ export function NotebookToolbar({
   focusedCellId,
   lastCellId,
   onAddCell,
+  onOpenDocumentSettings,
+  documentFrontmatterKind = "none",
   onToggleDependencies,
   isDepsOpen = false,
   listKernelspecs,
@@ -249,6 +255,29 @@ export function NotebookToolbar({
             <span>Update {updateVersion}</span>
           </button>
         )}
+
+        <button
+          type="button"
+          onClick={onOpenDocumentSettings}
+          data-testid="document-settings-button"
+          className={cn(
+            "flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors",
+            documentFrontmatterKind === "yaml"
+              ? "bg-rose-500/10 text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+              : documentFrontmatterKind === "toml" ||
+                  documentFrontmatterKind === "invalid"
+                ? "bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground",
+          )}
+          title={
+            documentFrontmatterKind === "none"
+              ? "Open document settings and create frontmatter"
+              : "Open document settings"
+          }
+        >
+          <FileText className="h-3 w-3" />
+          <span>Document</span>
+        </button>
 
         {/* Runtime / deps toggle */}
         <button
