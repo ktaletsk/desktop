@@ -519,10 +519,15 @@ async fn initialize_notebook_sync_open(
         socket_path.display(),
     );
 
-    let (raw_sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (presence_tx, raw_presence_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let pipe_channels = runtimed::notebook_sync_client::PipeChannels {
+        sync_tx,
+        presence_tx,
+    };
 
     let (handle, receiver, broadcast_receiver, _cells, _metadata, info) =
-        NotebookSyncClient::connect_open_split(socket_path, path, Some(raw_sync_tx))
+        NotebookSyncClient::connect_open_split(socket_path, path, Some(pipe_channels))
             .await
             .map_err(|e| format!("sync connect (open): {}", e))?;
 
@@ -552,6 +557,7 @@ async fn initialize_notebook_sync_open(
         handle,
         broadcast_receiver,
         raw_sync_rx,
+        raw_presence_rx,
         notebook_sync,
         sync_generation,
         current_generation,
@@ -584,7 +590,12 @@ async fn initialize_notebook_sync_create(
         socket_path.display(),
     );
 
-    let (raw_sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (sync_tx, raw_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (presence_tx, raw_presence_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let pipe_channels = runtimed::notebook_sync_client::PipeChannels {
+        sync_tx,
+        presence_tx,
+    };
 
     let (handle, receiver, broadcast_receiver, _cells, _metadata, info) =
         NotebookSyncClient::connect_create_split(
@@ -592,7 +603,7 @@ async fn initialize_notebook_sync_create(
             runtime,
             working_dir,
             notebook_id_hint,
-            Some(raw_sync_tx),
+            Some(pipe_channels),
         )
         .await
         .map_err(|e| format!("sync connect (create): {}", e))?;
@@ -621,6 +632,7 @@ async fn initialize_notebook_sync_create(
         handle,
         broadcast_receiver,
         raw_sync_rx,
+        raw_presence_rx,
         notebook_sync,
         sync_generation,
         current_generation,
@@ -645,6 +657,7 @@ async fn setup_sync_receivers(
     handle: NotebookSyncHandle,
     mut broadcast_receiver: NotebookBroadcastReceiver,
     mut raw_sync_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut raw_presence_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     notebook_sync: SharedNotebookSync,
     sync_generation: Arc<AtomicU64>,
     current_generation: u64,
@@ -677,6 +690,26 @@ async fn setup_sync_receivers(
         info!(
             "[notebook-sync] Raw sync relay ended for {}",
             notebook_id_for_raw_sync,
+        );
+    });
+
+    // Spawn presence relay task — forwards presence frames to frontend
+    let window_for_presence = window.clone();
+    let notebook_id_for_presence = notebook_id.clone();
+    tokio::spawn(async move {
+        while let Some(presence_bytes) = raw_presence_rx.recv().await {
+            if let Err(e) = emit_to_label::<_, _, _>(
+                &window_for_presence,
+                window_for_presence.label(),
+                "presence:from-daemon",
+                &presence_bytes,
+            ) {
+                warn!("[notebook-sync] Failed to emit presence:from-daemon: {}", e);
+            }
+        }
+        info!(
+            "[notebook-sync] Presence relay ended for {}",
+            notebook_id_for_presence,
         );
     });
 
@@ -2424,6 +2457,26 @@ async fn send_automerge_sync(
         .map_err(|e| format!("Failed to relay sync message: {}", e))
 }
 
+/// Send a presence frame to the daemon for relay to other peers.
+///
+/// The data should be CBOR-encoded presence bytes from the WASM
+/// `NotebookHandle.encode_cursor_presence()` or similar.
+#[tauri::command]
+async fn send_presence(
+    window: tauri::Window,
+    presence_data: Vec<u8>,
+    registry: tauri::State<'_, WindowNotebookRegistry>,
+) -> Result<(), String> {
+    let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
+    let guard = notebook_sync.lock().await;
+    let handle = guard.as_ref().ok_or("Not connected to daemon")?;
+
+    handle
+        .send_presence(presence_data)
+        .await
+        .map_err(|e| format!("send_presence: {}", e))
+}
+
 #[tauri::command]
 async fn list_kernelspecs() -> Result<Vec<KernelspecInfo>, String> {
     let specs = runtimelib::list_kernelspecs().await;
@@ -3466,6 +3519,7 @@ pub fn run(
             reconnect_to_daemon,
             get_automerge_doc_bytes,
             send_automerge_sync,
+            send_presence,
             // App update support
             install_daemon_for_update,
             begin_upgrade,
