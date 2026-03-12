@@ -199,6 +199,29 @@ export class NotebookHandle {
     update_source(cell_id: string, source: string): boolean;
 }
 
+/**
+ * Decode a presence frame payload into a JSON string for the frontend.
+ *
+ * Returns a JSON object with the decoded presence message, or null
+ * if decoding fails. The frontend can parse this to render remote
+ * cursors, selections, and kernel state.
+ */
+export function decode_presence_message(data: Uint8Array): string | undefined;
+
+/**
+ * Encode a cursor position as a presence frame payload (binary).
+ *
+ * The frontend should send these bytes via `invoke("send_presence", { presenceData })`.
+ * The `peer_id` is a local identifier — the daemon replaces it with the
+ * server-assigned peer ID before relaying.
+ */
+export function encode_cursor_presence(peer_id: string, cell_id: string, line: number, column: number): Uint8Array;
+
+/**
+ * Encode a selection range as a presence frame payload (binary).
+ */
+export function encode_selection_presence(peer_id: string, cell_id: string, anchor_line: number, anchor_col: number, head_line: number, head_col: number): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -244,10 +267,13 @@ export interface InitOutput {
     readonly notebookhandle_receive_sync_message: (a: number, b: number, c: number, d: number) => void;
     readonly notebookhandle_save: (a: number, b: number) => void;
     readonly notebookhandle_reset_sync_state: (a: number) => void;
+    readonly encode_cursor_presence: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly encode_selection_presence: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+    readonly decode_presence_message: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export3: (a: number, b: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number) => number;
+    readonly __wbindgen_export3: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
 }
 
