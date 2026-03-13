@@ -172,19 +172,68 @@ impl NotebookDoc {
 
 impl NotebookDoc {
     /// Read the notebook metadata as a typed snapshot.
+    ///
+    /// Assembles from individual native Automerge keys (`"kernelspec"`,
+    /// `"language_info"`, `"runt"`). Falls back to the legacy bundled
+    /// `"notebook_metadata"` JSON string for migration.
     pub fn get_metadata_snapshot(&self) -> Option<metadata::NotebookMetadataSnapshot> {
+        // Try native keys first
+        let kernelspec = self
+            .get_metadata_value("kernelspec")
+            .and_then(|v| serde_json::from_value(v).ok());
+        let language_info = self
+            .get_metadata_value("language_info")
+            .and_then(|v| serde_json::from_value(v).ok());
+        let runt: Option<metadata::RuntMetadata> = self
+            .get_metadata_value("runt")
+            .and_then(|v| serde_json::from_value(v).ok());
+
+        // If we found at least one native key, assemble from them
+        if kernelspec.is_some() || language_info.is_some() || runt.is_some() {
+            return Some(metadata::NotebookMetadataSnapshot {
+                kernelspec,
+                language_info,
+                runt: runt.unwrap_or_default(),
+            });
+        }
+
+        // Fallback: legacy bundled JSON string (for untitled notebooks from old daemon)
         let json = self.get_metadata(metadata::NOTEBOOK_METADATA_KEY)?;
         serde_json::from_str(&json).ok()
     }
 
-    /// Write a typed metadata snapshot to the document.
+    /// Write a typed metadata snapshot to the document as native Automerge.
+    ///
+    /// Writes `"kernelspec"`, `"language_info"`, and `"runt"` as separate
+    /// native Automerge maps/lists. Also writes the legacy `"notebook_metadata"`
+    /// string key for backward compatibility during migration.
     pub fn set_metadata_snapshot(
         &mut self,
         snapshot: &metadata::NotebookMetadataSnapshot,
     ) -> Result<(), AutomergeError> {
+        // Write individual native keys
+        if let Some(ref ks) = snapshot.kernelspec {
+            let value = serde_json::to_value(ks).map_err(|e| {
+                AutomergeError::InvalidObjId(format!("serialize kernelspec: {}", e))
+            })?;
+            self.set_metadata_value("kernelspec", &value)?;
+        }
+        if let Some(ref li) = snapshot.language_info {
+            let value = serde_json::to_value(li).map_err(|e| {
+                AutomergeError::InvalidObjId(format!("serialize language_info: {}", e))
+            })?;
+            self.set_metadata_value("language_info", &value)?;
+        }
+        let runt_value = serde_json::to_value(&snapshot.runt)
+            .map_err(|e| AutomergeError::InvalidObjId(format!("serialize runt: {}", e)))?;
+        self.set_metadata_value("runt", &runt_value)?;
+
+        // Also write legacy bundled key for backward compat (remove in Phase 2)
         let json = serde_json::to_string(snapshot)
             .map_err(|e| AutomergeError::InvalidObjId(format!("serialize metadata: {}", e)))?;
-        self.set_metadata(metadata::NOTEBOOK_METADATA_KEY, &json)
+        self.set_metadata(metadata::NOTEBOOK_METADATA_KEY, &json)?;
+
+        Ok(())
     }
 
     /// Detect the notebook runtime from metadata (kernelspec + language_info).
@@ -1765,8 +1814,85 @@ pub fn get_metadata_from_doc(doc: &AutoCommit, key: &str) -> Option<String> {
 pub fn get_metadata_snapshot_from_doc(
     doc: &AutoCommit,
 ) -> Option<metadata::NotebookMetadataSnapshot> {
+    let meta_id = doc
+        .get(automerge::ROOT, "metadata")
+        .ok()
+        .flatten()
+        .and_then(|(value, id)| match value {
+            automerge::Value::Object(ObjType::Map) => Some(id),
+            _ => None,
+        })?;
+
+    // Try native keys first
+    let kernelspec = get_json_value_from_doc(doc, &meta_id, "kernelspec")
+        .and_then(|v| serde_json::from_value(v).ok());
+    let language_info = get_json_value_from_doc(doc, &meta_id, "language_info")
+        .and_then(|v| serde_json::from_value(v).ok());
+    let runt: Option<metadata::RuntMetadata> = get_json_value_from_doc(doc, &meta_id, "runt")
+        .and_then(|v| serde_json::from_value(v).ok());
+
+    if kernelspec.is_some() || language_info.is_some() || runt.is_some() {
+        return Some(metadata::NotebookMetadataSnapshot {
+            kernelspec,
+            language_info,
+            runt: runt.unwrap_or_default(),
+        });
+    }
+
+    // Fallback: legacy bundled JSON string
     let json = get_metadata_from_doc(doc, metadata::NOTEBOOK_METADATA_KEY)?;
     serde_json::from_str(&json).ok()
+}
+
+/// Read an Automerge subtree as a `serde_json::Value` from a raw `AutoCommit`.
+///
+/// Free-function counterpart of `NotebookDoc::get_json_value`.
+fn get_json_value_from_doc(
+    doc: &AutoCommit,
+    parent: &ObjId,
+    key: &str,
+) -> Option<serde_json::Value> {
+    use automerge::Value;
+    match doc.get(parent, key).ok()?? {
+        (Value::Object(ObjType::Map), map_id) => Some(read_map_as_json_from_doc(doc, &map_id)),
+        (Value::Object(ObjType::List), list_id) => {
+            Some(read_list_as_json_from_doc(doc, &list_id))
+        }
+        (Value::Scalar(s), _) => Some(scalar_to_json(&s)),
+        _ => None,
+    }
+}
+
+/// Read an Automerge map as a JSON object from a raw `AutoCommit`.
+fn read_map_as_json_from_doc(doc: &AutoCommit, map_id: &ObjId) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for key in doc.keys(map_id) {
+        if let Some(value) = get_json_value_from_doc(doc, map_id, &key) {
+            obj.insert(key, value);
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Read an Automerge list as a JSON array from a raw `AutoCommit`.
+fn read_list_as_json_from_doc(doc: &AutoCommit, list_id: &ObjId) -> serde_json::Value {
+    use automerge::Value;
+    let len = doc.length(list_id);
+    let mut arr = Vec::with_capacity(len);
+    for i in 0..len {
+        let val = match doc.get(list_id, i).ok().flatten() {
+            Some((Value::Object(ObjType::Map), nested_id)) => {
+                read_map_as_json_from_doc(doc, &nested_id)
+            }
+            Some((Value::Object(ObjType::List), nested_id)) => {
+                read_list_as_json_from_doc(doc, &nested_id)
+            }
+            Some((Value::Scalar(s), _)) => scalar_to_json(&s),
+            _ => serde_json::Value::Null,
+        };
+        arr.push(val);
+    }
+    serde_json::Value::Array(arr)
 }
 
 /// Set a metadata value in a raw `AutoCommit` document.
