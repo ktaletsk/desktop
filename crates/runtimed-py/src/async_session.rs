@@ -40,6 +40,7 @@ use notebook_doc::metadata::NotebookMetadataSnapshot;
 pub struct AsyncSession {
     state: Arc<Mutex<AsyncSessionState>>,
     notebook_id: String,
+    peer_label: Option<String>,
 }
 
 struct AsyncSessionState {
@@ -86,14 +87,15 @@ impl AsyncSession {
     ///                  Multiple AsyncSession objects with the same notebook_id
     ///                  will share the same kernel.
     #[new]
-    #[pyo3(signature = (notebook_id=None))]
-    fn new(notebook_id: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (notebook_id=None, peer_label=None))]
+    fn new(notebook_id: Option<String>, peer_label: Option<String>) -> PyResult<Self> {
         let notebook_id =
             notebook_id.unwrap_or_else(|| format!("agent-session-{}", uuid::Uuid::new_v4()));
 
         Ok(Self {
             state: Arc::new(Mutex::new(AsyncSessionState::new())),
             notebook_id,
+            peer_label,
         })
     }
 
@@ -162,7 +164,12 @@ impl AsyncSession {
     /// Raises:
     ///     RuntimedError: If the file cannot be opened or parsed.
     #[staticmethod]
-    fn open_notebook(py: Python<'_>, path: String) -> PyResult<Bound<'_, PyAny>> {
+    #[pyo3(signature = (path, peer_label=None))]
+    fn open_notebook(
+        py: Python<'_>,
+        path: String,
+        peer_label: Option<String>,
+    ) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
             let path_buf = PathBuf::from(&path);
             let socket_path = get_socket_path();
@@ -196,6 +203,7 @@ impl AsyncSession {
             Ok(AsyncSession {
                 state: Arc::new(Mutex::new(state)),
                 notebook_id,
+                peer_label,
             })
         })
     }
@@ -212,11 +220,12 @@ impl AsyncSession {
     /// Returns:
     ///     A coroutine that resolves to a new AsyncSession connected to the created notebook.
     #[staticmethod]
-    #[pyo3(signature = (runtime="python", working_dir=None))]
+    #[pyo3(signature = (runtime="python", working_dir=None, peer_label=None))]
     fn create_notebook<'py>(
         py: Python<'py>,
         runtime: &str,
         working_dir: Option<String>,
+        peer_label: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Validate working_dir if provided
         if let Some(ref wd) = working_dir {
@@ -276,6 +285,7 @@ impl AsyncSession {
             Ok(AsyncSession {
                 state: Arc::new(Mutex::new(state)),
                 notebook_id,
+                peer_label,
             })
         })
     }
@@ -735,8 +745,9 @@ impl AsyncSession {
         column: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let data = notebook_doc::presence::encode_cursor_update(
+        let data = notebook_doc::presence::encode_cursor_update_labeled(
             "local",
+            self.peer_label.as_deref(),
             &notebook_doc::presence::CursorPosition {
                 cell_id: cell_id.to_string(),
                 line,
@@ -774,8 +785,9 @@ impl AsyncSession {
         head_col: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let data = notebook_doc::presence::encode_selection_update(
+        let data = notebook_doc::presence::encode_selection_update_labeled(
             "local",
+            self.peer_label.as_deref(),
             &notebook_doc::presence::SelectionRange {
                 cell_id: cell_id.to_string(),
                 anchor_line,

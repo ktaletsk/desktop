@@ -39,6 +39,7 @@ pub struct Session {
     runtime: Runtime,
     state: Arc<Mutex<SessionState>>,
     notebook_id: String,
+    peer_label: Option<String>,
 }
 
 struct SessionState {
@@ -85,8 +86,8 @@ impl Session {
     ///                  Multiple Session objects with the same notebook_id
     ///                  will share the same kernel.
     #[new]
-    #[pyo3(signature = (notebook_id=None))]
-    fn new(notebook_id: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (notebook_id=None, peer_label=None))]
+    fn new(notebook_id: Option<String>, peer_label: Option<String>) -> PyResult<Self> {
         let runtime = Runtime::new().map_err(to_py_err)?;
         let notebook_id =
             notebook_id.unwrap_or_else(|| format!("agent-session-{}", uuid::Uuid::new_v4()));
@@ -95,6 +96,7 @@ impl Session {
             runtime,
             state: Arc::new(Mutex::new(SessionState::new())),
             notebook_id,
+            peer_label,
         })
     }
 
@@ -148,7 +150,8 @@ impl Session {
     /// Raises:
     ///     RuntimedError: If the file cannot be opened or parsed.
     #[staticmethod]
-    fn open_notebook(path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, peer_label=None))]
+    fn open_notebook(path: &str, peer_label: Option<String>) -> PyResult<Self> {
         let runtime = Runtime::new().map_err(to_py_err)?;
         let path_buf = PathBuf::from(path);
         let path_str = path.to_string();
@@ -189,6 +192,7 @@ impl Session {
             runtime,
             state: Arc::new(Mutex::new(state)),
             notebook_id,
+            peer_label,
         })
     }
 
@@ -204,8 +208,12 @@ impl Session {
     /// Returns:
     ///     A new Session connected to the created notebook.
     #[staticmethod]
-    #[pyo3(signature = (runtime="python", working_dir=None))]
-    fn create_notebook(runtime: &str, working_dir: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (runtime="python", working_dir=None, peer_label=None))]
+    fn create_notebook(
+        runtime: &str,
+        working_dir: Option<&str>,
+        peer_label: Option<String>,
+    ) -> PyResult<Self> {
         // Validate working_dir if provided
         if let Some(wd) = working_dir {
             let path = std::path::Path::new(wd);
@@ -270,6 +278,7 @@ impl Session {
             runtime: rt,
             state: Arc::new(Mutex::new(state)),
             notebook_id,
+            peer_label,
         })
     }
 
@@ -595,8 +604,9 @@ impl Session {
     ///     line: Line number (0-based).
     ///     column: Column number (0-based).
     fn set_cursor(&self, cell_id: &str, line: u32, column: u32) -> PyResult<()> {
-        let data = notebook_doc::presence::encode_cursor_update(
+        let data = notebook_doc::presence::encode_cursor_update_labeled(
             "local",
+            self.peer_label.as_deref(),
             &notebook_doc::presence::CursorPosition {
                 cell_id: cell_id.to_string(),
                 line,
@@ -629,8 +639,9 @@ impl Session {
         head_line: u32,
         head_col: u32,
     ) -> PyResult<()> {
-        let data = notebook_doc::presence::encode_selection_update(
+        let data = notebook_doc::presence::encode_selection_update_labeled(
             "local",
+            self.peer_label.as_deref(),
             &notebook_doc::presence::SelectionRange {
                 cell_id: cell_id.to_string(),
                 anchor_line,
