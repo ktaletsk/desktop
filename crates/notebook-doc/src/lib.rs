@@ -1998,10 +1998,18 @@ pub fn get_cells_from_doc(doc: &AutoCommit) -> Vec<CellSnapshot> {
                 _ => vec![],
             };
 
-            // Read metadata (JSON string -> Value)
-            let metadata = read_str(doc, &cell_obj, "metadata")
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
+            // Read metadata: try native Automerge Map first, fall back to legacy JSON string
+            let metadata = match doc.get(&cell_obj, "metadata").ok().flatten() {
+                Some((automerge::Value::Object(ObjType::Map), map_id)) => {
+                    read_map_as_json_from_doc(doc, &map_id)
+                }
+                _ => {
+                    // Legacy: metadata stored as JSON string
+                    read_str(doc, &cell_obj, "metadata")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| serde_json::json!({}))
+                }
+            };
 
             // Read resolved asset map
             let resolved_assets = match doc.get(&cell_obj, "resolved_assets").ok().flatten() {
