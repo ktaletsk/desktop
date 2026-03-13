@@ -753,7 +753,7 @@ impl NotebookDoc {
         }
 
         // Store metadata as native Automerge map
-        if metadata.is_object() && !metadata.as_object().map_or(true, |m| m.is_empty()) {
+        if metadata.as_object().is_some_and(|m| !m.is_empty()) {
             let meta_id = self.doc.put_object(&cell_map, "metadata", ObjType::Map)?;
             if let serde_json::Value::Object(map) = metadata {
                 for (k, v) in map {
