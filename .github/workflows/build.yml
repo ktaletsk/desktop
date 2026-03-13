@@ -750,6 +750,28 @@ jobs:
         working-directory: python/runtimed
         run: uv run maturin develop --manifest-path ../../crates/runtimed-py/Cargo.toml
 
+      - name: Inspect binary and Python module
+        working-directory: python/runtimed
+        run: |
+          echo "=== runtimed binary ==="
+          ls -la "${GITHUB_WORKSPACE}/target/release/runtimed"
+          file "${GITHUB_WORKSPACE}/target/release/runtimed"
+          sha256sum "${GITHUB_WORKSPACE}/target/release/runtimed" | cut -c1-16
+          "${GITHUB_WORKSPACE}/target/release/runtimed" --version || true
+
+          echo ""
+          echo "=== runtimed Python module ==="
+          uv run python -c "
+          import runtimed
+          print(f'module file: {runtimed.__file__}')
+          print(f'version:     {getattr(runtimed, \"__version__\", \"N/A\")}')
+          print(f'dir:         {sorted(d for d in dir(runtimed) if not d.startswith(\"_\"))}')
+          "
+
+          echo ""
+          echo "=== installed packages ==="
+          uv pip list 2>/dev/null | grep -i runtimed || uv run pip list | grep -i runtimed || true
+
       - name: Run unit tests
         working-directory: python/runtimed
         run: uv run pytest tests/test_session_unit.py -v --tb=short
@@ -768,7 +790,7 @@ jobs:
           export RUNTIMED_WORKSPACE_PATH="${GITHUB_WORKSPACE}"
 
           # Run tests (daemon is spawned by the test fixture)
-          uv run pytest tests/test_daemon_integration.py -v --tb=short 2>&1 | tee integration-logs/test-output.log || FAIL=1
+          uv run pytest tests/test_daemon_integration.py -v -s --tb=short 2>&1 | tee integration-logs/test-output.log || FAIL=1
 
           exit ${FAIL:-0}
 
