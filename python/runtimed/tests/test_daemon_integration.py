@@ -19,6 +19,7 @@ Environment variables:
 """
 
 import asyncio
+import hashlib
 import inspect
 import os
 import subprocess
@@ -219,6 +220,26 @@ def daemon_process():
     # CI mode: spawn our own daemon
     binary = _find_runtimed_binary()
     log_level = os.environ.get("RUNTIMED_LOG_LEVEL", "info")
+
+    # Log binary diagnostics to help detect stale binaries in CI
+    print(f"[test] Binary path: {binary}", file=sys.stderr)
+    print(f"[test] Binary exists: {binary.exists()}", file=sys.stderr)
+    if binary.exists():
+        stat = binary.stat()
+        print(f"[test] Binary size: {stat.st_size} bytes", file=sys.stderr)
+        print(f"[test] Binary mtime: {stat.st_mtime}", file=sys.stderr)
+        sha = hashlib.sha256(binary.read_bytes()).hexdigest()[:16]
+        print(f"[test] Binary sha256 prefix: {sha}", file=sys.stderr)
+        try:
+            ver = subprocess.run(
+                [str(binary), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            print(f"[test] Binary version: {ver.stdout.strip()}", file=sys.stderr)
+        except Exception as e:
+            print(f"[test] Could not get binary version: {e}", file=sys.stderr)
 
     # Create a temp directory for this test run
     # ignore_cleanup_errors=True prevents OSError when ipykernel leaves behind
