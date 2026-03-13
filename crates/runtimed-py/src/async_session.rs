@@ -2169,9 +2169,23 @@ async fn collect_outputs_async(
             .ok_or_else(|| to_py_err("Not connected"))?;
 
         // Before ExecutionDone: 100ms poll interval.
-        // After ExecutionDone: 50ms polls but keep going until the
-        // drain deadline (500ms after done) expires.
-        let timeout_ms = if drain_deadline.is_some() { 50 } else { 100 };
+        // After ExecutionDone: poll for the lesser of 50ms or time remaining
+        // until drain deadline, so we exit promptly when the deadline arrives
+        // even if messages keep flowing.
+        let timeout_ms = match drain_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    log::debug!(
+                        "[async_session] Drain deadline reached (top of loop), finishing with {} outputs",
+                        outputs.len()
+                    );
+                    break;
+                }
+                remaining.as_millis().min(50) as u64
+            }
+            None => 100,
+        };
         let broadcast = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
             broadcast_rx.recv(),
@@ -2240,11 +2254,12 @@ async fn collect_outputs_async(
                         }
                     }
                     NotebookBroadcast::KernelError { error } => {
+                        // KernelError is a hard failure (kernel/daemon died), not
+                        // the shell/iopub ordering race. Return immediately.
                         success = false;
                         outputs.push(Output::error("KernelError", &error, vec![]));
-                        drain_deadline = Some(
-                            tokio::time::Instant::now() + std::time::Duration::from_millis(500),
-                        );
+                        log::debug!("[async_session] KernelError received, returning immediately");
+                        break;
                     }
                     _ => {}
                 }
