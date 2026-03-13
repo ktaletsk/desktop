@@ -1005,6 +1005,10 @@ pub(crate) async fn get_notebook_metadata(
 }
 
 /// Set the notebook metadata snapshot.
+///
+/// Writes via the legacy `"notebook_metadata"` string key through the handle.
+/// The doc layer's `set_metadata_snapshot` (called by the daemon on save/seed)
+/// handles dual-write to both native Automerge keys and the legacy string.
 pub(crate) async fn set_notebook_metadata(
     state: &Arc<Mutex<SessionState>>,
     snapshot: &NotebookMetadataSnapshot,
