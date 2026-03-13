@@ -42,7 +42,7 @@ use crate::connection::{self, NotebookFrameType};
 use crate::kernel_manager::{DenoLaunchedConfig, LaunchedEnvConfig, RoomKernel};
 use crate::markdown_assets::resolve_markdown_assets;
 use crate::notebook_doc::{notebook_doc_filename, CellSnapshot, NotebookDoc};
-use crate::notebook_metadata::{NotebookMetadataSnapshot, NOTEBOOK_METADATA_KEY};
+use crate::notebook_metadata::NotebookMetadataSnapshot;
 use crate::protocol::{EnvSyncDiff, NotebookBroadcast, NotebookRequest, NotebookResponse};
 use notebook_doc::presence::{self, PresenceState};
 
@@ -326,14 +326,10 @@ async fn process_markdown_assets(room: &NotebookRoom) {
 /// 1. Kernel launched with inline deps - track drift (additions/removals)
 /// 2. Kernel launched with prewarmed - detect when user adds inline deps (needs restart)
 async fn check_and_broadcast_sync_state(room: &NotebookRoom) {
-    // Get current metadata from doc
+    // Get current metadata from doc (reads native keys first, falls back to legacy)
     let current_metadata = {
         let doc = room.doc.read().await;
-        if let Some(meta_json) = doc.get_metadata(NOTEBOOK_METADATA_KEY) {
-            serde_json::from_str::<NotebookMetadataSnapshot>(&meta_json).ok()
-        } else {
-            None
-        }
+        doc.get_metadata_snapshot()
     };
 
     let Some(current_metadata) = current_metadata else {
@@ -403,11 +399,9 @@ async fn resolve_metadata_snapshot(
     // Try reading from the Automerge doc first
     {
         let doc = room.doc.read().await;
-        if let Some(meta_json) = doc.get_metadata(NOTEBOOK_METADATA_KEY) {
-            if let Ok(snapshot) = serde_json::from_str::<NotebookMetadataSnapshot>(&meta_json) {
-                debug!("[notebook-sync] Resolved metadata snapshot from Automerge doc");
-                return Some(snapshot);
-            }
+        if let Some(snapshot) = doc.get_metadata_snapshot() {
+            debug!("[notebook-sync] Resolved metadata snapshot from Automerge doc");
+            return Some(snapshot);
         }
     }
 
@@ -770,16 +764,21 @@ where
     // This ensures the kernelspec is available before auto-launch decides which kernel to use.
     if let Some(ref metadata_json) = initial_metadata {
         let mut doc = room.doc.write().await;
-        if doc.get_metadata(NOTEBOOK_METADATA_KEY).is_none() {
-            match doc.set_metadata(NOTEBOOK_METADATA_KEY, metadata_json) {
-                Ok(()) => {
-                    info!(
-                        "[notebook-sync] Seeded initial metadata from handshake for {}",
-                        notebook_id
-                    );
-                }
-                Err(e) => {
-                    warn!("[notebook-sync] Failed to seed initial metadata: {}", e);
+        if doc.get_metadata_snapshot().is_none() {
+            // Seed initial metadata: parse the JSON and write as native Automerge
+            // types via set_metadata_snapshot. Also writes the legacy string key
+            // for backward compat (dual-write inside set_metadata_snapshot).
+            if let Ok(snapshot) = serde_json::from_str::<NotebookMetadataSnapshot>(metadata_json) {
+                match doc.set_metadata_snapshot(&snapshot) {
+                    Ok(()) => {
+                        info!(
+                            "[notebook-sync] Seeded initial metadata from handshake for {}",
+                            notebook_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!("[notebook-sync] Failed to seed initial metadata: {}", e);
+                    }
                 }
             }
         }
@@ -2969,13 +2968,8 @@ async fn format_source(source: &str, runtime: &str) -> Option<String> {
 
 /// Detect the runtime from room metadata, returning "python", "deno", or None.
 async fn detect_room_runtime(room: &NotebookRoom) -> Option<String> {
-    let metadata_json = {
-        let doc = room.doc.read().await;
-        doc.get_metadata(NOTEBOOK_METADATA_KEY)
-    };
-    metadata_json
-        .as_ref()
-        .and_then(|json| serde_json::from_str::<NotebookMetadataSnapshot>(json).ok())
+    let doc = room.doc.read().await;
+    doc.get_metadata_snapshot()
         .and_then(|snapshot| snapshot.detect_runtime())
 }
 
@@ -3097,11 +3091,11 @@ async fn save_notebook_to_disk(
     };
 
     // Read cells and metadata from the Automerge doc
-    let (cells, metadata_json) = {
+    let (cells, metadata_snapshot) = {
         let doc = room.doc.read().await;
         let cells = doc.get_cells();
-        let metadata_json = doc.get_metadata(NOTEBOOK_METADATA_KEY);
-        (cells, metadata_json)
+        let metadata_snapshot = doc.get_metadata_snapshot();
+        (cells, metadata_snapshot)
     };
     let nbformat_attachments = room.nbformat_attachments.read().await.clone();
 
@@ -3164,12 +3158,8 @@ async fn save_notebook_to_disk(
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    if let Some(ref meta_json) = metadata_json {
-        if let Ok(snapshot) =
-            serde_json::from_str::<crate::notebook_metadata::NotebookMetadataSnapshot>(meta_json)
-        {
-            snapshot.merge_into_metadata_value(&mut metadata);
-        }
+    if let Some(ref snapshot) = metadata_snapshot {
+        snapshot.merge_into_metadata_value(&mut metadata);
     }
 
     // Build the final notebook JSON
@@ -3241,9 +3231,9 @@ async fn clone_notebook_to_disk(room: &NotebookRoom, target_path: &str) -> Resul
     };
 
     // Read cells and metadata from the Automerge doc
-    let (cells, metadata_json) = {
+    let (cells, metadata_snapshot) = {
         let doc = room.doc.read().await;
-        (doc.get_cells(), doc.get_metadata(NOTEBOOK_METADATA_KEY))
+        (doc.get_cells(), doc.get_metadata_snapshot())
     };
 
     let nbformat_attachments = room.nbformat_attachments.read().await.clone();
@@ -3302,18 +3292,14 @@ async fn clone_notebook_to_disk(room: &NotebookRoom, target_path: &str) -> Resul
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    if let Some(ref meta_json) = metadata_json {
-        if let Ok(mut snapshot) =
-            serde_json::from_str::<crate::notebook_metadata::NotebookMetadataSnapshot>(meta_json)
-        {
-            // Update env_id in the snapshot
-            snapshot.runt.env_id = Some(new_env_id.clone());
-            // Clear trust signature since this is a new notebook
-            snapshot.runt.trust_signature = None;
-            snapshot.runt.trust_timestamp = None;
+    if let Some(mut snapshot) = metadata_snapshot {
+        // Update env_id in the snapshot
+        snapshot.runt.env_id = Some(new_env_id.clone());
+        // Clear trust signature since this is a new notebook
+        snapshot.runt.trust_signature = None;
+        snapshot.runt.trust_timestamp = None;
 
-            snapshot.merge_into_metadata_value(&mut metadata);
-        }
+        snapshot.merge_into_metadata_value(&mut metadata);
     }
 
     // Determine nbformat_minor from existing or default to 5 (for cell IDs)
