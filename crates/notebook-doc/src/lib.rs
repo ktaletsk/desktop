@@ -1331,6 +1331,176 @@ impl NotebookDoc {
         Ok(())
     }
 
+    // ── Native JSON ↔ Automerge ─────────────────────────────────────
+    //
+    // These primitives convert between serde_json::Value and native
+    // Automerge objects. JSON objects become Maps, arrays become Lists,
+    // and scalars become scalars. No JSON-encoded string blobs.
+
+    /// Write a `serde_json::Value` into the Automerge doc as native types.
+    ///
+    /// - `Value::Object` → `ObjType::Map` with recursive children
+    /// - `Value::Array` → `ObjType::List` with recursive elements
+    /// - `Value::String` → string scalar
+    /// - `Value::Bool` → bool scalar (stored as string "true"/"false" for now)
+    /// - `Value::Number` → string representation (Automerge scalars)
+    /// - `Value::Null` → deletes the key
+    ///
+    /// If the key already exists, it is replaced (the old object is overwritten).
+    pub fn put_json_value(
+        &mut self,
+        parent: &ObjId,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), AutomergeError> {
+        match value {
+            serde_json::Value::Null => {
+                self.doc.delete(parent, key)?;
+            }
+            serde_json::Value::Bool(b) => {
+                self.doc.put(parent, key, *b)?;
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    self.doc.put(parent, key, i)?;
+                } else if let Some(f) = n.as_f64() {
+                    self.doc.put(parent, key, f)?;
+                }
+            }
+            serde_json::Value::String(s) => {
+                self.doc.put(parent, key, s.as_str())?;
+            }
+            serde_json::Value::Array(arr) => {
+                let list_id = self.doc.put_object(parent, key, ObjType::List)?;
+                for (i, elem) in arr.iter().enumerate() {
+                    self.insert_json_value_at(&list_id, i, elem)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let map_id = self.doc.put_object(parent, key, ObjType::Map)?;
+                for (k, v) in map {
+                    self.put_json_value(&map_id, k, v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert a `serde_json::Value` into an Automerge list at the given index.
+    fn insert_json_value_at(
+        &mut self,
+        list_id: &ObjId,
+        index: usize,
+        value: &serde_json::Value,
+    ) -> Result<(), AutomergeError> {
+        match value {
+            serde_json::Value::Null => {
+                // Insert empty string as placeholder for null in lists
+                self.doc.insert(list_id, index, "")?;
+            }
+            serde_json::Value::Bool(b) => {
+                self.doc.insert(list_id, index, *b)?;
+            }
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    self.doc.insert(list_id, index, i)?;
+                } else if let Some(f) = n.as_f64() {
+                    self.doc.insert(list_id, index, f)?;
+                }
+            }
+            serde_json::Value::String(s) => {
+                self.doc.insert(list_id, index, s.as_str())?;
+            }
+            serde_json::Value::Array(arr) => {
+                let nested_list = self.doc.insert_object(list_id, index, ObjType::List)?;
+                for (i, elem) in arr.iter().enumerate() {
+                    self.insert_json_value_at(&nested_list, i, elem)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let nested_map = self.doc.insert_object(list_id, index, ObjType::Map)?;
+                for (k, v) in map {
+                    self.put_json_value(&nested_map, k, v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read an Automerge subtree as a `serde_json::Value`.
+    ///
+    /// Maps become `Value::Object`, Lists become `Value::Array`,
+    /// and scalars become the appropriate JSON type.
+    ///
+    /// Returns `None` if the key doesn't exist.
+    pub fn get_json_value(&self, parent: &ObjId, key: &str) -> Option<serde_json::Value> {
+        use automerge::Value;
+        match self.doc.get(parent, key).ok()?? {
+            (Value::Object(ObjType::Map), map_id) => Some(self.read_map_as_json(&map_id)),
+            (Value::Object(ObjType::List), list_id) => Some(self.read_list_as_json(&list_id)),
+            (Value::Scalar(s), _) => Some(scalar_to_json(&s)),
+            _ => None,
+        }
+    }
+
+    /// Read an Automerge map as a JSON object.
+    fn read_map_as_json(&self, map_id: &ObjId) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        for key in self.doc.keys(map_id) {
+            if let Some(value) = self.get_json_value(map_id, &key) {
+                obj.insert(key, value);
+            }
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    /// Read an Automerge list as a JSON array.
+    fn read_list_as_json(&self, list_id: &ObjId) -> serde_json::Value {
+        use automerge::Value;
+        let len = self.doc.length(list_id);
+        let mut arr = Vec::with_capacity(len);
+        for i in 0..len {
+            let val = match self.doc.get(list_id, i).ok().flatten() {
+                Some((Value::Object(ObjType::Map), nested_id)) => self.read_map_as_json(&nested_id),
+                Some((Value::Object(ObjType::List), nested_id)) => {
+                    self.read_list_as_json(&nested_id)
+                }
+                Some((Value::Scalar(s), _)) => scalar_to_json(&s),
+                _ => serde_json::Value::Null,
+            };
+            arr.push(val);
+        }
+        serde_json::Value::Array(arr)
+    }
+
+    /// Set a top-level notebook metadata key as native Automerge.
+    ///
+    /// The value is stored as native Automerge types (maps, lists, scalars),
+    /// not as a JSON string. This enables per-field CRDT merging for
+    /// concurrent edits.
+    pub fn set_metadata_value(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), AutomergeError> {
+        let meta_id = match self.metadata_map_id() {
+            Some(id) => id,
+            None => self
+                .doc
+                .put_object(automerge::ROOT, "metadata", ObjType::Map)?,
+        };
+        self.put_json_value(&meta_id, key, value)
+    }
+
+    /// Get a top-level notebook metadata key as a JSON value.
+    ///
+    /// Reads the native Automerge subtree and reconstructs it as
+    /// `serde_json::Value`. Returns `None` if the key doesn't exist.
+    pub fn get_metadata_value(&self, key: &str) -> Option<serde_json::Value> {
+        let meta_id = self.metadata_map_id()?;
+        self.get_json_value(&meta_id, key)
+    }
+
     // ── Sync protocol ───────────────────────────────────────────────
 
     /// Generate a sync message to send to a peer.
@@ -1347,8 +1517,26 @@ impl NotebookDoc {
         self.doc.sync().receive_sync_message(peer_state, message)
     }
 
-    // ── Internal helpers ────────────────────────────────────────────
+    // ── Internal helpers ──────────────────────────────────────────────
+}
 
+/// Convert an Automerge scalar to a `serde_json::Value`.
+fn scalar_to_json(s: &automerge::ScalarValue) -> serde_json::Value {
+    match s {
+        automerge::ScalarValue::Str(s) => serde_json::Value::String(s.to_string()),
+        automerge::ScalarValue::Int(i) => serde_json::json!(*i),
+        automerge::ScalarValue::Uint(u) => serde_json::json!(*u),
+        automerge::ScalarValue::F64(f) => serde_json::json!(*f),
+        automerge::ScalarValue::Boolean(b) => serde_json::Value::Bool(*b),
+        automerge::ScalarValue::Null => serde_json::Value::Null,
+        automerge::ScalarValue::Timestamp(t) => serde_json::json!(*t),
+        automerge::ScalarValue::Counter(c) => serde_json::json!(i64::from(c)),
+        automerge::ScalarValue::Unknown { .. } => serde_json::Value::Null,
+        _ => serde_json::Value::Null,
+    }
+}
+
+impl NotebookDoc {
     /// Get the cells Map object ID.
     fn cells_map_id(&self) -> Option<ObjId> {
         self.doc
