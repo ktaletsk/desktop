@@ -689,7 +689,8 @@ impl NotebookDoc {
         self.doc.put_object(&cell_map, "source", ObjType::Text)?;
         self.doc.put(&cell_map, "execution_count", "null")?;
         self.doc.put_object(&cell_map, "outputs", ObjType::List)?;
-        self.doc.put(&cell_map, "metadata", "{}")?;
+        self.doc
+            .put_object(&cell_map, "metadata", ObjType::Map)?;
         self.doc
             .put_object(&cell_map, "resolved_assets", ObjType::Map)?;
 
@@ -752,9 +753,20 @@ impl NotebookDoc {
             self.doc.insert(&outputs_id, i, output.as_str())?;
         }
 
-        // Store metadata as JSON string
-        let metadata_str = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string());
-        self.doc.put(&cell_map, "metadata", metadata_str)?;
+        // Store metadata as native Automerge map
+        if metadata.is_object() && !metadata.as_object().map_or(true, |m| m.is_empty()) {
+            let meta_id = self
+                .doc
+                .put_object(&cell_map, "metadata", ObjType::Map)?;
+            if let serde_json::Value::Object(map) = metadata {
+                for (k, v) in map {
+                    self.put_json_value(&meta_id, k, v)?;
+                }
+            }
+        } else {
+            self.doc
+                .put_object(&cell_map, "metadata", ObjType::Map)?;
+        }
 
         self.doc
             .put_object(&cell_map, "resolved_assets", ObjType::Map)?;
@@ -1172,19 +1184,24 @@ impl NotebookDoc {
         let cells_id = self.cells_map_id()?;
         let cell_obj = self.cell_obj_id(&cells_id, cell_id)?;
 
-        // Cell exists - return its metadata or empty object if missing/invalid
-        Some(
-            read_str(&self.doc, &cell_obj, "metadata")
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| serde_json::json!({})),
-        )
+        // Try native Automerge Map first, fall back to legacy JSON string
+        match self.get_json_value(&cell_obj, "metadata") {
+            Some(serde_json::Value::Object(_)) => self.get_json_value(&cell_obj, "metadata"),
+            _ => {
+                // Legacy: metadata stored as JSON string
+                Some(
+                    read_str(&self.doc, &cell_obj, "metadata")
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+            }
+        }
     }
 
-    /// Set the entire metadata object for a cell.
+    /// Set the entire metadata object for a cell as native Automerge.
     ///
-    /// Note: Metadata is stored as a JSON-encoded string, not as a CRDT structure.
-    /// Concurrent edits from multiple peers will result in last-write-wins semantics.
-    /// Use `update_cell_metadata_at` for path-based updates when possible.
+    /// Metadata is stored as a native Automerge Map with per-field CRDT merging.
+    /// Concurrent edits to different metadata keys merge cleanly.
     pub fn set_cell_metadata(
         &mut self,
         cell_id: &str,
@@ -1199,20 +1216,26 @@ impl NotebookDoc {
             None => return Ok(false),
         };
 
-        let metadata_str = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string());
-        self.doc.put(&cell_obj, "metadata", metadata_str)?;
+        // Write as native Automerge Map
+        let meta_id = self
+            .doc
+            .put_object(&cell_obj, "metadata", ObjType::Map)?;
+        if let serde_json::Value::Object(map) = metadata {
+            for (k, v) in map {
+                self.put_json_value(&meta_id, k, v)?;
+            }
+        }
         Ok(true)
     }
 
-    /// Update a nested path within cell metadata.
+    /// Update a nested path within cell metadata using native Automerge.
     ///
-    /// Creates intermediate objects as needed. For example:
+    /// Creates intermediate Automerge Maps as needed. For example:
     /// `update_cell_metadata_at("cell-1", &["jupyter", "source_hidden"], json!(true))`
-    /// will create `{"jupyter": {"source_hidden": true}}` if metadata was `{}`.
+    /// will create `metadata.jupyter.source_hidden = true` as native Automerge objects.
     ///
-    /// Note: This performs a read-modify-write on the JSON string. Concurrent updates
-    /// to different paths may conflict (last-write-wins), but this is rare in practice
-    /// since metadata updates are typically user-initiated actions.
+    /// Concurrent updates to different paths merge cleanly since each path
+    /// segment is a separate Automerge Map key.
     pub fn update_cell_metadata_at(
         &mut self,
         cell_id: &str,
@@ -1223,34 +1246,39 @@ impl NotebookDoc {
             return self.set_cell_metadata(cell_id, &value);
         }
 
-        let mut metadata = self
-            .get_cell_metadata(cell_id)
-            .unwrap_or_else(|| serde_json::json!({}));
+        let cells_id = match self.cells_map_id() {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let cell_obj = match self.cell_obj_id(&cells_id, cell_id) {
+            Some(o) => o,
+            None => return Ok(false),
+        };
 
-        // Navigate to the parent of the target key, creating objects as needed
-        let mut current = &mut metadata;
+        // Get or create the metadata Map
+        let meta_id = match self.map_id(&cell_obj, "metadata") {
+            Some(id) => id,
+            None => self
+                .doc
+                .put_object(&cell_obj, "metadata", ObjType::Map)?,
+        };
+
+        // Navigate to the parent, creating intermediate Maps as needed
+        let mut current_id = meta_id;
         for key in &path[..path.len() - 1] {
-            if !current.is_object() {
-                *current = serde_json::json!({});
-            }
-            let obj = current.as_object_mut().unwrap();
-            if !obj.contains_key(*key) {
-                obj.insert((*key).to_string(), serde_json::json!({}));
-            }
-            current = obj.get_mut(*key).unwrap();
+            current_id = match self.map_id(&current_id, key) {
+                Some(id) => id,
+                None => self
+                    .doc
+                    .put_object(&current_id, *key, ObjType::Map)?,
+            };
         }
 
-        // Set the final key
-        if !current.is_object() {
-            *current = serde_json::json!({});
-        }
+        // Set the final key as native Automerge
         let final_key = path[path.len() - 1];
-        current
-            .as_object_mut()
-            .unwrap()
-            .insert(final_key.to_string(), value);
+        self.put_json_value(&current_id, final_key, &value)?;
 
-        self.set_cell_metadata(cell_id, &metadata)
+        Ok(true)
     }
 
     /// Set whether the cell source should be hidden (JupyterLab convention).
@@ -1734,10 +1762,16 @@ impl NotebookDoc {
             None => vec![],
         };
 
-        // Read metadata (JSON string -> Value)
-        let metadata = read_str(&self.doc, cell_obj, "metadata")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
+        // Read metadata: try native Automerge Map first, fall back to legacy JSON string
+        let metadata = match self.get_json_value(cell_obj, "metadata") {
+            Some(v @ serde_json::Value::Object(_)) => v,
+            _ => {
+                // Legacy: metadata stored as JSON string
+                read_str(&self.doc, cell_obj, "metadata")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}))
+            }
+        };
 
         // Read resolved asset map
         let resolved_assets = match self.map_id(cell_obj, "resolved_assets") {
