@@ -2342,6 +2342,46 @@ async fn handle_notebook_request(
                                             "[notebook-sync] Processing ExecutionDone for {}",
                                             cell_id
                                         );
+                                        // #region agent log
+                                        {
+                                            let queue_len = {
+                                                let guard = room_kernel.lock().await;
+                                                guard
+                                                    .as_ref()
+                                                    .map(|k| k.queued_cells().len())
+                                                    .unwrap_or(0)
+                                            };
+                                            let _ = (|| -> std::io::Result<()> {
+                                                use std::io::Write as _;
+                                                let timestamp = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_millis() as u64)
+                                                    .unwrap_or(0);
+                                                std::fs::OpenOptions::new()
+                                                    .create(true)
+                                                    .append(true)
+                                                    .open("/opt/cursor/logs/debug.log")?
+                                                    .write_all(
+                                                        format!(
+                                                            "{}\n",
+                                                            serde_json::json!({
+                                                                "hypothesisId": "A",
+                                                                "location": "crates/runtimed/src/notebook_sync_server.rs:2344",
+                                                                "message": "notebook sync processing execution done command",
+                                                                "data": {
+                                                                    "cellId": cell_id,
+                                                                    "queueLen": queue_len,
+                                                                },
+                                                                "timestamp": timestamp,
+                                                            })
+                                                        )
+                                                        .as_bytes(),
+                                                    )?;
+                                                Ok(())
+                                            })(
+                                            );
+                                        }
+                                        // #endregion
                                         let mut guard = room_kernel.lock().await;
                                         if let Some(ref mut k) = *guard {
                                             if let Err(e) = k.execution_done(&cell_id).await {
@@ -2357,6 +2397,46 @@ async fn handle_notebook_request(
                                             "[notebook-sync] Cell error (stop-on-error): {}",
                                             cell_id
                                         );
+                                        // #region agent log
+                                        {
+                                            let queue_len = {
+                                                let guard = room_kernel.lock().await;
+                                                guard
+                                                    .as_ref()
+                                                    .map(|k| k.queued_cells().len())
+                                                    .unwrap_or(0)
+                                            };
+                                            let _ = (|| -> std::io::Result<()> {
+                                                use std::io::Write as _;
+                                                let timestamp = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_millis() as u64)
+                                                    .unwrap_or(0);
+                                                std::fs::OpenOptions::new()
+                                                    .create(true)
+                                                    .append(true)
+                                                    .open("/opt/cursor/logs/debug.log")?
+                                                    .write_all(
+                                                        format!(
+                                                            "{}\n",
+                                                            serde_json::json!({
+                                                                "hypothesisId": "B",
+                                                                "location": "crates/runtimed/src/notebook_sync_server.rs:2360",
+                                                                "message": "notebook sync processing cell error command",
+                                                                "data": {
+                                                                    "cellId": cell_id,
+                                                                    "queueLen": queue_len,
+                                                                },
+                                                                "timestamp": timestamp,
+                                                            })
+                                                        )
+                                                        .as_bytes(),
+                                                    )?;
+                                                Ok(())
+                                            })(
+                                            );
+                                        }
+                                        // #endregion
                                         // Clear the queue to stop execution on error
                                         let mut guard = room_kernel.lock().await;
                                         if let Some(ref mut k) = *guard {

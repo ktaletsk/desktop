@@ -27,6 +27,34 @@ use crate::output_resolver;
 
 use pyo3::prelude::*;
 
+fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let _ = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/opt/cursor/logs/debug.log")?
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": timestamp,
+                    })
+                )
+                .as_bytes(),
+            )?;
+        Ok(())
+    })();
+}
+
 // =========================================================================
 // Shared state
 // =========================================================================
@@ -658,6 +686,17 @@ pub(crate) async fn collect_outputs(
 ) -> PyResult<ExecutionResult> {
     let mut kernel_error: Option<String> = None;
 
+    // #region agent log
+    agent_debug_log(
+        "D",
+        "crates/runtimed-py/src/session_core.rs:683",
+        "collect_outputs started waiting",
+        serde_json::json!({
+            "cellId": cell_id,
+        }),
+    );
+    // #endregion
+
     // Phase 1: Wait for ExecutionDone or KernelError signal via broadcast.
     loop {
         let mut st = state.lock().await;
@@ -679,11 +718,32 @@ pub(crate) async fn collect_outputs(
                         cell_id: msg_cell_id,
                     } => {
                         if msg_cell_id == cell_id {
+                            // #region agent log
+                            agent_debug_log(
+                                "D",
+                                "crates/runtimed-py/src/session_core.rs:710",
+                                "collect_outputs received execution done",
+                                serde_json::json!({
+                                    "cellId": cell_id,
+                                }),
+                            );
+                            // #endregion
                             log::debug!("[session_core] ExecutionDone received for {}", cell_id);
                             break;
                         }
                     }
                     NotebookBroadcast::KernelError { error } => {
+                        // #region agent log
+                        agent_debug_log(
+                            "D",
+                            "crates/runtimed-py/src/session_core.rs:722",
+                            "collect_outputs received kernel error",
+                            serde_json::json!({
+                                "cellId": cell_id,
+                                "error": error,
+                            }),
+                        );
+                        // #endregion
                         log::debug!("[session_core] KernelError: {}", error);
                         kernel_error = Some(error);
                         break;

@@ -39,6 +39,34 @@ use crate::stream_terminal::{StreamOutputState, StreamTerminals};
 use crate::terminal_size::{TERMINAL_COLUMNS_STR, TERMINAL_LINES_STR};
 use crate::{EnvType, PooledEnv};
 
+fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let _ = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/opt/cursor/logs/debug.log")?
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": timestamp,
+                    })
+                )
+                .as_bytes(),
+            )?;
+        Ok(())
+    })();
+}
+
 // ── Launched Environment Config ─────────────────────────────────────────────
 
 /// Environment configuration captured at kernel launch time.
@@ -804,6 +832,17 @@ impl RoomKernel {
                                 if status.execution_state == jupyter_protocol::ExecutionState::Idle
                                 {
                                     if let Some(cid) = cell_id {
+                                        // #region agent log
+                                        agent_debug_log(
+                                            "A",
+                                            "crates/runtimed/src/kernel_manager.rs:833",
+                                            "queued execution done from idle status",
+                                            serde_json::json!({
+                                                "cellId": cid,
+                                                "msgType": message.header.msg_type,
+                                            }),
+                                        );
+                                        // #endregion
                                         let _ = iopub_cmd_tx
                                             .try_send(QueueCommand::ExecutionDone { cell_id: cid });
                                     }
@@ -1288,6 +1327,16 @@ impl RoomKernel {
                                     }
 
                                     // Signal cell error for stop-on-error
+                                    // #region agent log
+                                    agent_debug_log(
+                                        "B",
+                                        "crates/runtimed/src/kernel_manager.rs:1320",
+                                        "queued cell error from error output",
+                                        serde_json::json!({
+                                            "cellId": cid,
+                                        }),
+                                    );
+                                    // #endregion
                                     let _ = iopub_cmd_tx.try_send(QueueCommand::CellError {
                                         cell_id: cid.clone(),
                                     });
@@ -1565,6 +1614,17 @@ impl RoomKernel {
                                     }
                                 }
 
+                                // #region agent log
+                                agent_debug_log(
+                                    "C",
+                                    "crates/runtimed/src/kernel_manager.rs:1594",
+                                    "received execute reply status",
+                                    serde_json::json!({
+                                        "cellId": cell_id,
+                                        "replyStatus": format!("{:?}", reply.status),
+                                    }),
+                                );
+                                // #endregion
                                 // Do not broadcast ExecutionDone from execute_reply error status.
                                 // The authoritative completion signal comes from the iopub idle
                                 // path, which preserves ordering with the final error output.
@@ -1832,6 +1892,16 @@ impl RoomKernel {
             // to one entry per cell while avoiding the race condition.
 
             // Broadcast done
+            // #region agent log
+            agent_debug_log(
+                "A",
+                "crates/runtimed/src/kernel_manager.rs:1864",
+                "broadcasting execution done from room kernel",
+                serde_json::json!({
+                    "cellId": cell_id,
+                }),
+            );
+            // #endregion
             let _ = self.broadcast_tx.send(NotebookBroadcast::ExecutionDone {
                 cell_id: cell_id.to_string(),
             });
