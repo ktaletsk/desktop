@@ -16,8 +16,19 @@ import { logger } from "./logger";
 // ---------------------------------------------------------------------------
 
 let _handle: NotebookHandle | null = null;
-let _snapshotCache: string | null = null;
+let _snapshotCache: NotebookMetadataSnapshot | null = null;
 const _subscribers = new Set<() => void>();
+
+/**
+ * Read the current metadata snapshot from the WASM handle as a typed object.
+ * Returns null if no handle is set or the WASM method returns a non-object.
+ */
+function readSnapshot(): NotebookMetadataSnapshot | null {
+  const raw = _handle?.get_metadata_snapshot();
+  return raw && typeof raw === "object"
+    ? (raw as NotebookMetadataSnapshot)
+    : null;
+}
 
 /**
  * Notify all useSyncExternalStore subscribers that the doc changed.
@@ -27,7 +38,7 @@ const _subscribers = new Set<() => void>();
  * - set_metadata (local writes)
  */
 export function notifyMetadataChanged(): void {
-  _snapshotCache = _handle?.get_metadata_snapshot_json() ?? null;
+  _snapshotCache = readSnapshot();
   for (const cb of _subscribers) cb();
 }
 
@@ -49,16 +60,16 @@ function subscribe(callback: () => void): () => void {
 }
 
 /**
- * Get the current metadata snapshot as a JSON string.
+ * Get the current metadata snapshot as a native JS object.
  * Used as the getSnapshot function for useSyncExternalStore.
  * Returns the cached value — only updated when notifyMetadataChanged() fires.
  */
-function getSnapshotJson(): string | null {
+function getSnapshot(): NotebookMetadataSnapshot | null {
   // _snapshotCache is always set by notifyMetadataChanged() before
   // any subscriber fires. This lazy init handles the first read
   // before any notification has occurred.
   if (_snapshotCache === null) {
-    _snapshotCache = _handle?.get_metadata_snapshot_json() ?? null;
+    _snapshotCache = readSnapshot();
   }
   return _snapshotCache;
 }
@@ -72,15 +83,7 @@ function getSnapshotJson(): string | null {
  * Re-renders when the Automerge doc changes (bootstrap, sync, writes).
  */
 export function useNotebookMetadata(): NotebookMetadataSnapshot | null {
-  const json = useSyncExternalStore(subscribe, getSnapshotJson);
-  return useMemo(() => {
-    if (!json) return null;
-    try {
-      return JSON.parse(json) as NotebookMetadataSnapshot;
-    } catch {
-      return null;
-    }
-  }, [json]);
+  return useSyncExternalStore(subscribe, getSnapshot);
 }
 
 /**
@@ -93,7 +96,7 @@ export function useNotebookMetadata(): NotebookMetadataSnapshot | null {
  */
 export function useDetectRuntime(): "python" | "deno" | null {
   // Subscribe to metadata changes so we re-render when the doc updates.
-  useSyncExternalStore(subscribe, getSnapshotJson);
+  useSyncExternalStore(subscribe, getSnapshot);
   if (!_handle) return null;
   return (_handle.detect_runtime() as "python" | "deno") ?? null;
 }
@@ -365,10 +368,9 @@ export async function setDenoFlexibleNpmImports(
   enabled: boolean,
 ): Promise<boolean> {
   if (!_handle) return false;
-  const json = _handle.get_metadata_snapshot_json();
-  if (!json) return false;
+  const snapshot = readSnapshot();
+  if (!snapshot) return false;
   try {
-    const snapshot = JSON.parse(json) as NotebookMetadataSnapshot;
     if (!snapshot.runt.deno) {
       snapshot.runt.deno = { permissions: [], flexible_npm_imports: enabled };
     } else {
