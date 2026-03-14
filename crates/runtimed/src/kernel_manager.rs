@@ -39,34 +39,6 @@ use crate::stream_terminal::{StreamOutputState, StreamTerminals};
 use crate::terminal_size::{TERMINAL_COLUMNS_STR, TERMINAL_LINES_STR};
 use crate::{EnvType, PooledEnv};
 
-fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let _ = (|| -> std::io::Result<()> {
-        use std::io::Write as _;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/opt/cursor/logs/debug.log")?
-            .write_all(
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": timestamp,
-                    })
-                )
-                .as_bytes(),
-            )?;
-        Ok(())
-    })();
-}
-
 // ── Launched Environment Config ─────────────────────────────────────────────
 
 /// Environment configuration captured at kernel launch time.
@@ -832,17 +804,6 @@ impl RoomKernel {
                                 if status.execution_state == jupyter_protocol::ExecutionState::Idle
                                 {
                                     if let Some(cid) = cell_id {
-                                        // #region agent log
-                                        agent_debug_log(
-                                            "A",
-                                            "crates/runtimed/src/kernel_manager.rs:806",
-                                            "queued execution done from idle status",
-                                            serde_json::json!({
-                                                "cellId": cid,
-                                                "msgType": message.header.msg_type,
-                                            }),
-                                        );
-                                        // #endregion
                                         let _ = iopub_cmd_tx
                                             .try_send(QueueCommand::ExecutionDone { cell_id: cid });
                                     }
@@ -950,25 +911,6 @@ impl RoomKernel {
                                         (text, state)
                                     };
 
-                                    // #region agent log
-                                    agent_debug_log(
-                                        "C",
-                                        "crates/runtimed/src/kernel_manager.rs:914",
-                                        "stream rendered before doc upsert",
-                                        serde_json::json!({
-                                            "cellId": cid,
-                                            "stream": stream_name,
-                                            "rawLen": stream.text.len(),
-                                            "rawHasCr": stream.text.contains('\r'),
-                                            "rawHasLf": stream.text.contains('\n'),
-                                            "rawHasAnsi": stream.text.contains("\u{1b}["),
-                                            "renderedLen": rendered_text.len(),
-                                            "renderedNonEmpty": !rendered_text.is_empty(),
-                                            "knownState": known_state.is_some(),
-                                        }),
-                                    );
-                                    // #endregion
-
                                     // Create nbformat JSON with rendered text
                                     let nbformat_value = serde_json::json!({
                                         "output_type": "stream",
@@ -1064,20 +1006,6 @@ impl RoomKernel {
                                         (bytes, broadcast_idx, upsert_debug)
                                     };
                                     let _ = persist_tx.send(Some(persist_bytes));
-
-                                    // #region agent log
-                                    agent_debug_log(
-                                        "D",
-                                        "crates/runtimed/src/kernel_manager.rs:1022",
-                                        "stream output upserted into daemon doc",
-                                        serde_json::json!({
-                                            "cellId": cid,
-                                            "stream": stream_name,
-                                            "broadcastOutputIndex": broadcast_output_index,
-                                            "upsert": upsert_debug,
-                                        }),
-                                    );
-                                    // #endregion
 
                                     let _ = broadcast_tx.send(NotebookBroadcast::Output {
                                         cell_id: cid.clone(),
@@ -1911,16 +1839,6 @@ impl RoomKernel {
             // to one entry per cell while avoiding the race condition.
 
             // Broadcast done
-            // #region agent log
-            agent_debug_log(
-                "A",
-                "crates/runtimed/src/kernel_manager.rs:1856",
-                "broadcasting execution done from kernel manager",
-                serde_json::json!({
-                    "cellId": cell_id,
-                }),
-            );
-            // #endregion
             let _ = self.broadcast_tx.send(NotebookBroadcast::ExecutionDone {
                 cell_id: cell_id.to_string(),
             });
