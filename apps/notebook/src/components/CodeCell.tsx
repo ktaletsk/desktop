@@ -302,7 +302,6 @@ export function CodeCell({
       if (!view) return;
 
       view.focus();
-      view.dom.scrollIntoView({ behavior: "smooth", block: "nearest" });
     });
 
     return () => cancelAnimationFrame(frameId);
