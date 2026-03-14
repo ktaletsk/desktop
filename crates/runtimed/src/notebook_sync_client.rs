@@ -2839,6 +2839,12 @@ async fn run_sync_task<S>(
                     }
                     SyncCommand::ConfirmSync { reply } => {
                         let result = client.sync_to_daemon_confirmed().await;
+                        if result.is_ok() {
+                            // confirm_sync may merge daemon-driven output changes into
+                            // client.doc; refresh the published snapshot so immediate
+                            // handle.get_cells() reads observe those updates.
+                            publish_snapshot(&client, &snapshot_tx);
+                        }
                         let _ = reply.send(result);
                     }
                     SyncCommand::SendPresence { data, reply } => {
