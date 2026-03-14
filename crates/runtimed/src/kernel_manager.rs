@@ -39,34 +39,6 @@ use crate::stream_terminal::{StreamOutputState, StreamTerminals};
 use crate::terminal_size::{TERMINAL_COLUMNS_STR, TERMINAL_LINES_STR};
 use crate::{EnvType, PooledEnv};
 
-fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let _ = (|| -> std::io::Result<()> {
-        use std::io::Write as _;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/opt/cursor/logs/debug.log")?
-            .write_all(
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": timestamp,
-                    })
-                )
-                .as_bytes(),
-            )?;
-        Ok(())
-    })();
-}
-
 // ── Launched Environment Config ─────────────────────────────────────────────
 
 /// Environment configuration captured at kernel launch time.
@@ -981,7 +953,7 @@ impl RoomKernel {
                                     };
 
                                     // Upsert stream output (update if validated, append if not)
-                                    let (persist_bytes, broadcast_output_index, upsert_debug) = {
+                                    let (persist_bytes, broadcast_output_index, _upsert_debug) = {
                                         let mut doc_guard = doc.write().await;
                                         let upsert_result = doc_guard.upsert_stream_output(
                                             cid,
@@ -1307,17 +1279,6 @@ impl RoomKernel {
                                         };
                                         let _ = persist_tx.send(Some(persist_bytes));
 
-                                        // #region agent log
-                                        agent_debug_log(
-                                            "A",
-                                            "crates/runtimed/src/kernel_manager.rs:1282",
-                                            "broadcasting error output event",
-                                            serde_json::json!({
-                                                "cellId": cid,
-                                                "outputType": "error",
-                                            }),
-                                        );
-                                        // #endregion
                                         let _ = broadcast_tx.send(NotebookBroadcast::Output {
                                             cell_id: cid.clone(),
                                             output_type: "error".to_string(),

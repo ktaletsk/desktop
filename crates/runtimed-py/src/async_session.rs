@@ -19,34 +19,6 @@ use crate::output::{Cell, ExecutionResult, NotebookConnectionInfo, SyncEnvironme
 use crate::session_core::{self, SessionState};
 use crate::subscription::EventSubscription;
 
-fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let _ = (|| -> std::io::Result<()> {
-        use std::io::Write as _;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/opt/cursor/logs/debug.log")?
-            .write_all(
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": timestamp,
-                    })
-                )
-                .as_bytes(),
-            )?;
-        Ok(())
-    })();
-}
-
 /// An async session for executing code via the runtimed daemon.
 ///
 /// Each session connects to a unique "virtual notebook" room in the daemon
@@ -818,18 +790,6 @@ impl AsyncSession {
                 .as_ref()
                 .ok_or_else(|| to_py_err("No broadcast receiver"))?
                 .resubscribe();
-
-            // #region agent log
-            agent_debug_log(
-                "C",
-                "crates/runtimed-py/src/async_session.rs:793",
-                "stream_execute created resubscribe after execute queued",
-                serde_json::json!({
-                    "cellId": cell_id,
-                    "signalOnly": signal_only,
-                }),
-            );
-            // #endregion
 
             let blob_base_url = st.blob_base_url.clone();
             let blob_store_path = st.blob_store_path.clone();

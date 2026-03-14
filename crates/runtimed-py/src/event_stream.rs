@@ -18,34 +18,6 @@ use crate::error::to_py_err;
 use crate::output::ExecutionEvent;
 use crate::output_resolver;
 
-fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let _ = (|| -> std::io::Result<()> {
-        use std::io::Write as _;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/opt/cursor/logs/debug.log")?
-            .write_all(
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": timestamp,
-                    })
-                )
-                .as_bytes(),
-            )?;
-        Ok(())
-    })();
-}
-
 /// Async iterator over execution events for a cell.
 ///
 /// Yields `ExecutionEvent` objects as they arrive from the kernel:
@@ -167,27 +139,15 @@ impl ExecutionEventStream {
                                         ));
                                     } else {
                                         // Full mode: resolve and include the output
-                                        let resolved = output_resolver::resolve_output_with_type(
-                                            &output_type,
-                                            &output_json,
-                                            &blob_base_url,
-                                            &blob_store_path,
-                                        )
-                                        .await;
-                                        // #region agent log
-                                        agent_debug_log(
-                                            "B",
-                                            "crates/runtimed-py/src/event_stream.rs:151",
-                                            "stream iterator received output broadcast",
-                                            serde_json::json!({
-                                                "cellId": cell_id,
-                                                "outputType": output_type,
-                                                "outputIndex": output_index,
-                                                "resolved": resolved.is_some(),
-                                            }),
-                                        );
-                                        // #endregion
-                                        if let Some(output) = resolved {
+                                        if let Some(output) =
+                                            output_resolver::resolve_output_with_type(
+                                                &output_type,
+                                                &output_json,
+                                                &blob_base_url,
+                                                &blob_store_path,
+                                            )
+                                            .await
+                                        {
                                             return Ok(ExecutionEvent::output_with_index(
                                                 &cell_id,
                                                 output,
@@ -201,16 +161,6 @@ impl ExecutionEventStream {
                                 cell_id: msg_cell_id,
                             } => {
                                 if msg_cell_id == cell_id {
-                                    // #region agent log
-                                    agent_debug_log(
-                                        "A",
-                                        "crates/runtimed-py/src/event_stream.rs:175",
-                                        "stream iterator received execution done",
-                                        serde_json::json!({
-                                            "cellId": cell_id,
-                                        }),
-                                    );
-                                    // #endregion
                                     state.done = true;
                                     return Ok(ExecutionEvent::done(&cell_id));
                                 }
