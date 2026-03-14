@@ -81,6 +81,13 @@ impl Session {
         state.kernel_started
     }
 
+    /// Get the kernel type (e.g., "python", "deno") if kernel is running.
+    #[getter]
+    fn kernel_type(&self) -> Option<String> {
+        let state = self.runtime.block_on(self.state.lock());
+        state.kernel_type.clone()
+    }
+
     /// Get the environment source (e.g., "uv:prewarmed") if kernel is running.
     #[getter]
     fn env_source(&self) -> Option<String> {
@@ -369,6 +376,47 @@ impl Session {
         self.connect()?;
         self.runtime
             .block_on(session_core::get_metadata(&self.state, key))
+    }
+
+    /// Set the notebook kernelspec.
+    #[pyo3(signature = (name, display_name, language=None))]
+    fn set_kernelspec(
+        &self,
+        name: &str,
+        display_name: &str,
+        language: Option<&str>,
+    ) -> PyResult<()> {
+        self.connect()?;
+        let mut snapshot = self
+            .runtime
+            .block_on(session_core::get_notebook_metadata(&self.state))?;
+        snapshot.kernelspec = Some(runtimed::notebook_metadata::KernelspecSnapshot {
+            name: name.to_string(),
+            display_name: display_name.to_string(),
+            language: language.map(|s| s.to_string()),
+        });
+        self.runtime
+            .block_on(session_core::set_notebook_metadata(&self.state, &snapshot))
+    }
+
+    /// Get the notebook kernelspec.
+    ///
+    /// Returns a dict with 'name', 'display_name', and optionally 'language',
+    /// or None if no kernelspec is set.
+    fn get_kernelspec(&self) -> PyResult<Option<std::collections::HashMap<String, String>>> {
+        self.connect()?;
+        let snapshot = self
+            .runtime
+            .block_on(session_core::get_notebook_metadata(&self.state))?;
+        Ok(snapshot.kernelspec.map(|ks| {
+            let mut map = std::collections::HashMap::new();
+            map.insert("name".to_string(), ks.name);
+            map.insert("display_name".to_string(), ks.display_name);
+            if let Some(lang) = ks.language {
+                map.insert("language".to_string(), lang);
+            }
+            map
+        }))
     }
 
     // =========================================================================

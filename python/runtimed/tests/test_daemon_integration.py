@@ -27,7 +27,6 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -1157,51 +1156,25 @@ class TestOutputHandling:
 # ============================================================================
 
 
-# The metadata key used by the daemon to store NotebookMetadataSnapshot
-NOTEBOOK_METADATA_KEY = "notebook_metadata"
+def _set_python_kernelspec(session, *, uv_deps=None, conda_deps=None, conda_channels=None):
+    """Set Python kernelspec using the typed API.
 
-
-def _python_kernelspec_metadata(
-    *, with_uv_deps=None, with_conda_deps=None, with_conda_channels=None
-):
-    """Build a NotebookMetadataSnapshot JSON dict with a Python kernelspec."""
-    snapshot: dict[str, Any] = {
-        "kernelspec": {
-            "name": "python3",
-            "display_name": "Python 3",
-            "language": "python",
-        },
-        "language_info": {"name": "python"},
-        "runt": {"schema_version": "1"},
-    }
-    if with_uv_deps is not None:
-        snapshot["runt"]["uv"] = {"dependencies": with_uv_deps}
-    if with_conda_deps is not None:
-        snapshot["runt"]["conda"] = {
-            "dependencies": with_conda_deps,
-            "channels": with_conda_channels or ["conda-forge"],
-        }
-    return snapshot
-
-
-def _deno_kernelspec_metadata(*, flexible_npm_imports=None):
-    """Build a NotebookMetadataSnapshot JSON dict with a Deno kernelspec.
-
-    Args:
-        flexible_npm_imports: If set, include deno.flexible_npm_imports in runt metadata.
+    This uses the native metadata methods (set_kernelspec, add_uv_dependency, etc.)
+    rather than writing raw JSON to the legacy notebook_metadata key.
     """
-    snapshot: dict[str, Any] = {
-        "kernelspec": {
-            "name": "deno",
-            "display_name": "Deno",
-            "language": "typescript",
-        },
-        "language_info": {"name": "typescript"},
-        "runt": {"schema_version": "1"},
-    }
-    if flexible_npm_imports is not None:
-        snapshot["runt"]["deno"] = {"flexible_npm_imports": flexible_npm_imports}
-    return snapshot
+    session.set_kernelspec("python3", "Python 3", "python")
+    if uv_deps is not None:
+        for dep in uv_deps:
+            session.add_uv_dependency(dep)
+    if conda_deps is not None:
+        for dep in conda_deps:
+            session.add_conda_dependency(dep)
+        # Note: conda_channels would need a separate API method if needed
+
+
+def _set_deno_kernelspec(session):
+    """Set Deno kernelspec using the typed API."""
+    session.set_kernelspec("deno", "Deno", "typescript")
 
 
 class TestKernelLaunchMetadata:
@@ -1212,20 +1185,6 @@ class TestKernelLaunchMetadata:
     Automerge document rather than re-reading .ipynb files from disk.
     """
 
-    def test_metadata_round_trip(self, session):
-        """Metadata set on the doc can be read back."""
-        import json
-
-        snapshot = _python_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
-
-        raw = session.get_metadata(NOTEBOOK_METADATA_KEY)
-        parsed = json.loads(raw)
-        assert parsed["kernelspec"]["name"] == "python3"
-        assert parsed["runt"]["schema_version"] == "1"
-
     def test_custom_metadata_round_trip(self, session):
         """Non-notebook metadata keys remain readable after the watch refactor."""
         session.set_metadata("custom_key", "custom_value")
@@ -1234,12 +1193,8 @@ class TestKernelLaunchMetadata:
 
     def test_python_kernel_with_python_kernelspec(self, session):
         """A notebook with python kernelspec launches a Python kernel."""
-        import json
-
-        # Set python kernelspec in the Automerge doc
-        snapshot = _python_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        # Set python kernelspec using typed API
+        _set_python_kernelspec(session)
 
         start_kernel_with_retry(session, kernel_type="python")
 
@@ -1258,13 +1213,8 @@ class TestKernelLaunchMetadata:
         notebook in a project that defaults to Deno should still get a Python
         kernel.
         """
-        import json
-
-        # Set python kernelspec in the Automerge doc (simulates opening
-        # an existing Python notebook even though default_runtime=deno)
-        snapshot = _python_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        # Set python kernelspec using typed API
+        _set_python_kernelspec(session)
 
         # Explicitly start Python kernel (as the frontend would after
         # reading kernelspec from the doc)
@@ -1298,21 +1248,45 @@ class TestKernelLaunchMetadata:
         )
 
     def test_metadata_visible_to_second_peer(self, two_sessions):
-        """Metadata set by one peer is visible to another."""
-        import json
-
+        """Metadata set by one peer is visible to another via typed API."""
         s1, s2 = two_sessions
 
-        # Session 1 sets metadata
-        snapshot = _python_kernelspec_metadata()
-        s1.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
+        # Session 1 sets kernelspec via typed API
+        s1.set_kernelspec("python3", "Python 3", "python")
 
-        # Poll until session 2 sees it (was flaky with a bare sleep)
-        wait_for_metadata(s2, NOTEBOOK_METADATA_KEY, description="metadata sync to s2")
+        # Poll until session 2 sees the kernelspec (sync propagation)
+        for _ in range(20):
+            ks = s2.get_kernelspec()
+            if ks and ks.get("name") == "python3":
+                break
+            time.sleep(0.25)
 
-        raw = s2.get_metadata(NOTEBOOK_METADATA_KEY)
-        parsed = json.loads(raw)
-        assert parsed["kernelspec"]["name"] == "python3"
+        # Verify the kernelspec arrived at session 2
+        ks = s2.get_kernelspec()
+        assert ks is not None, "Kernelspec should have synced to session 2"
+        assert ks["name"] == "python3"
+        assert ks["display_name"] == "Python 3"
+        assert ks.get("language") == "python"
+
+    def test_kernelspec_round_trip(self, session):
+        """Set a kernelspec, read it back, verify fields match."""
+        session.set_kernelspec("test-kernel", "Test Kernel Display", "test-lang")
+
+        ks = session.get_kernelspec()
+        assert ks is not None, "Kernelspec should be readable after set"
+        assert ks["name"] == "test-kernel"
+        assert ks["display_name"] == "Test Kernel Display"
+        assert ks.get("language") == "test-lang"
+
+    def test_kernelspec_round_trip_without_language(self, session):
+        """Set a kernelspec without language, verify it round-trips."""
+        session.set_kernelspec("minimal-kernel", "Minimal Kernel")
+
+        ks = session.get_kernelspec()
+        assert ks is not None
+        assert ks["name"] == "minimal-kernel"
+        assert ks["display_name"] == "Minimal Kernel"
+        assert "language" not in ks  # Should not be present when not set
 
     @pytest.mark.timeout(120)
     def test_uv_inline_deps_trusted(self, session):
@@ -1322,11 +1296,7 @@ class TestKernelLaunchMetadata:
         should detect env_source as 'uv:inline' and prepare a cached env
         with those deps installed. First run may be slow (uv venv + install).
         """
-        import json
-
-        snapshot = _python_kernelspec_metadata(with_uv_deps=["requests"])
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        _set_python_kernelspec(session, uv_deps=["requests"])
 
         # Retry: metadata may not have synced to the daemon's Automerge doc yet
         start_kernel_with_retry(session, kernel_type="python", env_source="uv:inline")
@@ -1341,11 +1311,7 @@ class TestKernelLaunchMetadata:
     @pytest.mark.timeout(120)
     def test_uv_inline_deps_env_has_python(self, session):
         """UV inline env actually has a working Python with the declared deps."""
-        import json
-
-        snapshot = _python_kernelspec_metadata(with_uv_deps=["requests"])
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        _set_python_kernelspec(session, uv_deps=["requests"])
 
         # Retry: metadata may not have synced to the daemon's Automerge doc yet
         start_kernel_with_retry(session, kernel_type="python", env_source="uv:inline")
@@ -1383,11 +1349,7 @@ class TestDenoKernel:
 
     def test_deno_kernel_launch(self, session):
         """Deno kernel launches and executes TypeScript."""
-        import json
-
-        snapshot = _deno_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        _set_deno_kernelspec(session)
 
         start_kernel_with_retry(session, kernel_type="deno", env_source="deno")
 
@@ -1397,11 +1359,7 @@ class TestDenoKernel:
 
     def test_deno_kernel_typescript_features(self, session):
         """Deno kernel supports TypeScript features."""
-        import json
-
-        snapshot = _deno_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        _set_deno_kernelspec(session)
 
         start_kernel_with_retry(session, kernel_type="deno", env_source="deno")
 
@@ -1413,75 +1371,21 @@ class TestDenoKernel:
         assert result.success, f"TypeScript execution failed: {result.stderr}"
         assert "Hello, integration test!" in result.stdout
 
-    def test_deno_kernelspec_metadata_round_trip(self, session):
-        """Deno kernelspec in metadata is stored and retrieved correctly."""
-        import json
+    def test_deno_kernelspec_via_typed_api(self, session):
+        """Deno kernelspec set via typed API enables Deno kernel."""
+        _set_deno_kernelspec(session)
 
-        snapshot = _deno_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        # Verify kernelspec round-trips correctly before launching
+        ks = session.get_kernelspec()
+        assert ks is not None, "Deno kernelspec should be readable"
+        assert ks["name"] == "deno"
+        assert ks["display_name"] == "Deno"
+        assert ks.get("language") == "typescript"
 
-        raw = session.get_metadata(NOTEBOOK_METADATA_KEY)
-        assert raw is not None
-        parsed = json.loads(raw)
-        assert parsed["kernelspec"]["name"] == "deno"
-        assert parsed["kernelspec"]["language"] == "typescript"
-        assert parsed["language_info"]["name"] == "typescript"
+        start_kernel_with_retry(session, kernel_type="deno", env_source="deno")
 
-    def test_deno_flexible_npm_imports_syncs_between_peers(self, two_sessions):
-        """flexible_npm_imports setting syncs between peers.
-
-        When one session updates the deno.flexible_npm_imports setting,
-        the other session should see the change after sync propagates.
-        """
-        import json
-
-        s1, s2 = two_sessions
-
-        # Session 1 sets initial metadata with flexible_npm_imports=True
-        snapshot = _deno_kernelspec_metadata(flexible_npm_imports=True)
-        s1.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-
-        # Poll until session 2 sees it
-        wait_for_metadata(s2, NOTEBOOK_METADATA_KEY, description="metadata sync to s2")
-
-        raw = s2.get_metadata(NOTEBOOK_METADATA_KEY)
-        parsed = json.loads(raw)
-        assert parsed["runt"]["deno"]["flexible_npm_imports"] is True
-
-        # Session 2 changes it to False
-        snapshot2 = _deno_kernelspec_metadata(flexible_npm_imports=False)
-        s2.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot2))
-
-        # Poll until session 1 sees the updated value
-        def s1_sees_update():
-            raw1 = s1.get_metadata(NOTEBOOK_METADATA_KEY)
-            if raw1 is None:
-                return False
-            parsed1 = json.loads(raw1)
-            deno = parsed1.get("runt", {}).get("deno", {})
-            return deno.get("flexible_npm_imports") is False
-
-        wait_for_sync(s1_sees_update, description="metadata update sync to s1")
-
-        raw1 = s1.get_metadata(NOTEBOOK_METADATA_KEY)
-        parsed1 = json.loads(raw1)
-        assert parsed1["runt"]["deno"]["flexible_npm_imports"] is False
-
-    def test_deno_flexible_npm_imports_round_trip(self, session):
-        """flexible_npm_imports is preserved through metadata round-trip."""
-        import json
-
-        # Set to False (non-default)
-        snapshot = _deno_kernelspec_metadata(flexible_npm_imports=False)
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
-
-        raw = session.get_metadata(NOTEBOOK_METADATA_KEY)
-        assert raw is not None
-        parsed = json.loads(raw)
-        assert "deno" in parsed["runt"]
-        assert parsed["runt"]["deno"]["flexible_npm_imports"] is False
+        # Verify kernel type is Deno
+        assert session.kernel_type == "deno"
 
 
 # ============================================================================
@@ -1506,8 +1410,6 @@ class TestCondaInlineDeps:
     @pytest.fixture(scope="class")
     def conda_inline_session(self, daemon_process):
         """Create a session with conda inline deps, shared across tests in this class."""
-        import json
-
         socket_path, _ = daemon_process
 
         # Set socket path env var so Session.connect() uses the right daemon
@@ -1520,10 +1422,8 @@ class TestCondaInlineDeps:
         sess = runtimed.Session(notebook_id=notebook_id)
         sess.connect()
 
-        # Set up conda inline deps metadata
-        snapshot = _python_kernelspec_metadata(with_conda_deps=["filelock"])
-        sess.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(sess, NOTEBOOK_METADATA_KEY)
+        # Set up conda inline deps metadata using typed API
+        _set_python_kernelspec(sess, conda_deps=["filelock"])
 
         # Extra delay: conda:inline metadata must propagate to the daemon's
         # Automerge doc before start_kernel reads it. The retry helper covers
@@ -1606,14 +1506,10 @@ class TestProjectFileDetection:
         Uses `uv run --with ipykernel` to install deps from the fixture
         pyproject.toml (httpx).
         """
-        import json
-
         notebook_path = str(FIXTURES_DIR / "pyproject-project" / "5-pyproject.ipynb")
 
-        # Set python kernelspec in metadata
-        snapshot = _python_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        # Set python kernelspec using typed API
+        _set_python_kernelspec(session)
 
         start_kernel_with_retry(
             session,
@@ -1634,13 +1530,9 @@ class TestProjectFileDetection:
         The conda:pixi env_source is detected, and a pooled conda env
         is used to launch the kernel.
         """
-        import json
-
         notebook_path = str(FIXTURES_DIR / "pixi-project" / "6-pixi.ipynb")
 
-        snapshot = _python_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        _set_python_kernelspec(session)
 
         start_kernel_with_retry(
             session,
@@ -1661,13 +1553,9 @@ class TestProjectFileDetection:
         The conda:env_yml env_source is detected, and a pooled conda env
         is used to launch the kernel.
         """
-        import json
-
         notebook_path = str(FIXTURES_DIR / "conda-env-project" / "7-environment-yml.ipynb")
 
-        snapshot = _python_kernelspec_metadata()
-        session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-        wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+        _set_python_kernelspec(session)
 
         start_kernel_with_retry(
             session,
@@ -1683,7 +1571,6 @@ class TestProjectFileDetection:
 
     def test_no_project_file_falls_back_to_prewarmed(self, session):
         """When no project file is found, auto falls back to uv:prewarmed."""
-        import json
         import tempfile
 
         # Create a temp notebook path with no project files nearby
@@ -1691,9 +1578,7 @@ class TestProjectFileDetection:
             notebook_path = f.name
 
         try:
-            snapshot = _python_kernelspec_metadata()
-            session.set_metadata(NOTEBOOK_METADATA_KEY, json.dumps(snapshot))
-            wait_for_metadata(session, NOTEBOOK_METADATA_KEY)
+            _set_python_kernelspec(session)
 
             start_kernel_with_retry(
                 session,

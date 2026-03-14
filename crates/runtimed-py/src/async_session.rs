@@ -80,6 +80,15 @@ impl AsyncSession {
         })
     }
 
+    /// Get the kernel type (e.g., "python", "deno") if kernel is running.
+    fn kernel_type<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        future_into_py(py, async move {
+            let st = state.lock().await;
+            Ok(st.kernel_type.clone())
+        })
+    }
+
     /// Get the environment source if kernel is running.
     fn env_source<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
@@ -473,6 +482,56 @@ impl AsyncSession {
         future_into_py(py, async move {
             session_core::connect(&state, &notebook_id).await?;
             session_core::get_metadata(&state, &key).await
+        })
+    }
+
+    /// Set the notebook kernelspec.
+    #[pyo3(signature = (name, display_name, language=None))]
+    fn set_kernelspec<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        display_name: &str,
+        language: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let notebook_id = self.notebook_id.clone();
+        let name = name.to_string();
+        let display_name = display_name.to_string();
+        let language = language.map(|s| s.to_string());
+
+        future_into_py(py, async move {
+            session_core::connect(&state, &notebook_id).await?;
+            let mut snapshot = session_core::get_notebook_metadata(&state).await?;
+            snapshot.kernelspec = Some(runtimed::notebook_metadata::KernelspecSnapshot {
+                name,
+                display_name,
+                language,
+            });
+            session_core::set_notebook_metadata(&state, &snapshot).await
+        })
+    }
+
+    /// Get the notebook kernelspec.
+    ///
+    /// Returns a dict with 'name', 'display_name', and optionally 'language',
+    /// or None if no kernelspec is set.
+    fn get_kernelspec<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let notebook_id = self.notebook_id.clone();
+
+        future_into_py(py, async move {
+            session_core::connect(&state, &notebook_id).await?;
+            let snapshot = session_core::get_notebook_metadata(&state).await?;
+            Ok(snapshot.kernelspec.map(|ks| {
+                let mut map = std::collections::HashMap::<String, String>::new();
+                map.insert("name".to_string(), ks.name);
+                map.insert("display_name".to_string(), ks.display_name);
+                if let Some(lang) = ks.language {
+                    map.insert("language".to_string(), lang);
+                }
+                map
+            }))
         })
     }
 
