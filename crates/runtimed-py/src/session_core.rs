@@ -607,7 +607,28 @@ pub(crate) async fn execute_cell(
         let blob_base_url = st.blob_base_url.clone();
         let blob_store_path = st.blob_store_path.clone();
 
+        // #region agent log
+        agent_debug_log(
+            "E",
+            "crates/runtimed-py/src/session_core.rs:611",
+            "execute_cell preparing confirm_sync",
+            serde_json::json!({
+                "cellId": cell_id,
+            }),
+        );
+        // #endregion
         handle.confirm_sync().await.map_err(to_py_err)?;
+
+        // #region agent log
+        agent_debug_log(
+            "E",
+            "crates/runtimed-py/src/session_core.rs:621",
+            "execute_cell sending execute request",
+            serde_json::json!({
+                "cellId": cell_id,
+            }),
+        );
+        // #endregion
 
         let response = handle
             .send_request(NotebookRequest::ExecuteCell {
@@ -615,6 +636,18 @@ pub(crate) async fn execute_cell(
             })
             .await
             .map_err(to_py_err)?;
+
+        // #region agent log
+        agent_debug_log(
+            "E",
+            "crates/runtimed-py/src/session_core.rs:634",
+            "execute_cell received request response",
+            serde_json::json!({
+                "cellId": cell_id,
+                "response": format!("{:?}", response),
+            }),
+        );
+        // #endregion
 
         match response {
             NotebookResponse::CellQueued { .. } => {}
