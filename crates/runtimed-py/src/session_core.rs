@@ -657,8 +657,11 @@ pub(crate) async fn collect_outputs(
     blob_store_path: Option<PathBuf>,
 ) -> PyResult<ExecutionResult> {
     let mut kernel_error: Option<String> = None;
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
 
-    // Phase 1: Wait for ExecutionDone or KernelError signal via broadcast.
+    // Phase 1: Wait for ExecutionDone or KernelError, then keep draining
+    // briefly to catch straggling IOPub messages that arrive after the shell
+    // reply (a common Jupyter protocol race).
     loop {
         let mut st = state.lock().await;
 
@@ -667,8 +670,12 @@ pub(crate) async fn collect_outputs(
             .as_mut()
             .ok_or_else(|| to_py_err("Not connected"))?;
 
-        let broadcast =
-            tokio::time::timeout(std::time::Duration::from_millis(100), broadcast_rx.recv()).await;
+        let timeout_ms = if drain_deadline.is_some() { 50 } else { 100 };
+        let broadcast = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            broadcast_rx.recv(),
+        )
+        .await;
 
         match broadcast {
             Ok(Some(msg)) => {
@@ -680,13 +687,17 @@ pub(crate) async fn collect_outputs(
                     } => {
                         if msg_cell_id == cell_id {
                             log::debug!("[session_core] ExecutionDone received for {}", cell_id);
-                            break;
+                            drain_deadline = Some(
+                                tokio::time::Instant::now() + std::time::Duration::from_millis(500),
+                            );
                         }
                     }
                     NotebookBroadcast::KernelError { error } => {
                         log::debug!("[session_core] KernelError: {}", error);
                         kernel_error = Some(error);
-                        break;
+                        drain_deadline = Some(
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(500),
+                        );
                     }
                     _ => {
                         // Ignore all other broadcasts — doc has the data
@@ -697,7 +708,11 @@ pub(crate) async fn collect_outputs(
                 return Err(to_py_err("Broadcast channel closed"));
             }
             Err(_) => {
-                // Poll timeout — keep waiting for signal
+                if let Some(deadline) = drain_deadline {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
             }
         }
     }
