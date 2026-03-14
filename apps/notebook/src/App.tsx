@@ -175,6 +175,7 @@ function AppContent() {
     addDependency,
     removeDependency,
     clearAllDependencies: clearAllUvDeps,
+    setPrerelease,
     syncState,
     syncNow,
     pyprojectInfo,
@@ -1054,12 +1055,14 @@ function AppContent() {
             <DependencyHeader
               dependencies={dependencies?.dependencies ?? []}
               requiresPython={dependencies?.requires_python ?? null}
+              prerelease={dependencies?.prerelease ?? null}
               uvAvailable={uvAvailable}
               loading={depsLoading}
               syncedWhileRunning={syncedWhileRunning}
               needsKernelRestart={needsKernelRestart}
               onAdd={addDependency}
               onRemove={removeDependency}
+              onSetPrerelease={setPrerelease}
               syncState={uvDerivedSyncState ?? syncState}
               onSyncNow={uvDerivedSyncState ? handleSyncDeps : syncNow}
               pyprojectInfo={pyprojectInfo}
