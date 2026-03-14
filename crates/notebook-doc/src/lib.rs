@@ -217,12 +217,16 @@ impl NotebookDoc {
                 AutomergeError::InvalidObjId(format!("serialize kernelspec: {}", e))
             })?;
             self.set_metadata_value("kernelspec", &value)?;
+        } else if let Some(meta_id) = self.metadata_map_id() {
+            let _ = self.doc.delete(&meta_id, "kernelspec");
         }
         if let Some(ref li) = snapshot.language_info {
             let value = serde_json::to_value(li).map_err(|e| {
                 AutomergeError::InvalidObjId(format!("serialize language_info: {}", e))
             })?;
             self.set_metadata_value("language_info", &value)?;
+        } else if let Some(meta_id) = self.metadata_map_id() {
+            let _ = self.doc.delete(&meta_id, "language_info");
         }
         let runt_value = serde_json::to_value(&snapshot.runt)
             .map_err(|e| AutomergeError::InvalidObjId(format!("serialize runt: {}", e)))?;
@@ -1182,7 +1186,7 @@ impl NotebookDoc {
 
         // Try native Automerge Map first, fall back to legacy JSON string
         match self.get_json_value(&cell_obj, "metadata") {
-            Some(serde_json::Value::Object(_)) => self.get_json_value(&cell_obj, "metadata"),
+            Some(v @ serde_json::Value::Object(_)) => Some(v),
             _ => {
                 // Legacy: metadata stored as JSON string
                 Some(
@@ -1212,12 +1216,16 @@ impl NotebookDoc {
             None => return Ok(false),
         };
 
+        // Only accept JSON objects as cell metadata
+        let map = match metadata {
+            serde_json::Value::Object(map) => map,
+            _ => return Ok(false),
+        };
+
         // Write as native Automerge Map
         let meta_id = self.doc.put_object(&cell_obj, "metadata", ObjType::Map)?;
-        if let serde_json::Value::Object(map) = metadata {
-            for (k, v) in map {
-                self.put_json_value(&meta_id, k, v)?;
-            }
+        for (k, v) in map {
+            self.put_json_value(&meta_id, k, v)?;
         }
         Ok(true)
     }
@@ -1409,9 +1417,9 @@ impl NotebookDoc {
     /// - `Value::Object` → `ObjType::Map` with recursive children
     /// - `Value::Array` → `ObjType::List` with recursive elements
     /// - `Value::String` → string scalar
-    /// - `Value::Bool` → bool scalar (stored as string "true"/"false" for now)
-    /// - `Value::Number` → string representation (Automerge scalars)
-    /// - `Value::Null` → deletes the key
+    /// - `Value::Bool` → native bool scalar
+    /// - `Value::Number` → i64 or f64 scalar (i64 preferred when lossless)
+    /// - `Value::Null` → null scalar
     ///
     /// If the key already exists, it is replaced (the old object is overwritten).
     pub fn put_json_value(
@@ -1422,7 +1430,7 @@ impl NotebookDoc {
     ) -> Result<(), AutomergeError> {
         match value {
             serde_json::Value::Null => {
-                self.doc.delete(parent, key)?;
+                self.doc.put(parent, key, automerge::ScalarValue::Null)?;
             }
             serde_json::Value::Bool(b) => {
                 self.doc.put(parent, key, *b)?;
@@ -1430,6 +1438,13 @@ impl NotebookDoc {
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     self.doc.put(parent, key, i)?;
+                } else if let Some(u) = n.as_u64() {
+                    // u64 that didn't fit in i64 — store as f64 if it won't fit
+                    if u <= i64::MAX as u64 {
+                        self.doc.put(parent, key, u as i64)?;
+                    } else {
+                        self.doc.put(parent, key, u as f64)?;
+                    }
                 } else if let Some(f) = n.as_f64() {
                     self.doc.put(parent, key, f)?;
                 }
@@ -1462,8 +1477,8 @@ impl NotebookDoc {
     ) -> Result<(), AutomergeError> {
         match value {
             serde_json::Value::Null => {
-                // Insert empty string as placeholder for null in lists
-                self.doc.insert(list_id, index, "")?;
+                self.doc
+                    .insert(list_id, index, automerge::ScalarValue::Null)?;
             }
             serde_json::Value::Bool(b) => {
                 self.doc.insert(list_id, index, *b)?;
@@ -1471,6 +1486,12 @@ impl NotebookDoc {
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     self.doc.insert(list_id, index, i)?;
+                } else if let Some(u) = n.as_u64() {
+                    if u <= i64::MAX as u64 {
+                        self.doc.insert(list_id, index, u as i64)?;
+                    } else {
+                        self.doc.insert(list_id, index, u as f64)?;
+                    }
                 } else if let Some(f) = n.as_f64() {
                     self.doc.insert(list_id, index, f)?;
                 }
@@ -3439,5 +3460,145 @@ mod tests {
         // Can delete after migration
         doc.delete_cell("new-cell").unwrap();
         assert_eq!(doc.cell_count(), 1);
+    }
+
+    #[test]
+    fn test_json_round_trip_nested() {
+        let mut doc = NotebookDoc::new("rt-nested");
+        let input = serde_json::json!({
+            "string_key": "hello",
+            "bool_true": true,
+            "bool_false": false,
+            "int_pos": 42,
+            "int_neg": -7,
+            "float_val": 3.14,
+            "null_val": null,
+            "nested_map": {
+                "inner": "value",
+                "deep": { "a": 1 }
+            },
+            "array": [1, "two", true, null, {"k": "v"}, [10, 20]]
+        });
+
+        // Write into a fresh metadata key, then read back
+        doc.set_metadata_value("test_blob", &input).unwrap();
+        let output = doc.get_metadata_value("test_blob").unwrap();
+
+        assert_eq!(input, output, "nested JSON did not round-trip");
+    }
+
+    #[test]
+    fn test_metadata_value_round_trip() {
+        let mut doc = NotebookDoc::new("rt-meta");
+        let value = serde_json::json!({
+            "display_name": "Python 3",
+            "language": "python",
+            "version": 3,
+            "features": ["repl", "notebook"],
+            "config": null
+        });
+
+        doc.set_metadata_value("my_key", &value).unwrap();
+        let got = doc.get_metadata_value("my_key").unwrap();
+        assert_eq!(value, got);
+    }
+
+    #[test]
+    fn test_cell_metadata_nested_round_trip() {
+        let mut doc = NotebookDoc::new("rt-cell-meta");
+        doc.add_cell(0, "c1", "code").unwrap();
+
+        let meta = serde_json::json!({
+            "jupyter": {
+                "source_hidden": true,
+                "outputs_hidden": false
+            },
+            "tags": ["parameters"],
+            "custom": null
+        });
+
+        doc.set_cell_metadata("c1", &meta).unwrap();
+        let got = doc.get_cell_metadata("c1").unwrap();
+        assert_eq!(meta, got);
+    }
+
+    #[test]
+    fn test_set_cell_metadata_rejects_non_object() {
+        let mut doc = NotebookDoc::new("rt-reject");
+        doc.add_cell(0, "c1", "code").unwrap();
+
+        // Passing a non-object should return Ok(false) without mutating
+        assert_eq!(
+            doc.set_cell_metadata("c1", &serde_json::json!("not an object"))
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            doc.set_cell_metadata("c1", &serde_json::json!(42)).unwrap(),
+            false
+        );
+        assert_eq!(
+            doc.set_cell_metadata("c1", &serde_json::json!(null))
+                .unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn test_set_metadata_snapshot_none_deletes_stale() {
+        let mut doc = NotebookDoc::new("rt-snap-del");
+
+        // Set a full snapshot first
+        let snap = metadata::NotebookMetadataSnapshot {
+            kernelspec: Some(metadata::KernelspecSnapshot {
+                display_name: "Python 3".into(),
+                language: Some("python".into()),
+                name: "python3".into(),
+            }),
+            language_info: Some(metadata::LanguageInfoSnapshot {
+                name: "python".into(),
+                version: None,
+            }),
+            runt: metadata::RuntMetadata::default(),
+        };
+        doc.set_metadata_snapshot(&snap).unwrap();
+        assert!(doc.get_metadata_value("kernelspec").is_some());
+        assert!(doc.get_metadata_value("language_info").is_some());
+
+        // Now set a snapshot with None fields — stale keys should be removed
+        let snap2 = metadata::NotebookMetadataSnapshot {
+            kernelspec: None,
+            language_info: None,
+            runt: metadata::RuntMetadata::default(),
+        };
+        doc.set_metadata_snapshot(&snap2).unwrap();
+        assert!(
+            doc.get_metadata_value("kernelspec").is_none(),
+            "kernelspec should be deleted when snapshot.kernelspec is None"
+        );
+        assert!(
+            doc.get_metadata_value("language_info").is_none(),
+            "language_info should be deleted when snapshot.language_info is None"
+        );
+    }
+
+    #[test]
+    fn test_null_in_list_round_trips() {
+        let mut doc = NotebookDoc::new("rt-null-list");
+        let input = serde_json::json!([1, null, "three", null]);
+
+        doc.set_metadata_value("arr", &input).unwrap();
+        let output = doc.get_metadata_value("arr").unwrap();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_null_in_map_round_trips() {
+        let mut doc = NotebookDoc::new("rt-null-map");
+        let input = serde_json::json!({"a": null, "b": 2});
+
+        doc.set_metadata_value("obj", &input).unwrap();
+        let output = doc.get_metadata_value("obj").unwrap();
+        assert_eq!(input, output);
     }
 }

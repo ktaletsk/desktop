@@ -2924,9 +2924,15 @@ async fn run_sync_task<S>(
                                 let update = SyncUpdate {
                                     cells,
                                     notebook_metadata: if metadata_changed {
-                                        current_metadata
-                                            .as_ref()
-                                            .and_then(|m| serde_json::to_string(m).ok())
+                                        current_metadata.as_ref().map(|m| {
+                                            serde_json::to_string(m).unwrap_or_else(|e| {
+                                                log::warn!(
+                                                    "[notebook-sync-task] Failed to serialize metadata for {}: {}",
+                                                    notebook_id, e
+                                                );
+                                                "{}".to_string()
+                                            })
+                                        })
                                     } else {
                                         None
                                     },

@@ -768,8 +768,8 @@ where
             // Seed initial metadata: parse the JSON and write as native Automerge
             // types via set_metadata_snapshot. Also writes the legacy string key
             // for backward compat (dual-write inside set_metadata_snapshot).
-            if let Ok(snapshot) = serde_json::from_str::<NotebookMetadataSnapshot>(metadata_json) {
-                match doc.set_metadata_snapshot(&snapshot) {
+            match serde_json::from_str::<NotebookMetadataSnapshot>(metadata_json) {
+                Ok(snapshot) => match doc.set_metadata_snapshot(&snapshot) {
                     Ok(()) => {
                         info!(
                             "[notebook-sync] Seeded initial metadata from handshake for {}",
@@ -778,6 +778,16 @@ where
                     }
                     Err(e) => {
                         warn!("[notebook-sync] Failed to seed initial metadata: {}", e);
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "[notebook-sync] Failed to parse handshake metadata for {}: {}",
+                        notebook_id, e
+                    );
+                    // Fall back to writing the raw string as legacy key
+                    if let Err(e) = doc.set_metadata("notebook_metadata", metadata_json) {
+                        warn!("[notebook-sync] Failed to write legacy metadata: {}", e);
                     }
                 }
             }
