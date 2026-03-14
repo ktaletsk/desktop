@@ -1,8 +1,8 @@
 [package]
-name = "notebook-sync"
+name = "notebook-protocol"
 version = "0.1.0"
 edition = "2021"
-description = "Automerge-based notebook sync client with direct document access"
+description = "Shared wire protocol types for notebook sync (client and server)"
 repository = "https://github.com/nteract/desktop"
 license = "BSD-3-Clause"
 
@@ -10,13 +10,10 @@ license = "BSD-3-Clause"
 workspace = true
 
 [dependencies]
-automerge = "0.7"
+anyhow = { workspace = true }
+kernel-env = { path = "../kernel-env" }
 notebook-doc = { path = "../notebook-doc" }
-notebook-protocol = { path = "../notebook-protocol" }
-tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-
-uuid = { workspace = true }
+tokio = { workspace = true }
 log = "0.4"

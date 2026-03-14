@@ -3506,13 +3506,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "notebook-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kernel-env",
+ "log",
+ "notebook-doc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "notebook-sync"
 version = "0.1.0"
 dependencies = [
  "automerge",
  "log",
  "notebook-doc",
- "runtimed",
+ "notebook-protocol",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
