@@ -86,6 +86,10 @@ cargo xtask run
 cargo xtask run path/to/notebook.ipynb
 ```
 
+`cargo xtask build` also emits JavaScript source maps for the bundled debug UI,
+including inline maps for the isolated renderer iframe bundle, so native webview
+devtools can step through `.tsx` sources.
+
 ### `cargo xtask build --rust-only` — Fast Rust Iteration
 
 When you're only changing Rust code (not the frontend), skip the frontend rebuild:
