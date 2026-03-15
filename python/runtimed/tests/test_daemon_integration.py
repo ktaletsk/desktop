@@ -2715,6 +2715,54 @@ class TestPresence:
         s1.set_cursor(cell_id, line=0, column=0)
         s2.set_cursor(cell_id, line=0, column=5)
 
+    def test_get_peers_and_remote_cursors(self, two_sessions):
+        """Session B sees Session A's cursor via get_peers/get_remote_cursors."""
+        s1, s2 = two_sessions
+        cell_id = s1.create_cell("shared cell")
+
+        # Wait for cell to sync to s2
+        wait_for_sync(
+            lambda: len(s2.get_cells()) > 0,
+            description="cell sync to s2",
+        )
+
+        # Session A sends cursor presence
+        s1.set_cursor(cell_id, line=5, column=10)
+
+        # Session B should see Session A as a peer
+        wait_for_sync(
+            lambda: len(s2.get_peers()) > 0,
+            description="s2 sees s1 peer",
+        )
+        peers = s2.get_peers()
+        assert len(peers) > 0, "Expected at least one remote peer"
+
+        # Session B should see Session A's cursor at (5, 10).
+        # Note: create_cell auto-emits presence at (0, 0), so we must wait
+        # specifically for the updated cursor position from set_cursor.
+        def _cursor_at_expected_pos():
+            for _, _, cid, ln, col in s2.get_remote_cursors():
+                if cid == cell_id and ln == 5 and col == 10:
+                    return True
+            return False
+
+        wait_for_sync(
+            _cursor_at_expected_pos,
+            description="s2 sees s1 cursor at (5, 10)",
+        )
+
+    def test_get_peers_not_connected_raises(self):
+        """get_peers raises when not connected."""
+        sess = runtimed.Session()
+        with pytest.raises(runtimed.RuntimedError):
+            sess.get_peers()
+
+    def test_get_remote_cursors_not_connected_raises(self):
+        """get_remote_cursors raises when not connected."""
+        sess = runtimed.Session()
+        with pytest.raises(runtimed.RuntimedError):
+            sess.get_remote_cursors()
+
 
 class TestAsyncPresence:
     """Async versions of presence tests."""
@@ -2734,6 +2782,16 @@ class TestAsyncPresence:
             head_line=1,
             head_col=5,
         )
+
+    async def test_async_get_peers(self, async_session):
+        """Can query peers via AsyncSession."""
+        peers = await async_session.get_peers()
+        assert isinstance(peers, list)
+
+    async def test_async_get_remote_cursors(self, async_session):
+        """Can query remote cursors via AsyncSession."""
+        cursors = await async_session.get_remote_cursors()
+        assert isinstance(cursors, list)
 
 
 if __name__ == "__main__":

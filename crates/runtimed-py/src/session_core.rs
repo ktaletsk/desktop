@@ -25,6 +25,9 @@ use crate::output_resolver;
 
 use pyo3::prelude::*;
 
+/// Remote cursor info: (peer_id, peer_label, cell_id, line, column).
+pub(crate) type RemoteCursor = (String, String, String, u32, u32);
+
 // =========================================================================
 // Shared state
 // =========================================================================
@@ -1013,6 +1016,32 @@ pub(crate) async fn set_selection(
         .ok_or_else(|| to_py_err("Not connected"))?;
 
     handle.send_presence(data).await.map_err(to_py_err)
+}
+
+/// Get all connected peer IDs and labels.
+pub(crate) async fn get_peers(state: &Arc<Mutex<SessionState>>) -> PyResult<Vec<(String, String)>> {
+    let st = state.lock().await;
+    let handle = st
+        .handle
+        .as_ref()
+        .ok_or_else(|| to_py_err("Not connected"))?;
+    Ok(handle.get_peers())
+}
+
+/// Get remote peer cursors as (peer_id, peer_label, cell_id, line, column).
+pub(crate) async fn get_remote_cursors(
+    state: &Arc<Mutex<SessionState>>,
+) -> PyResult<Vec<RemoteCursor>> {
+    let st = state.lock().await;
+    let handle = st
+        .handle
+        .as_ref()
+        .ok_or_else(|| to_py_err("Not connected"))?;
+    Ok(handle
+        .remote_cursors("local")
+        .into_iter()
+        .map(|(id, label, pos)| (id, label, pos.cell_id, pos.line, pos.column))
+        .collect())
 }
 
 /// Internal helper to emit cursor presence (best-effort).

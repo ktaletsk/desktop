@@ -465,6 +465,45 @@ impl DocHandle {
         reply_rx.await.map_err(|_| SyncError::Disconnected)?
     }
 
+    /// Get all connected peer IDs and labels, sorted by peer ID for stable ordering.
+    pub fn get_peers(&self) -> Vec<(String, String)> {
+        let state = self.doc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut peers: Vec<_> = state
+            .presence
+            .peers()
+            .values()
+            .map(|p| (p.peer_id.clone(), p.peer_label.clone()))
+            .collect();
+        peers.sort_by(|a, b| a.0.cmp(&b.0));
+        peers
+    }
+
+    /// Get all remote peer cursors, excluding the given peer ID.
+    ///
+    /// Returns `(peer_id, peer_label, cursor_position)` tuples sorted by peer ID.
+    pub fn remote_cursors(
+        &self,
+        exclude_peer: &str,
+    ) -> Vec<(String, String, notebook_doc::presence::CursorPosition)> {
+        let state = self.doc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cursors: Vec<_> = state
+            .presence
+            .remote_cursors(exclude_peer)
+            .into_iter()
+            .map(|(id, pos)| {
+                let label = state
+                    .presence
+                    .peers()
+                    .get(id)
+                    .map(|p| p.peer_label.clone())
+                    .unwrap_or_default();
+                (id.to_string(), label, pos.clone())
+            })
+            .collect();
+        cursors.sort_by(|a, b| a.0.cmp(&b.0));
+        cursors
+    }
+
     /// Send a raw presence frame to the daemon.
     ///
     /// The daemon relays this to all other peers in the notebook room.
