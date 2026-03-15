@@ -11,6 +11,22 @@ use notebook_doc::{CellSnapshot, NotebookDoc};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+/// Serialize a Rust value to a `JsValue`, forcing maps to plain JS Objects.
+///
+/// `serde_wasm_bindgen::to_value` defaults to serializing maps as JS `Map`,
+/// but `#[serde(flatten)]` causes serde to emit the containing struct via
+/// `serialize_map`. That turns structs like `RuntMetadata` (which flattens
+/// an `extra: HashMap`) into JS `Map` objects — breaking dot-access on the
+/// JS side (`snapshot.runt.uv` becomes `undefined`).
+///
+/// Using `serialize_maps_as_objects(true)` ensures all maps become plain
+/// JS Objects, matching what `JSON.parse()` would produce. The returned
+/// `JsValue` can be any JS type (object, array, scalar) depending on input.
+fn serialize_to_js<T: Serialize>(value: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    value.serialize(&serializer)
+}
+
 use notebook_doc::frame_types;
 
 /// Event returned from `receive_frame()` for the frontend to handle.
@@ -287,7 +303,7 @@ impl NotebookHandle {
     /// avoiding JSON string round-trips. Returns undefined if no metadata is set.
     pub fn get_metadata_snapshot(&self) -> JsValue {
         match self.doc.get_metadata_snapshot() {
-            Some(snapshot) => serde_wasm_bindgen::to_value(&snapshot).unwrap_or(JsValue::UNDEFINED),
+            Some(snapshot) => serialize_to_js(&snapshot).unwrap_or(JsValue::UNDEFINED),
             None => JsValue::UNDEFINED,
         }
     }
@@ -298,7 +314,7 @@ impl NotebookHandle {
     /// Returns undefined if the key doesn't exist.
     pub fn get_metadata_value(&self, key: &str) -> JsValue {
         match self.doc.get_metadata_value(key) {
-            Some(value) => serde_wasm_bindgen::to_value(&value).unwrap_or(JsValue::UNDEFINED),
+            Some(value) => serialize_to_js(&value).unwrap_or(JsValue::UNDEFINED),
             None => JsValue::UNDEFINED,
         }
     }
@@ -671,8 +687,7 @@ impl NotebookHandle {
             }
         }
 
-        let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
-        events.serialize(&serializer).unwrap_or(JsValue::UNDEFINED)
+        serialize_to_js(&events).unwrap_or(JsValue::UNDEFINED)
     }
 }
 
