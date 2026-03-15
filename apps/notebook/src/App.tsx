@@ -114,6 +114,7 @@ function AppContent() {
     addCell,
     moveCell,
     deleteCell,
+    undoDeleteCell,
     save,
     openNotebook,
     cloneNotebook,
@@ -680,6 +681,22 @@ function AppContent() {
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, [save]);
+
+  // Cmd+Z to undo deleted cell
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !e.shiftKey) {
+        // Only intercept if there's something on the undo stack.
+        // Otherwise let the browser handle native text undo.
+        const restored = undoDeleteCell();
+        if (restored) {
+          e.preventDefault();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [undoDeleteCell]);
 
   // Cmd+F to open global find
   useEffect(() => {

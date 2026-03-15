@@ -318,11 +318,39 @@ impl NotebookHandle {
             .map_err(|e| JsError::new(&format!("move_cell failed: {}", e)))
     }
 
+    /// Get a single cell's snapshot as a JSON string, or null if not found.
+    ///
+    /// Used by the frontend to snapshot a cell before deletion (for undo).
+    pub fn get_cell_snapshot_json(&self, cell_id: &str) -> Option<String> {
+        let cell = self.doc.get_cell(cell_id)?;
+        serde_json::to_string(&cell).ok()
+    }
+
     /// Delete a cell by ID. Returns true if the cell was found and deleted.
     pub fn delete_cell(&mut self, cell_id: &str) -> Result<bool, JsError> {
         self.doc
             .delete_cell(cell_id)
             .map_err(|e| JsError::new(&format!("delete_cell failed: {}", e)))
+    }
+
+    /// Restore a previously deleted cell from a JSON-serialized CellSnapshot.
+    ///
+    /// Re-inserts the cell with all its original data (source, outputs, metadata)
+    /// using the stored position string to preserve ordering.
+    pub fn restore_cell(&mut self, snapshot_json: &str) -> Result<(), JsError> {
+        let snap: notebook_doc::CellSnapshot = serde_json::from_str(snapshot_json)
+            .map_err(|e| JsError::new(&format!("restore_cell: invalid JSON: {}", e)))?;
+        self.doc
+            .add_cell_full(
+                &snap.id,
+                &snap.cell_type,
+                &snap.position,
+                &snap.source,
+                &snap.outputs,
+                &snap.execution_count,
+                &snap.metadata,
+            )
+            .map_err(|e| JsError::new(&format!("restore_cell failed: {}", e)))
     }
 
     /// Update a cell's source text using Automerge Text CRDT (Myers diff).

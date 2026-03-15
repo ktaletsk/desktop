@@ -36,6 +36,13 @@ const wasmReady: Promise<void> = init().then(() => {
   logger.info("[automerge-notebook] WASM initialized");
 });
 
+/** Entry on the undo stack representing a deleted cell. */
+interface DeletedCellEntry {
+  snapshot: CellSnapshot;
+  /** ID of the cell that was before this one, or null if it was first. */
+  afterCellId: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
@@ -65,6 +72,9 @@ export function useAutomergeNotebook() {
 
   // Output manifest cache (shared with materialize-cells utilities).
   const outputCacheRef = useRef<Map<string, JupyterOutput>>(new Map());
+
+  // Undo stack for deleted cells.
+  const undoStackRef = useRef<DeletedCellEntry[]>([]);
 
   // Blob port for manifest resolution.
   const blobPortPromiseRef = useRef<Promise<number | null> | null>(null);
@@ -459,6 +469,25 @@ export function useAutomergeNotebook() {
       // Guard: never delete the last cell
       if (handle.cell_count() <= 1) return;
 
+      // Snapshot before delete (for undo) — read cell list to find neighbor
+      try {
+        const allCells: CellSnapshot[] = JSON.parse(handle.get_cells_json());
+        const idx = allCells.findIndex((c) => c.id === cellId);
+        if (idx >= 0) {
+          const entry: DeletedCellEntry = {
+            snapshot: allCells[idx],
+            afterCellId: idx > 0 ? allCells[idx - 1].id : null,
+          };
+          undoStackRef.current.push(entry);
+          // Cap the stack at 50 entries to limit memory usage
+          if (undoStackRef.current.length > 50) {
+            undoStackRef.current.shift();
+          }
+        }
+      } catch {
+        // Snapshot failure shouldn't block deletion
+      }
+
       // Mutate WASM (instant, local-first)
       const deleted = handle.delete_cell(cellId);
       if (!deleted) return;
@@ -473,6 +502,36 @@ export function useAutomergeNotebook() {
     },
     [rematerializeCellsSync, syncToRelay],
   );
+
+  const undoDeleteCell = useCallback(() => {
+    const handle = handleRef.current;
+    if (!handle || awaitingInitialSyncRef.current) return false;
+
+    const entry = undoStackRef.current.pop();
+    if (!entry) return false;
+
+    const { snapshot, afterCellId } = entry;
+
+    // Re-insert the cell at its original position
+    handle.add_cell_after(snapshot.id, snapshot.cell_type, afterCellId);
+
+    // Restore source text
+    if (snapshot.source) {
+      handle.update_source(snapshot.id, snapshot.source);
+    }
+
+    // Restore cell metadata
+    if (snapshot.metadata && Object.keys(snapshot.metadata).length > 0) {
+      handle.set_cell_metadata(snapshot.id, JSON.stringify(snapshot.metadata));
+    }
+
+    rematerializeCellsSync(handle);
+    syncToRelay(handle);
+    setDirty(true);
+    setFocusedCellId(snapshot.id);
+
+    return true;
+  }, [rematerializeCellsSync, syncToRelay]);
 
   // ── Save / Open / Clone ────────────────────────────────────────────
 
@@ -639,6 +698,7 @@ export function useAutomergeNotebook() {
     addCell,
     moveCell,
     deleteCell,
+    undoDeleteCell,
     save,
     openNotebook,
     cloneNotebook,
