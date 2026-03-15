@@ -1055,6 +1055,23 @@ impl NotebookSyncClient<tokio::net::windows::named_pipe::NamedPipeClient> {
     }
 }
 
+impl<S> NotebookSyncClient<S> {
+    /// Set the actor identity for this client's Automerge document.
+    ///
+    /// Tags all subsequent edits with the given label for provenance tracking
+    /// (e.g., `"agent:claude"`, `"runtimed-py:<session>"`).
+    pub fn set_actor(&mut self, actor_label: &str) {
+        self.doc
+            .set_actor(automerge::ActorId::from(actor_label.as_bytes()));
+    }
+
+    /// Get the actor identity label for this client's document.
+    pub fn get_actor_id(&self) -> String {
+        let actor = self.doc.get_actor();
+        String::from_utf8(actor.to_bytes().to_vec()).unwrap_or_else(|_| actor.to_hex_string())
+    }
+}
+
 impl<S> NotebookSyncClient<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,

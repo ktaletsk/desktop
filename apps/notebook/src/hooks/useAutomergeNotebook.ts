@@ -151,6 +151,13 @@ export function useAutomergeNotebook() {
 
     const handle = NotebookHandle.create_empty();
 
+    // Tag this peer's edits with a "human" actor label for provenance.
+    // The session suffix ensures uniqueness across concurrent tabs.
+    if (typeof handle.set_actor === "function") {
+      const sessionId = crypto.randomUUID().slice(0, 8);
+      handle.set_actor(`human:${sessionId}`);
+    }
+
     // Dispose previous handle (WASM allocation).
     handleRef.current?.free();
     handleRef.current = handle;

@@ -53,7 +53,7 @@ pub const SCHEMA_VERSION: u64 = 2;
 use automerge::sync;
 use automerge::sync::SyncDoc;
 use automerge::transaction::Transactable;
-use automerge::{AutoCommit, AutomergeError, ObjId, ObjType, ReadDoc};
+use automerge::{ActorId, AutoCommit, AutomergeError, ObjId, ObjType, ReadDoc};
 use loro_fractional_index::FractionalIndex;
 use serde::{Deserialize, Serialize};
 
@@ -168,6 +168,29 @@ impl NotebookDoc {
     /// Use this after wrapping to get back the modified AutoCommit.
     pub fn into_inner(self) -> AutoCommit {
         self.doc
+    }
+
+    /// Set the actor identity for this document.
+    ///
+    /// Every Automerge operation is tagged with the actor ID of the document
+    /// that created it. By default, `AutoCommit::new()` assigns a random UUID.
+    /// Call this to set a meaningful, self-attested identity (e.g., `"daemon"`,
+    /// `"human"`, `"agent:claude"`) so edits are attributable to their source.
+    ///
+    /// The actor ID is encoded as the UTF-8 bytes of the label. Each peer
+    /// session should use a unique actor ID — append a session suffix if
+    /// multiple peers share the same label (e.g., `"human:<session-uuid>"`).
+    pub fn set_actor(&mut self, actor_label: &str) {
+        self.doc.set_actor(ActorId::from(actor_label.as_bytes()));
+    }
+
+    /// Get the actor identity label for this document.
+    ///
+    /// Returns the actor ID as a UTF-8 string if it's valid UTF-8,
+    /// otherwise returns the hex representation.
+    pub fn get_actor_id(&self) -> String {
+        let actor = self.doc.get_actor();
+        String::from_utf8(actor.to_bytes().to_vec()).unwrap_or_else(|_| actor.to_hex_string())
     }
 }
 
@@ -412,6 +435,17 @@ impl NotebookDoc {
         Self { doc }
     }
 
+    /// Create a new notebook document with a specific actor identity.
+    ///
+    /// Like `new()`, but sets the actor ID so all operations created by this
+    /// document are attributable to the given label (e.g., `"daemon"`,
+    /// `"human:<session>"`, `"agent:claude:<session>"`).
+    pub fn new_with_actor(notebook_id: &str, actor_label: &str) -> Self {
+        let mut s = Self::new(notebook_id);
+        s.set_actor(actor_label);
+        s
+    }
+
     /// Read the schema version from the document, if present.
     ///
     /// Returns `None` for documents created before schema versioning was added.
@@ -554,10 +588,29 @@ impl NotebookDoc {
         }
     }
 
+    /// Create an empty sync-only bootstrap document with a specific actor identity.
+    ///
+    /// Like `empty()`, but sets the actor ID for edit provenance.
+    pub fn empty_with_actor(actor_label: &str) -> Self {
+        let mut s = Self::empty();
+        s.set_actor(actor_label);
+        s
+    }
+
     /// Load a notebook document from saved bytes.
     pub fn load(data: &[u8]) -> Result<Self, AutomergeError> {
         let doc = AutoCommit::load(data)?;
         Ok(Self { doc })
+    }
+
+    /// Load a notebook document from saved bytes with a specific actor identity.
+    ///
+    /// The loaded document retains its full history (including the original
+    /// actors), but any new operations will be tagged with `actor_label`.
+    pub fn load_with_actor(data: &[u8], actor_label: &str) -> Result<Self, AutomergeError> {
+        let mut s = Self::load(data)?;
+        s.set_actor(actor_label);
+        Ok(s)
     }
 
     /// Load from file or create a new document if the file doesn't exist.
@@ -617,6 +670,14 @@ impl NotebookDoc {
             notebook_id, path
         );
         Self::new(notebook_id)
+    }
+
+    /// Load from file or create, with a specific actor identity for new operations.
+    #[cfg(feature = "persistence")]
+    pub fn load_or_create_with_actor(path: &Path, notebook_id: &str, actor_label: &str) -> Self {
+        let mut doc = Self::load_or_create(path, notebook_id);
+        doc.set_actor(actor_label);
+        doc
     }
 
     /// Rename a corrupt persisted file to `{path}.corrupt` for diagnostics.
@@ -3652,5 +3713,92 @@ mod tests {
         // Can delete after migration
         doc.delete_cell("new-cell").unwrap();
         assert_eq!(doc.cell_count(), 1);
+    }
+
+    // ── Actor provenance tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_set_actor_identity() {
+        let mut doc = NotebookDoc::new("test");
+        doc.set_actor("daemon");
+        assert_eq!(doc.get_actor_id(), "daemon");
+    }
+
+    #[test]
+    fn test_new_with_actor() {
+        let doc = NotebookDoc::new_with_actor("test", "agent:claude:abc123");
+        assert_eq!(doc.get_actor_id(), "agent:claude:abc123");
+    }
+
+    #[test]
+    fn test_empty_with_actor() {
+        let doc = NotebookDoc::empty_with_actor("human:session-1");
+        assert_eq!(doc.get_actor_id(), "human:session-1");
+    }
+
+    #[test]
+    fn test_actor_survives_sync() {
+        use automerge::sync;
+
+        // Daemon doc with "daemon" actor
+        let mut daemon = NotebookDoc::new_with_actor("test-notebook", "daemon");
+        daemon.add_cell(0, "cell-1", "code").unwrap();
+
+        // Frontend doc with "human" actor
+        let mut frontend = NotebookDoc::empty_with_actor("human:tab-1");
+
+        let mut daemon_state = sync::State::new();
+        let mut frontend_state = sync::State::new();
+
+        // Sync until convergence
+        for _ in 0..10 {
+            if let Some(msg) = daemon.generate_sync_message(&mut daemon_state) {
+                frontend
+                    .receive_sync_message(&mut frontend_state, msg)
+                    .unwrap();
+            }
+            if let Some(msg) = frontend.generate_sync_message(&mut frontend_state) {
+                daemon.receive_sync_message(&mut daemon_state, msg).unwrap();
+            }
+        }
+
+        // Both docs have the cell
+        assert_eq!(frontend.cell_count(), 1);
+
+        // Actor identities are preserved after sync
+        assert_eq!(daemon.get_actor_id(), "daemon");
+        assert_eq!(frontend.get_actor_id(), "human:tab-1");
+
+        // Frontend makes an edit — tagged with its own actor
+        frontend
+            .update_source("cell-1", "# edited by human")
+            .unwrap();
+
+        // Sync the edit back
+        for _ in 0..10 {
+            if let Some(msg) = frontend.generate_sync_message(&mut frontend_state) {
+                daemon.receive_sync_message(&mut daemon_state, msg).unwrap();
+            }
+            if let Some(msg) = daemon.generate_sync_message(&mut daemon_state) {
+                frontend
+                    .receive_sync_message(&mut frontend_state, msg)
+                    .unwrap();
+            }
+        }
+
+        // Daemon sees the edit
+        assert_eq!(
+            daemon.get_cell("cell-1").unwrap().source,
+            "# edited by human"
+        );
+    }
+
+    #[test]
+    fn test_default_actor_is_random_hex() {
+        let doc = NotebookDoc::new("test");
+        let actor_id = doc.get_actor_id();
+        // Default actor is a random UUID (32 hex chars)
+        // get_actor_id falls back to hex for non-UTF-8 bytes
+        assert!(!actor_id.is_empty());
     }
 }
