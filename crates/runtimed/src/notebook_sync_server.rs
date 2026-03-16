@@ -4908,10 +4908,13 @@ pub(crate) fn spawn_notebook_file_watcher(
                                     let doc = room.doc.read().await;
                                     doc.get_cells()
                                 };
+                                let metadata = json
+                                    .get("metadata")
+                                    .map(|m| m.to_string());
                                 let _ = room.kernel_broadcast_tx.send(
                                     NotebookBroadcast::FileChanged {
                                         cells,
-                                        metadata: None, // TODO: handle metadata changes
+                                        metadata,
                                     }
                                 );
                             }
