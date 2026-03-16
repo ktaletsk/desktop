@@ -298,6 +298,10 @@ pub enum NotebookRequest {
         /// JSON string of NotebookMetadataSnapshot.
         snapshot: String,
     },
+
+    /// Check if a runtime tool is available (e.g., "deno").
+    /// The daemon checks without triggering bootstrap — safe for UI hints.
+    CheckToolAvailable { tool: String },
 }
 
 /// Responses from daemon to notebook app.
@@ -421,6 +425,9 @@ pub enum NotebookResponse {
         /// Serialized NotebookMetadataSnapshot JSON, or None if not available.
         snapshot: Option<String>,
     },
+
+    /// Tool availability result.
+    ToolAvailable { available: bool },
 }
 
 /// Broadcast messages from daemon to all peers in a room.

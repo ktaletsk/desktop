@@ -6,19 +6,16 @@ pub mod menu;
 
 pub mod pixi;
 pub mod pyproject;
-pub mod runtime;
 pub mod session;
 pub mod settings;
 pub mod shell_env;
-// Re-export tools from kernel-launch crate
-pub use kernel_launch::tools;
 pub mod trust;
 pub mod typosquat;
 pub mod uv_env;
 #[cfg(feature = "webdriver-test")]
 pub mod webdriver;
 
-pub use runtime::Runtime;
+pub use runtimed::runtime::Runtime;
 
 use notebook_sync::RelayHandle;
 use runtimed::protocol::{CompletionItem, HistoryEntry, NotebookRequest, NotebookResponse};
@@ -131,29 +128,6 @@ struct GitInfo {
     branch: String,
     commit: String,
     description: Option<String>,
-}
-
-/// Environment sync state for dirty detection.
-#[derive(Serialize)]
-#[serde(tag = "status")]
-pub enum EnvSyncState {
-    /// Kernel is not running
-    #[serde(rename = "not_running")]
-    NotRunning,
-    /// Kernel is running but not UV-managed
-    #[serde(rename = "not_uv_managed")]
-    NotUvManaged,
-    /// Environment is in sync with declared dependencies
-    #[serde(rename = "synced")]
-    Synced,
-    /// Environment differs from declared dependencies
-    #[serde(rename = "dirty")]
-    Dirty {
-        /// Dependencies declared but not synced
-        added: Vec<String>,
-        /// Dependencies synced but no longer declared
-        removed: Vec<String>,
-    },
 }
 
 /// Status of a notebook for the upgrade screen.
@@ -2804,10 +2778,30 @@ async fn import_pixi_dependencies(
 
 // ========== Deno kernel support ==========
 
-/// Check if Deno is available on the system
+/// Check if Deno is available on the system.
+/// Queries the daemon via the notebook sync protocol so the notebook crate
+/// does not need a direct dependency on kernel-launch.
 #[tauri::command]
-async fn check_deno_available() -> bool {
-    deno_env::check_deno_available().await
+async fn check_deno_available(
+    window: tauri::Window,
+    registry: tauri::State<'_, WindowNotebookRegistry>,
+) -> Result<bool, String> {
+    let Ok(notebook_sync) = notebook_sync_for_window(&window, registry.inner()) else {
+        return Ok(false);
+    };
+    let guard = notebook_sync.lock().await;
+    let Some(handle) = guard.as_ref() else {
+        return Ok(false);
+    };
+    match handle
+        .send_request(NotebookRequest::CheckToolAvailable {
+            tool: "deno".to_string(),
+        })
+        .await
+    {
+        Ok(NotebookResponse::ToolAvailable { available }) => Ok(available),
+        _ => Ok(false),
+    }
 }
 
 /// Detect deno.json/deno.jsonc near the notebook and return info about it
