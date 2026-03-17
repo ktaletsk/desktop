@@ -42,6 +42,7 @@ import { startAttributionDispatch } from "./lib/attribution-registry";
 import { startCursorDispatch } from "./lib/cursor-registry";
 import { KERNEL_STATUS } from "./lib/kernel-status";
 import { logger } from "./lib/logger";
+import { getNotebookCellsSnapshot } from "./lib/notebook-cells";
 import { useDetectRuntime } from "./lib/notebook-metadata";
 import type { JupyterMessage } from "./types";
 
@@ -107,7 +108,7 @@ function AppContent() {
   }, []);
 
   const {
-    cells,
+    cellIds,
     isLoading,
     focusedCellId,
     setFocusedCellId,
@@ -125,10 +126,11 @@ function AppContent() {
     clearCellOutputs,
     setCellSourceHidden,
     setCellOutputsHidden,
+    flushSync,
   } = useAutomergeNotebook();
 
   // Global find (Cmd+F)
-  const globalFind = useGlobalFind(cells);
+  const globalFind = useGlobalFind(cellIds);
 
   const [dependencyHeaderOpen, setDependencyHeaderOpen] = useState(false);
   const [showIsolationTest, setShowIsolationTest] = useState(false);
@@ -484,7 +486,12 @@ function AppContent() {
 
   // Restart and run all cells
   const restartAndRunAll = useCallback(async () => {
-    const codeCells = cells.filter((c) => c.cell_type === "code");
+    const codeCells = getNotebookCellsSnapshot().filter(
+      (c) => c.cell_type === "code",
+    );
+
+    // Flush pending source sync so daemon has latest code
+    await flushSync();
 
     // Clear all outputs locally (immediate feedback)
     for (const cell of codeCells) {
@@ -512,9 +519,9 @@ function AppContent() {
       logger.warn("[App] restartAndRunAll: no kernel available");
     }
   }, [
-    cells,
     clearCellOutputs,
     clearOutputs,
+    flushSync,
     shutdownKernel,
     tryStartKernel,
     daemonRunAllCells,
@@ -554,8 +561,11 @@ function AppContent() {
   const handleExecuteCell = useCallback(
     async (cellId: string) => {
       // Resolve cell up front before awaiting sync operations.
-      const cell = cells.find((c) => c.id === cellId);
+      const cell = getNotebookCellsSnapshot().find((c) => c.id === cellId);
       if (!cell || cell.cell_type !== "code") return;
+
+      // Flush pending source sync so daemon has latest code before executing
+      await flushSync();
 
       // Clear outputs immediately so user sees feedback
       clearCellOutputs(cellId);
@@ -580,7 +590,7 @@ function AppContent() {
     [
       clearCellOutputs,
       clearOutputs,
-      cells,
+      flushSync,
       kernelStatus,
       tryStartKernel,
       executeCell,
@@ -610,8 +620,13 @@ function AppContent() {
 
   const handleRunAllCells = useCallback(async () => {
     // Daemon reads cells from synced Automerge doc
-    const codeCells = cells.filter((c) => c.cell_type === "code");
+    const codeCells = getNotebookCellsSnapshot().filter(
+      (c) => c.cell_type === "code",
+    );
     if (codeCells.length === 0) return;
+
+    // Flush pending source sync so daemon has latest code
+    await flushSync();
 
     // Clear all outputs first (local for immediate feedback)
     for (const cell of codeCells) {
@@ -640,9 +655,9 @@ function AppContent() {
   }, [
     kernelStatus,
     tryStartKernel,
-    cells,
     clearCellOutputs,
     clearOutputs,
+    flushSync,
     daemonRunAllCells,
   ]);
 
@@ -770,7 +785,9 @@ function AppContent() {
     const webview = getCurrentWebview();
     const unlistenPromise = webview.listen("menu:clear-outputs", async () => {
       if (!focusedCellId) return;
-      const cell = cells.find((c) => c.id === focusedCellId);
+      const cell = getNotebookCellsSnapshot().find(
+        (c) => c.id === focusedCellId,
+      );
       if (!cell || cell.cell_type !== "code") return;
       clearCellOutputs(focusedCellId);
       await clearOutputs(focusedCellId);
@@ -778,7 +795,7 @@ function AppContent() {
     return () => {
       unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
     };
-  }, [focusedCellId, cells, clearCellOutputs, clearOutputs]);
+  }, [focusedCellId, clearCellOutputs, clearOutputs]);
 
   // Cell menu: Clear All Outputs
   useEffect(() => {
@@ -786,7 +803,9 @@ function AppContent() {
     const unlistenPromise = webview.listen(
       "menu:clear-all-outputs",
       async () => {
-        const codeCells = cells.filter((c) => c.cell_type === "code");
+        const codeCells = getNotebookCellsSnapshot().filter(
+          (c) => c.cell_type === "code",
+        );
         for (const cell of codeCells) {
           clearCellOutputs(cell.id);
         }
@@ -796,7 +815,7 @@ function AppContent() {
     return () => {
       unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
     };
-  }, [cells, clearCellOutputs, clearOutputs]);
+  }, [clearCellOutputs, clearOutputs]);
 
   // Kernel menu: Run All Cells
   useEffect(() => {
@@ -1020,7 +1039,7 @@ function AppContent() {
           onRunAllCells={handleRunAllCells}
           onRestartAndRunAll={handleRestartAndRunAll}
           focusedCellId={focusedCellId}
-          lastCellId={cells.length > 0 ? cells[cells.length - 1].id : null}
+          lastCellId={cellIds.length > 0 ? cellIds[cellIds.length - 1] : null}
           onAddCell={handleAddCell}
           onToggleDependencies={() => setDependencyHeaderOpen((prev) => !prev)}
           isDepsOpen={dependencyHeaderOpen}
@@ -1163,7 +1182,7 @@ function AppContent() {
           daemonMode={true}
         />
         <NotebookView
-          cells={cells}
+          cellIds={cellIds}
           isLoading={isLoading}
           focusedCellId={focusedCellId}
           executingCellIds={executingCellIds}
