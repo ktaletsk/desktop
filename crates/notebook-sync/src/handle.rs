@@ -532,8 +532,12 @@ impl DocHandle {
     }
 
     /// Get all cells from the latest snapshot.
-    pub fn get_cells(&self) -> Vec<notebook_doc::CellSnapshot> {
-        self.snapshot_rx.borrow().cells.as_ref().clone()
+    ///
+    /// Returns an `Arc<Vec<CellSnapshot>>` for cheap cloning — the cell data
+    /// is shared, not deep-copied. Callers that only need to iterate or index
+    /// can use `Deref` to access the underlying slice.
+    pub fn get_cells(&self) -> Arc<Vec<notebook_doc::CellSnapshot>> {
+        Arc::clone(&self.snapshot_rx.borrow().cells)
     }
 
     /// Get the typed notebook metadata from the latest snapshot.

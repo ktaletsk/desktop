@@ -850,7 +850,7 @@ async fn test_streaming_load_via_open_notebook() {
         .await
         .expect("should connect and open notebook");
     let handle = result.handle;
-    let initial_cells = result.cells;
+    let _initial_cells = result.cells;
     let info = result.info;
 
     // Handshake reports 0 cells (streaming load is deferred)
@@ -860,7 +860,7 @@ async fn test_streaming_load_via_open_notebook() {
     // The sync task runs in the background. Wait for cells to arrive.
     // In pipe mode, initial_cells may be empty; cells come via sync.
     let start = std::time::Instant::now();
-    let mut cells = initial_cells;
+    let mut cells = handle.get_cells();
     while cells.len() < 7 && start.elapsed() < Duration::from_secs(5) {
         sleep(Duration::from_millis(50)).await;
         cells = handle.get_cells();

@@ -39,7 +39,7 @@ pub mod metadata;
 pub mod pep723;
 pub mod presence;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Current document schema version.
 ///
@@ -142,6 +142,15 @@ impl CellSnapshot {
 /// Wrapper around an Automerge document storing a notebook.
 pub struct NotebookDoc {
     doc: AutoCommit,
+    /// Materialized position index: sorted set of `(position_hex, cell_id)` pairs.
+    ///
+    /// Enables O(1) access to first/last cell and O(log n) positional lookup
+    /// for `compute_position()`, avoiding the O(n log n) `get_cells()` call on
+    /// every insertion. The index is maintained incrementally by mutation methods
+    /// and lazily rebuilt when the doc is modified externally (via `doc_mut()`).
+    ///
+    /// `None` means the index is stale and must be rebuilt before use.
+    position_index: Option<BTreeSet<(String, String)>>,
 }
 
 impl NotebookDoc {
@@ -151,7 +160,11 @@ impl NotebookDoc {
     }
 
     /// Access the underlying Automerge document (mutable).
+    ///
+    /// Invalidates the position index since external mutations may change
+    /// cell positions. The index will be lazily rebuilt on next access.
     pub fn doc_mut(&mut self) -> &mut AutoCommit {
+        self.position_index = None;
         &mut self.doc
     }
 
@@ -159,14 +172,19 @@ impl NotebookDoc {
     ///
     /// Use this when you need to call NotebookDoc methods on an AutoCommit
     /// that was constructed elsewhere (e.g., in a sync client).
+    /// The position index is lazily built on first access.
     pub fn wrap(doc: AutoCommit) -> Self {
-        Self { doc }
+        Self {
+            doc,
+            position_index: None,
+        }
     }
 
     /// Consume the NotebookDoc and return the underlying AutoCommit.
     ///
     /// Use this after wrapping to get back the modified AutoCommit.
     pub fn into_inner(self) -> AutoCommit {
+        // position_index is dropped with the struct
         self.doc
     }
 
@@ -478,7 +496,10 @@ impl NotebookDoc {
             let _ = doc.put(&meta_id, "runtime", "python");
         }
 
-        Self { doc }
+        Self {
+            doc,
+            position_index: Some(BTreeSet::new()),
+        }
     }
 
     /// Read the schema version from the document, if present.
@@ -620,6 +641,7 @@ impl NotebookDoc {
     pub fn empty() -> Self {
         Self {
             doc: AutoCommit::new(),
+            position_index: None,
         }
     }
 
@@ -635,7 +657,10 @@ impl NotebookDoc {
     /// Load a notebook document from saved bytes.
     pub fn load(data: &[u8]) -> Result<Self, AutomergeError> {
         let doc = AutoCommit::load(data)?;
-        Ok(Self { doc })
+        Ok(Self {
+            doc,
+            position_index: None,
+        })
     }
 
     /// Load a notebook document from saved bytes with a specific actor identity.
@@ -681,7 +706,10 @@ impl NotebookDoc {
             match std::fs::read(path) {
                 Ok(data) => match AutoCommit::load(&data) {
                     Ok(doc) => {
-                        let mut loaded = Self { doc };
+                        let mut loaded = Self {
+                            doc,
+                            position_index: None,
+                        };
                         let version = loaded.schema_version().unwrap_or(1);
                         if version < SCHEMA_VERSION {
                             info!(
@@ -788,6 +816,30 @@ impl NotebookDoc {
         }
     }
 
+    /// Get the ID of the first cell (by position order) without sorting all cells.
+    ///
+    /// Uses the materialized position index for O(1) access after the index is built.
+    /// Returns `None` if the notebook has no cells.
+    pub fn first_cell_id(&mut self) -> Option<String> {
+        self.ensure_position_index();
+        self.position_index
+            .as_ref()
+            .and_then(|idx| idx.first().map(|(_, id)| id.clone()))
+    }
+
+    /// Get the ID of the last cell (by position order) without sorting all cells.
+    ///
+    /// Uses the materialized position index for O(1) access after the index is built.
+    /// This is the primary optimization for append operations — agents and
+    /// sequential execution can find the last cell without reading or sorting
+    /// all cell data.
+    pub fn last_cell_id(&mut self) -> Option<String> {
+        self.ensure_position_index();
+        self.position_index
+            .as_ref()
+            .and_then(|idx| idx.last().map(|(_, id)| id.clone()))
+    }
+
     /// Get all cells as snapshots, sorted by position.
     pub fn get_cells(&self) -> Vec<CellSnapshot> {
         let cells_id = match self.cells_map_id() {
@@ -827,17 +879,24 @@ impl NotebookDoc {
         cell_id: &str,
         cell_type: &str,
     ) -> Result<(), AutomergeError> {
-        // Convert index to after_cell_id. Indices greater than the current cell
-        // count are treated as "insert at end" by clamping to cells.len().
-        let cells = self.get_cells();
-        let clamped = index.min(cells.len());
+        // Convert index to after_cell_id using the position index instead of
+        // the expensive get_cells() which reads all cell data.
+        self.ensure_position_index();
+        let count = self
+            .position_index
+            .as_ref()
+            .map(|idx| idx.len())
+            .unwrap_or(0);
+        let clamped = index.min(count);
         let after_cell_id = if clamped == 0 {
             None
         } else {
-            cells.get(clamped - 1).map(|c| c.id.as_str())
+            self.position_index
+                .as_ref()
+                .and_then(|idx| idx.iter().nth(clamped - 1).map(|(_, id)| id.clone()))
         };
 
-        self.add_cell_after(cell_id, cell_type, after_cell_id)?;
+        self.add_cell_after(cell_id, cell_type, after_cell_id.as_deref())?;
         Ok(())
     }
 
@@ -871,6 +930,11 @@ impl NotebookDoc {
         self.doc.put_object(&cell_map, "metadata", ObjType::Map)?;
         self.doc
             .put_object(&cell_map, "resolved_assets", ObjType::Map)?;
+
+        // Maintain the position index
+        if let Some(ref mut index) = self.position_index {
+            index.insert((position_str.clone(), cell_id.to_string()));
+        }
 
         Ok(position_str)
     }
@@ -942,6 +1006,11 @@ impl NotebookDoc {
         self.doc
             .put_object(&cell_map, "resolved_assets", ObjType::Map)?;
 
+        // Maintain the position index
+        if let Some(ref mut index) = self.position_index {
+            index.insert((position.to_string(), cell_id.to_string()));
+        }
+
         Ok(())
     }
 
@@ -952,12 +1021,21 @@ impl NotebookDoc {
             None => return Ok(false),
         };
 
-        // Check if cell exists before deleting
-        if self.cell_obj_id(&cells_id, cell_id).is_none() {
-            return Ok(false);
-        }
+        let cell_obj = match self.cell_obj_id(&cells_id, cell_id) {
+            Some(obj) => obj,
+            None => return Ok(false),
+        };
+
+        // Read position before deleting (for index maintenance)
+        let position = read_str(&self.doc, &cell_obj, "position");
 
         self.doc.delete(&cells_id, cell_id)?;
+
+        // Maintain the position index
+        if let (Some(ref mut index), Some(pos)) = (&mut self.position_index, position) {
+            index.remove(&(pos, cell_id.to_string()));
+        }
+
         Ok(true)
     }
 
@@ -989,10 +1067,22 @@ impl NotebookDoc {
             .cell_obj_id(&cells_id, cell_id)
             .ok_or_else(|| AutomergeError::InvalidObjId(format!("cell not found: {}", cell_id)))?;
 
+        // Read old position for index removal
+        let old_position = read_str(&self.doc, &cell_obj, "position");
+
         let position = self.compute_position(after_cell_id);
         let position_str = position.to_string();
 
         self.doc.put(&cell_obj, "position", position_str.as_str())?;
+
+        // Maintain the position index
+        if let Some(ref mut index) = self.position_index {
+            if let Some(old_pos) = old_position {
+                index.remove(&(old_pos, cell_id.to_string()));
+            }
+            index.insert((position_str.clone(), cell_id.to_string()));
+        }
+
         Ok(position_str)
     }
 
@@ -1008,6 +1098,8 @@ impl NotebookDoc {
                 self.doc.delete(&cells_id, &cell_id)?;
             }
         }
+        // Reset the position index to empty (all cells removed)
+        self.position_index = Some(BTreeSet::new());
         Ok(())
     }
 
@@ -1659,59 +1751,110 @@ impl NotebookDoc {
             })
     }
 
-    /// Compute a position for a new cell.
+    /// Compute a position for a new cell using the materialized position index.
     ///
     /// - `after_cell_id = None` → insert at start (before first cell)
     /// - `after_cell_id = Some(id)` → insert after that cell
-    fn compute_position(&self, after_cell_id: Option<&str>) -> FractionalIndex {
-        let cells = self.get_cells(); // sorted by position
+    ///
+    /// Uses the `BTreeSet` position index for O(log n) lookup instead of the
+    /// O(n log n) `get_cells()` call. The index is lazily rebuilt if stale.
+    fn compute_position(&mut self, after_cell_id: Option<&str>) -> FractionalIndex {
+        self.ensure_position_index();
+        self.compute_position_from_index(after_cell_id)
+    }
+
+    /// Inner implementation that reads from the (guaranteed-valid) position index.
+    fn compute_position_from_index(&self, after_cell_id: Option<&str>) -> FractionalIndex {
+        let index = self.position_index.as_ref().unwrap();
 
         match after_cell_id {
             None => {
                 // Insert at start
-                cells
+                index
                     .first()
-                    .map(|c| {
-                        FractionalIndex::new_before(&FractionalIndex::from_hex_string(&c.position))
+                    .map(|(pos, _)| {
+                        FractionalIndex::new_before(&FractionalIndex::from_hex_string(pos))
                     })
                     .unwrap_or_default()
             }
             Some(after_id) => {
-                let idx = cells.iter().position(|c| c.id == after_id);
-                match idx {
-                    Some(i) if i + 1 < cells.len() => {
-                        // Insert between after and next
-                        FractionalIndex::new_between(
-                            &FractionalIndex::from_hex_string(&cells[i].position),
-                            &FractionalIndex::from_hex_string(&cells[i + 1].position),
-                        )
-                        .unwrap_or_else(|| {
-                            // Fallback: insert after if between fails
-                            FractionalIndex::new_after(&FractionalIndex::from_hex_string(
-                                &cells[i].position,
+                // Read the position of after_id directly from the Automerge doc (O(1))
+                let after_pos = self.read_cell_position(after_id);
+                match after_pos {
+                    Some(pos) => {
+                        let key = (pos.clone(), after_id.to_string());
+                        // Find the next entry after this one in the index (O(log n))
+                        let next = index
+                            .range::<(String, String), _>((
+                                std::ops::Bound::Excluded(&key),
+                                std::ops::Bound::Unbounded,
                             ))
-                        })
-                    }
-                    Some(i) => {
-                        // Insert at end (after the last cell)
-                        FractionalIndex::new_after(&FractionalIndex::from_hex_string(
-                            &cells[i].position,
-                        ))
+                            .next();
+                        match next {
+                            Some((next_pos, _)) => {
+                                // Insert between after and next
+                                FractionalIndex::new_between(
+                                    &FractionalIndex::from_hex_string(&pos),
+                                    &FractionalIndex::from_hex_string(next_pos),
+                                )
+                                .unwrap_or_else(|| {
+                                    FractionalIndex::new_after(&FractionalIndex::from_hex_string(
+                                        &pos,
+                                    ))
+                                })
+                            }
+                            None => {
+                                // after_id is the last cell
+                                FractionalIndex::new_after(&FractionalIndex::from_hex_string(&pos))
+                            }
+                        }
                     }
                     None => {
-                        // after_cell_id not found: insert at end (after the last cell)
-                        cells
+                        // after_cell_id not found: insert at end
+                        index
                             .last()
-                            .map(|c| {
-                                FractionalIndex::new_after(&FractionalIndex::from_hex_string(
-                                    &c.position,
-                                ))
+                            .map(|(pos, _)| {
+                                FractionalIndex::new_after(&FractionalIndex::from_hex_string(pos))
                             })
                             .unwrap_or_default()
                     }
                 }
             }
         }
+    }
+
+    /// Read just the position field of a cell by ID (O(1) map lookup).
+    fn read_cell_position(&self, cell_id: &str) -> Option<String> {
+        let cells_id = self.cells_map_id()?;
+        let cell_obj = self.cell_obj_id(&cells_id, cell_id)?;
+        read_str(&self.doc, &cell_obj, "position")
+    }
+
+    /// Ensure the position index is built, rebuilding from the doc if stale.
+    fn ensure_position_index(&mut self) {
+        if self.position_index.is_none() {
+            self.rebuild_position_index();
+        }
+    }
+
+    /// Rebuild the position index by scanning only position + id fields.
+    ///
+    /// O(n) scan — much cheaper than `get_cells()` which also reads source,
+    /// outputs, metadata, and resolved_assets for every cell.
+    fn rebuild_position_index(&mut self) {
+        let mut index = BTreeSet::new();
+        if let Some(cells_id) = self.cells_map_id() {
+            for key in self.doc.keys(&cells_id) {
+                if let Some(cell_obj) = self.cell_obj_id(&cells_id, &key) {
+                    if let Some(id) = read_str(&self.doc, &cell_obj, "id") {
+                        let position = read_str(&self.doc, &cell_obj, "position")
+                            .unwrap_or_else(|| "80".to_string());
+                        index.insert((position, id));
+                    }
+                }
+            }
+        }
+        self.position_index = Some(index);
     }
 
     fn text_id(&self, parent: &ObjId, key: &str) -> Option<ObjId> {
@@ -2479,6 +2622,7 @@ mod tests {
         // Client starts with an empty doc (like a new window joining)
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
 
         let mut server_state = sync::State::new();
@@ -2509,6 +2653,7 @@ mod tests {
         let mut server = NotebookDoc::new("merge-test");
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
 
         let mut server_state = sync::State::new();
@@ -2622,6 +2767,7 @@ mod tests {
         // Client starts empty and syncs
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         let mut daemon_state = sync::State::new();
         let mut client_state = sync::State::new();
@@ -2672,6 +2818,7 @@ mod tests {
 
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         let mut daemon_state = sync::State::new();
         let mut client_state = sync::State::new();
@@ -2719,6 +2866,7 @@ mod tests {
 
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         let mut daemon_state = sync::State::new();
         let mut client_state = sync::State::new();
@@ -2751,6 +2899,7 @@ mod tests {
         let mut daemon = NotebookDoc::new("bidirectional-test");
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         let mut daemon_state = sync::State::new();
         let mut client_state = sync::State::new();
@@ -2810,9 +2959,11 @@ mod tests {
         let mut daemon = NotebookDoc::new("three-peer-test");
         let mut client1 = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         let mut client2 = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         let mut daemon_state1 = sync::State::new();
         let mut daemon_state2 = sync::State::new();
@@ -2889,6 +3040,7 @@ mod tests {
         // Client starts completely empty (zero operations)
         let mut client = NotebookDoc {
             doc: AutoCommit::new(),
+            position_index: None,
         };
         assert_eq!(client.cell_count(), 0);
         assert!(client.notebook_id().is_none());
@@ -3395,7 +3547,10 @@ mod tests {
         if let Ok(meta_id) = doc.put_object(automerge::ROOT, "metadata", ObjType::Map) {
             let _ = doc.put(&meta_id, "runtime", "python");
         }
-        NotebookDoc { doc }
+        NotebookDoc {
+            doc,
+            position_index: None,
+        }
     }
 
     /// Add a cell to a v1 doc using List insert (the old schema).

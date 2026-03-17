@@ -597,8 +597,9 @@ pub(crate) async fn get_cell(state: &Arc<Mutex<SessionState>>, cell_id: &str) ->
 
         let cells = handle.get_cells();
         let snapshot = cells
-            .into_iter()
+            .iter()
             .find(|c| c.id == cell_id)
+            .cloned()
             .ok_or_else(|| to_py_err(format!("Cell not found: {}", cell_id)))?;
 
         (snapshot, blob_base_url, blob_store_path)
@@ -628,14 +629,14 @@ pub(crate) async fn get_cells(state: &Arc<Mutex<SessionState>>) -> PyResult<Vec<
     };
 
     let mut cells = Vec::with_capacity(snapshots.len());
-    for snapshot in snapshots {
+    for snapshot in snapshots.iter() {
         let outputs = output_resolver::resolve_cell_outputs(
             &snapshot.outputs,
             &blob_base_url,
             &blob_store_path,
         )
         .await;
-        cells.push(Cell::from_snapshot_with_outputs(snapshot, outputs));
+        cells.push(Cell::from_snapshot_with_outputs(snapshot.clone(), outputs));
     }
 
     Ok(cells)
@@ -891,12 +892,16 @@ pub(crate) async fn collect_outputs(
         handle.confirm_sync().await.map_err(to_py_err)?;
 
         let cells = handle.get_cells();
-        let snapshot = cells.into_iter().find(|c| c.id == cell_id).ok_or_else(|| {
-            to_py_err(format!(
-                "Cell not found in doc after execution: {}",
-                cell_id
-            ))
-        })?;
+        let snapshot = cells
+            .iter()
+            .find(|c| c.id == cell_id)
+            .cloned()
+            .ok_or_else(|| {
+                to_py_err(format!(
+                    "Cell not found in doc after execution: {}",
+                    cell_id
+                ))
+            })?;
 
         (snapshot, blob_base_url, blob_store_path)
     };
@@ -1204,7 +1209,7 @@ pub(crate) async fn get_cell_metadata(
 
     // Synchronous — read from watch snapshot via DocHandle
     let cells = handle.get_cells();
-    let cell = cells.into_iter().find(|c| c.id == cell_id);
+    let cell = cells.iter().find(|c| c.id == cell_id);
 
     match cell {
         Some(c) => Ok(Some(
