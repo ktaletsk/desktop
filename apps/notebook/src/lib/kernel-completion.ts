@@ -43,6 +43,8 @@ async function kernelCompletionSource(
       cursorPos,
     });
 
+    // Discard stale response if the user has moved on
+    if (context.aborted) return null;
     if (!result.items || result.items.length === 0) return null;
 
     return {
@@ -62,4 +64,5 @@ async function kernelCompletionSource(
  */
 export const kernelCompletionExtension: Extension = autocompletion({
   override: [kernelCompletionSource],
+  activateOnTypingDelay: 150,
 });
