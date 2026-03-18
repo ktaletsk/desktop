@@ -26,7 +26,34 @@ export interface RawCell {
   metadata: CellMetadata;
 }
 
-export type NotebookCell = CodeCell | MarkdownCell | RawCell;
+// =============================================================================
+// MDX Cell Type (RFC 001: MDX-Capable Jupyter Notebook)
+// =============================================================================
+
+export interface MDXCell {
+  cell_type: "mdx";
+  id: string;
+  /** MDX source — markdown with embedded JSX components */
+  source: string;
+  metadata: CellMetadata & {
+    /** Component theme override for this cell */
+    componentTheme?: string;
+  };
+}
+
+/** Data binding exported from a code cell via `#| export:` directive */
+export interface DataBinding {
+  /** Cell ID that produced this binding */
+  cellId: string;
+  /** Variable name */
+  name: string;
+  /** JSON-serialized value from the kernel */
+  value: unknown;
+  /** Timestamp of last update */
+  updatedAt: number;
+}
+
+export type NotebookCell = CodeCell | MarkdownCell | RawCell | MDXCell;
 
 export type JupyterOutput =
   | {
