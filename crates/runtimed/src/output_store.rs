@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::io;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -91,6 +92,44 @@ impl ContentRef {
     /// Returns true if the content is inlined.
     pub fn is_inline(&self) -> bool {
         matches!(self, ContentRef::Inline { .. })
+    }
+
+    /// Create a ContentRef from raw binary data, always using the blob store.
+    ///
+    /// Binary content (images, Arrow IPC, etc.) skips the inline threshold
+    /// and is always stored as a blob. The raw bytes are stored directly —
+    /// no base64 encoding — so the blob store holds the actual binary content
+    /// and the HTTP server can serve it with the correct Content-Type.
+    pub async fn from_binary(
+        data: &[u8],
+        media_type: &str,
+        blob_store: &BlobStore,
+    ) -> io::Result<Self> {
+        let hash = blob_store.put(data, media_type).await?;
+        Ok(ContentRef::Blob {
+            blob: hash,
+            size: data.len() as u64,
+        })
+    }
+
+    /// Resolve a ContentRef that holds binary content, returning base64.
+    ///
+    /// For inline content, returns the string as-is (it's already base64
+    /// from the Jupyter wire protocol, kept inline for small images).
+    /// For blob content, reads the raw bytes and base64-encodes them.
+    ///
+    /// Used by `resolve_data_bundle` for binary MIME types to reconstruct
+    /// the Jupyter nbformat representation (base64 strings for images).
+    pub async fn resolve_binary_as_base64(&self, blob_store: &BlobStore) -> io::Result<String> {
+        match self {
+            ContentRef::Inline { inline } => Ok(inline.clone()),
+            ContentRef::Blob { blob, .. } => {
+                let data = blob_store.get(blob).await?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("blob not found: {}", blob))
+                })?;
+                Ok(base64::engine::general_purpose::STANDARD.encode(&data))
+            }
+        }
     }
 }
 
@@ -378,9 +417,22 @@ async fn convert_value_to_content_refs(
     let mut result = HashMap::new();
     if let Value::Object(map) = data {
         for (mime_type, value) in map {
-            let content_str = value_to_string(value);
-            let content_ref =
-                ContentRef::from_data(&content_str, mime_type, blob_store, threshold).await?;
+            let content_ref = if is_binary_mime(mime_type) {
+                // Binary MIME type: base64-decode → store raw bytes in blob.
+                let base64_str = value_to_string(value);
+                let raw_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&base64_str)
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("base64 decode failed for {}: {}", mime_type, e),
+                        )
+                    })?;
+                ContentRef::from_binary(&raw_bytes, mime_type, blob_store).await?
+            } else {
+                let content_str = value_to_string(value);
+                ContentRef::from_data(&content_str, mime_type, blob_store, threshold).await?
+            };
             result.insert(mime_type.clone(), content_ref);
         }
     }
@@ -476,6 +528,10 @@ pub async fn resolve_manifest(manifest_json: &str, blob_store: &BlobStore) -> io
 // =============================================================================
 
 /// Convert a Jupyter data bundle (MIME type -> content) to ContentRefs.
+///
+/// Binary MIME types (images, Arrow IPC, etc.) are base64-decoded and stored
+/// as raw bytes in the blob store. Text MIME types use the existing
+/// inline/blob threshold logic.
 async fn convert_data_bundle(
     data: Option<&Value>,
     blob_store: &BlobStore,
@@ -485,10 +541,26 @@ async fn convert_data_bundle(
 
     if let Some(Value::Object(map)) = data {
         for (mime_type, value) in map {
-            let content_str = value_to_string(value);
-            // Use the MIME type as the blob media type
-            let content_ref =
-                ContentRef::from_data(&content_str, mime_type, blob_store, threshold).await?;
+            let content_ref = if is_binary_mime(mime_type) {
+                // Binary MIME type: base64-decode → store raw bytes in blob.
+                // Jupyter sends image data as base64 strings on the wire.
+                // We decode to actual bytes so the blob store holds real
+                // binary content and the HTTP server serves it correctly.
+                let base64_str = value_to_string(value);
+                let raw_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&base64_str)
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("base64 decode failed for {}: {}", mime_type, e),
+                        )
+                    })?;
+                ContentRef::from_binary(&raw_bytes, mime_type, blob_store).await?
+            } else {
+                // Text MIME type: store as-is with inline/blob threshold.
+                let content_str = value_to_string(value);
+                ContentRef::from_data(&content_str, mime_type, blob_store, threshold).await?
+            };
             result.insert(mime_type.clone(), content_ref);
         }
     }
@@ -497,6 +569,10 @@ async fn convert_data_bundle(
 }
 
 /// Resolve a data bundle of ContentRefs back to string values.
+///
+/// Binary MIME types are resolved via `resolve_binary_as_base64` which
+/// reads raw bytes from the blob store and base64-encodes them for the
+/// Jupyter nbformat representation (used when saving .ipynb to disk).
 async fn resolve_data_bundle(
     data: HashMap<String, ContentRef>,
     blob_store: &BlobStore,
@@ -504,11 +580,17 @@ async fn resolve_data_bundle(
     let mut result = HashMap::new();
 
     for (mime_type, content_ref) in data {
-        let content = content_ref.resolve(blob_store).await?;
-        // Try to parse as JSON for structured MIME types, otherwise use as string
-        let value = if mime_type.ends_with("+json") || mime_type == "application/json" {
+        let value = if is_binary_mime(&mime_type) {
+            // Binary: read raw bytes from blob → base64-encode for nbformat
+            let base64_str = content_ref.resolve_binary_as_base64(blob_store).await?;
+            Value::String(base64_str)
+        } else if mime_type.ends_with("+json") || mime_type == "application/json" {
+            // JSON: parse into structured Value
+            let content = content_ref.resolve(blob_store).await?;
             serde_json::from_str(&content).unwrap_or(Value::String(content))
         } else {
+            // Text: return as string
+            let content = content_ref.resolve(blob_store).await?;
             Value::String(content)
         };
         result.insert(mime_type, value);
@@ -560,6 +642,43 @@ fn value_to_string(value: &Value) -> String {
         Value::String(s) => s.clone(),
         _ => serde_json::to_string(value).unwrap_or_default(),
     }
+}
+
+/// Check if a MIME type represents binary content.
+///
+/// Binary MIME types are base64-encoded on the Jupyter wire protocol.
+/// We decode them to raw bytes before storing in the blob store so that:
+/// - The blob store holds actual binary content (33% smaller than base64)
+/// - The HTTP blob server serves correct Content-Type with real bytes
+/// - Future binary formats (Arrow IPC, Parquet) work without changes
+fn is_binary_mime(mime: &str) -> bool {
+    if mime.starts_with("image/") {
+        // SVG is plain XML text in Jupyter, not base64-encoded binary.
+        return !mime.ends_with("+xml");
+    }
+    if mime.starts_with("audio/") || mime.starts_with("video/") {
+        return true;
+    }
+
+    // application/* is binary by default, with carve-outs for text-like formats.
+    if let Some(subtype) = mime.strip_prefix("application/") {
+        // Text-like application types that should NOT be treated as binary
+        let is_text = subtype == "json"
+            || subtype == "javascript"
+            || subtype == "ecmascript"
+            || subtype == "xml"
+            || subtype == "xhtml+xml"
+            || subtype == "mathml+xml"
+            || subtype == "sql"
+            || subtype == "graphql"
+            || subtype == "x-latex"
+            || subtype == "x-tex"
+            || subtype.ends_with("+json")
+            || subtype.ends_with("+xml");
+        return !is_text;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -873,5 +992,113 @@ mod tests {
         let resolved = resolve_manifest(&manifest_json, &store).await.unwrap();
 
         assert_eq!(resolved["text"], "line 1\nline 2\n");
+    }
+
+    // ── Binary blob tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_from_binary_always_uses_blob() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+
+        // Even tiny binary data should go to blob (no inline threshold)
+        let tiny_png = b"\x89PNG\r\n\x1a\n";
+        let content_ref = ContentRef::from_binary(tiny_png, "image/png", &store)
+            .await
+            .unwrap();
+
+        assert!(
+            !content_ref.is_inline(),
+            "Binary content should always use blob, never inline"
+        );
+        if let ContentRef::Blob { size, .. } = &content_ref {
+            assert_eq!(*size, tiny_png.len() as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_binary_round_trip_base64() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+
+        // Known bytes → store as blob → resolve back as base64
+        let raw_bytes: Vec<u8> = (0..=255).collect();
+        let content_ref = ContentRef::from_binary(&raw_bytes, "image/png", &store)
+            .await
+            .unwrap();
+
+        let base64_result = content_ref.resolve_binary_as_base64(&store).await.unwrap();
+
+        // Decode the base64 and verify it matches the original bytes
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&base64_result)
+            .unwrap();
+        assert_eq!(decoded, raw_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_binary_display_data_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let store = test_store(&dir);
+
+        // Simulate what the kernel sends: base64-encoded PNG in a display_data
+        let raw_pixels = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let base64_from_kernel = base64::engine::general_purpose::STANDARD.encode(&raw_pixels);
+
+        let output = serde_json::json!({
+            "output_type": "display_data",
+            "data": {
+                "text/plain": "<Figure>",
+                "image/png": base64_from_kernel
+            },
+            "metadata": {}
+        });
+
+        // Create manifest (should base64-decode the PNG and store raw bytes)
+        let manifest_json = create_manifest(&output, &store, DEFAULT_INLINE_THRESHOLD)
+            .await
+            .unwrap();
+
+        // Resolve manifest (should base64-encode raw bytes back for nbformat)
+        let resolved = resolve_manifest(&manifest_json, &store).await.unwrap();
+
+        assert_eq!(resolved["output_type"], "display_data");
+        assert_eq!(resolved["data"]["text/plain"], "<Figure>");
+        // The resolved base64 should match what the kernel originally sent
+        assert_eq!(resolved["data"]["image/png"], base64_from_kernel);
+    }
+
+    #[test]
+    fn test_is_binary_mime() {
+        // Binary image types
+        assert!(is_binary_mime("image/png"));
+        assert!(is_binary_mime("image/jpeg"));
+        assert!(is_binary_mime("image/gif"));
+        assert!(is_binary_mime("image/webp"));
+
+        // SVG is text (plain XML in Jupyter)
+        assert!(!is_binary_mime("image/svg+xml"));
+
+        // Audio/video
+        assert!(is_binary_mime("audio/mpeg"));
+        assert!(is_binary_mime("video/mp4"));
+
+        // Binary application types
+        assert!(is_binary_mime("application/pdf"));
+        assert!(is_binary_mime("application/octet-stream"));
+        assert!(is_binary_mime("application/vnd.apache.arrow.stream"));
+        assert!(is_binary_mime("application/wasm"));
+
+        // Text-like application types
+        assert!(!is_binary_mime("application/json"));
+        assert!(!is_binary_mime("application/javascript"));
+        assert!(!is_binary_mime("application/xml"));
+        assert!(!is_binary_mime("application/vnd.vegalite.v5+json"));
+        assert!(!is_binary_mime("application/xhtml+xml"));
+
+        // Text types
+        assert!(!is_binary_mime("text/plain"));
+        assert!(!is_binary_mime("text/html"));
+        assert!(!is_binary_mime("text/latex"));
     }
 }
