@@ -4129,4 +4129,201 @@ mod tests {
         assert_eq!(doc.get_cell_metadata("nonexistent"), None);
         assert_eq!(doc.get_cell_position("nonexistent"), None);
     }
+
+    // ── Metadata fingerprint tests ──────────────────────────────
+
+    #[test]
+    fn test_metadata_fingerprint_stable_when_unchanged() {
+        let mut doc = NotebookDoc::new("fingerprint-test");
+        let snapshot = metadata::NotebookMetadataSnapshot {
+            kernelspec: Some(metadata::KernelspecSnapshot {
+                name: "python3".to_string(),
+                display_name: "Python 3".to_string(),
+                language: Some("python".to_string()),
+            }),
+            language_info: None,
+            runt: metadata::RuntMetadata::default(),
+        };
+        doc.set_metadata_snapshot(&snapshot).unwrap();
+
+        let fp1 = doc.get_metadata_fingerprint();
+        let fp2 = doc.get_metadata_fingerprint();
+        assert_eq!(
+            fp1, fp2,
+            "Fingerprint should be stable across repeated calls"
+        );
+    }
+
+    #[test]
+    fn test_metadata_fingerprint_changes_on_metadata_update() {
+        let mut doc = NotebookDoc::new("fingerprint-change-test");
+        let snapshot1 = metadata::NotebookMetadataSnapshot {
+            kernelspec: Some(metadata::KernelspecSnapshot {
+                name: "python3".to_string(),
+                display_name: "Python 3".to_string(),
+                language: Some("python".to_string()),
+            }),
+            language_info: None,
+            runt: metadata::RuntMetadata::default(),
+        };
+        doc.set_metadata_snapshot(&snapshot1).unwrap();
+        let fp1 = doc.get_metadata_fingerprint();
+
+        // Add a UV dependency — fingerprint should change
+        doc.add_uv_dependency("pandas>=2.0").unwrap();
+        let fp2 = doc.get_metadata_fingerprint();
+        assert_ne!(fp1, fp2, "Fingerprint should change when deps are added");
+
+        // Add another — fingerprint should change again
+        doc.add_uv_dependency("numpy").unwrap();
+        let fp3 = doc.get_metadata_fingerprint();
+        assert_ne!(fp2, fp3, "Fingerprint should change on each dep addition");
+    }
+
+    #[test]
+    fn test_metadata_fingerprint_stable_across_cell_changes() {
+        let mut doc = NotebookDoc::new("fingerprint-cell-test");
+        let snapshot = metadata::NotebookMetadataSnapshot {
+            kernelspec: Some(metadata::KernelspecSnapshot {
+                name: "python3".to_string(),
+                display_name: "Python 3".to_string(),
+                language: None,
+            }),
+            language_info: None,
+            runt: metadata::RuntMetadata::default(),
+        };
+        doc.set_metadata_snapshot(&snapshot).unwrap();
+        let fp_before = doc.get_metadata_fingerprint();
+
+        // Mutate cells — fingerprint should NOT change
+        doc.add_cell_after("cell-1", "code", None).unwrap();
+        doc.update_source("cell-1", "print('hello')").unwrap();
+        let fp_after = doc.get_metadata_fingerprint();
+
+        assert_eq!(
+            fp_before, fp_after,
+            "Fingerprint should not change when only cells are modified"
+        );
+    }
+
+    #[test]
+    fn test_metadata_fingerprint_deterministic_with_extra_keys() {
+        use metadata::RuntMetadata;
+
+        let mut doc = NotebookDoc::new("fingerprint-extra-test");
+        let mut runt = RuntMetadata::default();
+        // Add extra keys in different order — BTreeMap ensures deterministic output
+        runt.extra
+            .insert("zebra_key".to_string(), serde_json::json!("z_value"));
+        runt.extra
+            .insert("alpha_key".to_string(), serde_json::json!("a_value"));
+        let snapshot = metadata::NotebookMetadataSnapshot {
+            kernelspec: None,
+            language_info: None,
+            runt,
+        };
+        doc.set_metadata_snapshot(&snapshot).unwrap();
+
+        let fp1 = doc.get_metadata_fingerprint();
+        let fp2 = doc.get_metadata_fingerprint();
+        assert_eq!(
+            fp1, fp2,
+            "Fingerprint with extra keys should be deterministic (BTreeMap ordering)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn test_fingerprint_stable_when_unchanged() {
+        let mut doc = NotebookDoc::new("test");
+        doc.set_metadata_snapshot(&metadata::NotebookMetadataSnapshot {
+            kernelspec: Some(metadata::KernelspecSnapshot {
+                name: "python3".to_string(),
+                display_name: "Python 3".to_string(),
+                language: Some("python".to_string()),
+            }),
+            language_info: None,
+            runt: metadata::RuntMetadata::default(),
+        })
+        .unwrap();
+
+        let fp1 = doc.get_metadata_fingerprint();
+        let fp2 = doc.get_metadata_fingerprint();
+        assert_eq!(fp1, fp2, "Fingerprint should be stable across calls");
+    }
+
+    #[test]
+    fn test_fingerprint_changes_on_metadata_change() {
+        let mut doc = NotebookDoc::new("test");
+        doc.set_metadata_snapshot(&metadata::NotebookMetadataSnapshot {
+            kernelspec: None,
+            language_info: None,
+            runt: metadata::RuntMetadata::default(),
+        })
+        .unwrap();
+
+        let fp_before = doc.get_metadata_fingerprint();
+
+        doc.add_uv_dependency("pandas>=2.0").unwrap();
+        let fp_after = doc.get_metadata_fingerprint();
+
+        assert_ne!(
+            fp_before, fp_after,
+            "Fingerprint should change when metadata changes"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_stable_after_cell_change() {
+        let mut doc = NotebookDoc::new("test");
+        doc.set_metadata_snapshot(&metadata::NotebookMetadataSnapshot {
+            kernelspec: None,
+            language_info: None,
+            runt: { let mut r = metadata::RuntMetadata::default(); r.uv = Some(metadata::UvInlineMetadata { dependencies: vec!["numpy".to_string()], requires_python: None, prerelease: None }); r },
+        })
+        .unwrap();
+
+        let fp_before = doc.get_metadata_fingerprint();
+
+        // Mutate cells, not metadata
+        doc.add_cell_after("cell-1", "code", None).unwrap();
+        doc.update_source("cell-1", "print('hello')").unwrap();
+
+        let fp_after = doc.get_metadata_fingerprint();
+        assert_eq!(
+            fp_before, fp_after,
+            "Fingerprint should NOT change on cell-only mutations"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_deterministic_with_extra_keys() {
+        let mut doc = NotebookDoc::new("test");
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "custom_key".to_string(),
+            serde_json::json!("custom_value"),
+        );
+        extra.insert("zebra".to_string(), serde_json::json!(42));
+        extra.insert("alpha".to_string(), serde_json::json!(true));
+
+        doc.set_metadata_snapshot(&metadata::NotebookMetadataSnapshot {
+            kernelspec: None,
+            language_info: None,
+            runt: metadata::RuntMetadata {
+                extra,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // Call multiple times — BTreeMap ensures deterministic order
+        let fp1 = doc.get_metadata_fingerprint();
+        let fp2 = doc.get_metadata_fingerprint();
+        assert_eq!(fp1, fp2, "Fingerprint should be deterministic with extra keys");
+    }
 }

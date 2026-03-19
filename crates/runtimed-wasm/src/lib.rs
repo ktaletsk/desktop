@@ -500,6 +500,7 @@ impl NotebookHandle {
     /// given key in the metadata map. Objects become Maps, arrays become Lists,
     /// and scalars become native scalars.
     pub fn set_metadata_value(&mut self, key: &str, value: JsValue) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         let json_value: serde_json::Value = serde_wasm_bindgen::from_value(value)
             .map_err(|e| JsError::new(&format!("invalid metadata value: {}", e)))?;
         self.doc
