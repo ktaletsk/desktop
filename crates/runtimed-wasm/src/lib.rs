@@ -95,6 +95,11 @@ pub enum FrameEvent {
 pub struct NotebookHandle {
     doc: NotebookDoc,
     sync_state: sync::State,
+    /// Cached metadata fingerprint — invalidated on `receive_frame` when
+    /// the doc changes. Avoids re-serializing the metadata snapshot on
+    /// every `get_metadata_fingerprint()` call (which happens per sync
+    /// batch, ~30/sec during agent output streaming).
+    metadata_fingerprint_cache: Option<String>,
 }
 
 /// A cell snapshot returned to JavaScript.
@@ -184,6 +189,7 @@ impl NotebookHandle {
         NotebookHandle {
             doc: NotebookDoc::new(notebook_id),
             sync_state: sync::State::new(),
+            metadata_fingerprint_cache: None,
         }
     }
 
@@ -194,6 +200,7 @@ impl NotebookHandle {
         NotebookHandle {
             doc: NotebookDoc::empty(),
             sync_state: sync::State::new(),
+            metadata_fingerprint_cache: None,
         }
     }
 
@@ -205,6 +212,7 @@ impl NotebookHandle {
         NotebookHandle {
             doc: NotebookDoc::empty_with_actor(actor_label),
             sync_state: sync::State::new(),
+            metadata_fingerprint_cache: None,
         }
     }
 
@@ -215,6 +223,7 @@ impl NotebookHandle {
         Ok(NotebookHandle {
             doc,
             sync_state: sync::State::new(),
+            metadata_fingerprint_cache: None,
         })
     }
 
@@ -433,8 +442,38 @@ impl NotebookHandle {
         self.doc.detect_runtime()
     }
 
+    /// Invalidate the cached metadata fingerprint.
+    ///
+    /// Call after any local mutation that modifies notebook metadata.
+    /// Remote changes are handled by `receive_frame` (which invalidates
+    /// on `changed = true`).
+    fn invalidate_metadata_cache(&mut self) {
+        self.metadata_fingerprint_cache = None;
+    }
+
+    /// Return a stable fingerprint of the notebook metadata.
+    ///
+    /// Returns a cached JSON string suitable for equality comparison.
+    /// The cache is invalidated in `receive_frame` when the Automerge
+    /// doc actually changes (heads differ). This means the JSON
+    /// serialization cost is paid at most once per doc change, not
+    /// on every call — important during high-frequency output streaming
+    /// where the frame pipeline calls this ~30 times/sec but metadata
+    /// rarely changes.
+    ///
+    /// Returns undefined if no metadata is present.
+    pub fn get_metadata_fingerprint(&mut self) -> Option<String> {
+        if let Some(ref cached) = self.metadata_fingerprint_cache {
+            return Some(cached.clone());
+        }
+        let fp = self.doc.get_metadata_fingerprint()?;
+        self.metadata_fingerprint_cache = Some(fp.clone());
+        Some(fp)
+    }
+
     /// Set a metadata value (legacy string API).
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .set_metadata(key, value)
             .map_err(|e| JsError::new(&format!("set_metadata failed: {}", e)))
@@ -446,6 +485,7 @@ impl NotebookHandle {
     /// it as native Automerge types (maps, lists, scalars). This enables per-field
     /// CRDT merging instead of last-write-wins on a JSON string.
     pub fn set_metadata_snapshot_value(&mut self, value: JsValue) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         let snapshot: notebook_doc::metadata::NotebookMetadataSnapshot =
             serde_wasm_bindgen::from_value(value)
                 .map_err(|e| JsError::new(&format!("invalid metadata snapshot: {}", e)))?;
@@ -597,6 +637,7 @@ impl NotebookHandle {
     /// Add a UV dependency, deduplicating by package name (case-insensitive).
     /// Initializes the UV section if absent, preserving existing fields.
     pub fn add_uv_dependency(&mut self, pkg: &str) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .add_uv_dependency(pkg)
             .map_err(|e| JsError::new(&format!("add_uv_dependency failed: {}", e)))
@@ -605,6 +646,7 @@ impl NotebookHandle {
     /// Remove a UV dependency by package name (case-insensitive).
     /// Returns true if a dependency was removed.
     pub fn remove_uv_dependency(&mut self, pkg: &str) -> Result<bool, JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .remove_uv_dependency(pkg)
             .map_err(|e| JsError::new(&format!("remove_uv_dependency failed: {}", e)))
@@ -612,6 +654,7 @@ impl NotebookHandle {
 
     /// Clear the UV section entirely (deps + requires-python).
     pub fn clear_uv_section(&mut self) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .clear_uv_section()
             .map_err(|e| JsError::new(&format!("clear_uv_section failed: {}", e)))
@@ -623,6 +666,7 @@ impl NotebookHandle {
         &mut self,
         requires_python: Option<String>,
     ) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .set_uv_requires_python(requires_python)
             .map_err(|e| JsError::new(&format!("set_uv_requires_python failed: {}", e)))
@@ -631,6 +675,7 @@ impl NotebookHandle {
     /// Set UV prerelease strategy, preserving deps and requires-python.
     /// Pass "allow", "disallow", "if-necessary", "explicit", "if-necessary-or-explicit", or null to clear.
     pub fn set_uv_prerelease(&mut self, prerelease: Option<String>) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .set_uv_prerelease(prerelease)
             .map_err(|e| JsError::new(&format!("set_uv_prerelease failed: {}", e)))
@@ -641,6 +686,7 @@ impl NotebookHandle {
     /// Add a Conda dependency, deduplicating by package name (case-insensitive).
     /// Initializes the Conda section with ["conda-forge"] channels if absent.
     pub fn add_conda_dependency(&mut self, pkg: &str) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .add_conda_dependency(pkg)
             .map_err(|e| JsError::new(&format!("add_conda_dependency failed: {}", e)))
@@ -649,6 +695,7 @@ impl NotebookHandle {
     /// Remove a Conda dependency by package name (case-insensitive).
     /// Returns true if a dependency was removed.
     pub fn remove_conda_dependency(&mut self, pkg: &str) -> Result<bool, JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .remove_conda_dependency(pkg)
             .map_err(|e| JsError::new(&format!("remove_conda_dependency failed: {}", e)))
@@ -656,6 +703,7 @@ impl NotebookHandle {
 
     /// Clear the Conda section entirely.
     pub fn clear_conda_section(&mut self) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .clear_conda_section()
             .map_err(|e| JsError::new(&format!("clear_conda_section failed: {}", e)))
@@ -664,6 +712,7 @@ impl NotebookHandle {
     /// Set Conda channels, preserving deps and python.
     /// Accepts a JSON array string (e.g. `'["conda-forge","bioconda"]'`).
     pub fn set_conda_channels(&mut self, channels_json: &str) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         let channels: Vec<String> = serde_json::from_str(channels_json)
             .map_err(|e| JsError::new(&format!("invalid channels JSON: {}", e)))?;
         self.doc
@@ -674,6 +723,7 @@ impl NotebookHandle {
     /// Set Conda python version, preserving deps and channels.
     /// Pass undefined/null to clear the constraint.
     pub fn set_conda_python(&mut self, python: Option<String>) -> Result<(), JsError> {
+        self.invalidate_metadata_cache();
         self.doc
             .set_conda_python(python)
             .map_err(|e| JsError::new(&format!("set_conda_python failed: {}", e)))
@@ -777,6 +827,11 @@ impl NotebookHandle {
                 }
                 let heads_after = self.doc.doc_mut().get_heads();
                 let changed = heads_before != heads_after;
+
+                if changed {
+                    // Invalidate cached fingerprint — metadata may have changed.
+                    self.metadata_fingerprint_cache = None;
+                }
 
                 let (changeset, attributions) = if changed {
                     let cs = diff_cells(self.doc.doc_mut(), &heads_before, &heads_after);

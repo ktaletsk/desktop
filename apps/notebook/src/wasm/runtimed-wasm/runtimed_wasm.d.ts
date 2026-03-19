@@ -192,6 +192,20 @@ export class NotebookHandle {
      */
     get_metadata(key: string): string | undefined;
     /**
+     * Return a stable fingerprint of the notebook metadata.
+     *
+     * Returns a cached JSON string suitable for equality comparison.
+     * The cache is invalidated in `receive_frame` when the Automerge
+     * doc actually changes (heads differ). This means the JSON
+     * serialization cost is paid at most once per doc change, not
+     * on every call — important during high-frequency output streaming
+     * where the frame pipeline calls this ~30 times/sec but metadata
+     * rarely changes.
+     *
+     * Returns undefined if no metadata is present.
+     */
+    get_metadata_fingerprint(): string | undefined;
+    /**
      * Get the full typed metadata as a native JS object.
      *
      * Returns the `NotebookMetadataSnapshot` as a JS object via serde-wasm-bindgen,
@@ -446,6 +460,7 @@ export interface InitOutput {
     readonly notebookhandle_get_metadata_snapshot: (a: number) => number;
     readonly notebookhandle_get_metadata_value: (a: number, b: number, c: number) => number;
     readonly notebookhandle_detect_runtime: (a: number, b: number) => void;
+    readonly notebookhandle_get_metadata_fingerprint: (a: number, b: number) => void;
     readonly notebookhandle_set_metadata: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly notebookhandle_set_metadata_snapshot_value: (a: number, b: number, c: number) => void;
     readonly notebookhandle_set_metadata_value: (a: number, b: number, c: number, d: number, e: number) => void;
