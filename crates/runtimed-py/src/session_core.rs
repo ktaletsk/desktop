@@ -614,6 +614,63 @@ pub(crate) async fn set_source(
     Ok(())
 }
 
+/// Splice a cell's source at a specific position (character-level, no diff).
+/// Deletes `delete_count` characters starting at `index`, then inserts `text`.
+pub(crate) async fn splice_source(
+    state: &Arc<Mutex<SessionState>>,
+    cell_id: &str,
+    index: usize,
+    delete_count: usize,
+    text: &str,
+) -> PyResult<()> {
+    let (last_line, last_col) = {
+        let st = state.lock().await;
+        let handle = st
+            .handle
+            .as_ref()
+            .ok_or_else(|| to_py_err("Not connected"))?;
+
+        // Synchronous — direct doc mutation via DocHandle
+        handle
+            .splice_source(cell_id, index, delete_count, text)
+            .map_err(to_py_err)?;
+
+        // Read back the full source to compute cursor position at splice point
+        let cell = handle
+            .get_cell(cell_id)
+            .ok_or_else(|| to_py_err(format!("Cell {} not found", cell_id)))?;
+
+        // Position the cursor at the end of the inserted text.
+        // Use char count (not byte length) — Automerge indices are character-based.
+        let cursor_index = index + text.chars().count();
+        index_to_line_col(&cell.source, cursor_index)
+    };
+
+    emit_cursor_presence(state, cell_id, last_line, last_col).await;
+    emit_clear_channel(state, notebook_doc::presence::Channel::Selection).await;
+
+    Ok(())
+}
+
+/// Convert a character index in a string to (line, col) — both 0-based, u32 for presence API.
+/// Uses character counting (not byte offsets) to handle multi-byte UTF-8 correctly.
+fn index_to_line_col(source: &str, char_index: usize) -> (u32, u32) {
+    let mut line: u32 = 0;
+    let mut col: u32 = 0;
+    for (i, ch) in source.chars().enumerate() {
+        if i >= char_index {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// Append text to a cell's source.
 pub(crate) async fn append_source(
     state: &Arc<Mutex<SessionState>>,
