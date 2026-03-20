@@ -5,6 +5,8 @@ interface CompactExecutionButtonProps {
   count: number | null;
   /** Whether the cell is currently executing */
   isExecuting?: boolean;
+  /** Whether the cell is queued for execution */
+  isQueued?: boolean;
   /** Called when user clicks to execute */
   onExecute?: () => void;
   /** Called when user clicks to interrupt */
@@ -17,17 +19,20 @@ interface CompactExecutionButtonProps {
  * Compact execution button combining play + execution count into one element.
  *
  * - Never run: `[ ▶ ]` - click to execute
+ * - Queued: `[⏳]` - waiting in execution queue
  * - Running: `[■]` with pulse - click to stop
  * - Executed: `[1]` - hover to show play, click to re-run
  */
 export function CompactExecutionButton({
   count,
   isExecuting = false,
+  isQueued = false,
   onExecute,
   onInterrupt,
   className,
 }: CompactExecutionButtonProps) {
   const handleClick = () => {
+    if (isQueued) return; // already in queue — no-op
     if (isExecuting) {
       onInterrupt?.();
     } else {
@@ -43,9 +48,16 @@ export function CompactExecutionButton({
         "group/exec inline-flex items-center font-mono text-sm tabular-nums",
         "text-muted-foreground hover:text-foreground",
         "transition-colors duration-150",
+        isQueued ? "cursor-default" : "cursor-pointer",
         className,
       )}
-      title={isExecuting ? "Stop execution" : "Run cell"}
+      title={
+        isExecuting
+          ? "Stop execution"
+          : isQueued
+            ? "Queued for execution"
+            : "Run cell"
+      }
       data-testid="execute-button"
     >
       <span className="opacity-60">[</span>
@@ -53,6 +65,11 @@ export function CompactExecutionButton({
         {isExecuting ? (
           // Running state: show stop with pulse
           <span className="text-destructive animate-pulse">■</span>
+        ) : isQueued ? (
+          // Queued state: small dot with slow breathe animation
+          <span className="flex items-center justify-center">
+            <span className="block h-1.5 w-1.5 rounded-full bg-muted-foreground animate-queue-breathe" />
+          </span>
         ) : count !== null ? (
           // Has count: show count, play on hover
           <>

@@ -431,6 +431,47 @@ async fn handle_incoming_frame<W: AsyncWrite + Unpin>(
                 notebook_id
             );
         }
+
+        NotebookFrameType::RuntimeStateSync => {
+            let msg = match sync::Message::decode(&frame.payload) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    warn!(
+                        "[notebook-sync] Failed to decode RuntimeStateSync for {}: {}",
+                        notebook_id, e
+                    );
+                    return;
+                }
+            };
+
+            // Apply and generate reply — same pattern as AutomergeSync
+            let reply_bytes = {
+                let mut state = doc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = state.receive_state_sync_message(msg) {
+                    warn!(
+                        "[notebook-sync] Failed to apply RuntimeStateSync for {}: {}",
+                        notebook_id, e
+                    );
+                    return;
+                }
+                state.generate_state_sync_message().map(|msg| msg.encode())
+            };
+
+            if let Some(bytes) = reply_bytes {
+                if let Err(e) = connection::send_typed_frame(
+                    writer,
+                    NotebookFrameType::RuntimeStateSync,
+                    &bytes,
+                )
+                .await
+                {
+                    warn!(
+                        "[notebook-sync] Failed to send RuntimeStateSync reply for {}: {}",
+                        notebook_id, e
+                    );
+                }
+            }
+        }
     }
 }
 
