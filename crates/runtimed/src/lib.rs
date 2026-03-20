@@ -253,3 +253,4 @@ pub fn settings_schema_path() -> PathBuf {
 pub fn default_notebook_docs_dir() -> PathBuf {
     daemon_base_dir().join("notebook-docs")
 }
+pub mod pool_doc;
