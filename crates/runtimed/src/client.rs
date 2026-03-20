@@ -737,7 +737,7 @@ pub async fn subscribe_pool_state(
 /// ```
 pub async fn sync_pool_state(
 ) -> Result<tokio::sync::mpsc::Receiver<crate::pool_doc::PoolState>, ClientError> {
-    use automerge::{sync, sync::SyncDoc, AutoCommit, ReadDoc, ROOT};
+    use automerge::{sync, sync::SyncDoc, AutoCommit};
 
     let socket_path = default_socket_path();
     let connect_timeout = Duration::from_secs(2);
@@ -882,6 +882,20 @@ fn read_pool_state_from_doc(doc: &automerge::AutoCommit) -> Option<crate::pool_d
             .ok()?
             .and_then(|(v, _)| v.to_u64())
             .unwrap_or(0);
+        let consecutive_failures = doc
+            .get(&obj_id, "consecutive_failures")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| v.to_u64())
+            .unwrap_or(0) as u32;
+
+        let retry_in_secs = doc
+            .get(&obj_id, "retry_in_secs")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| v.to_u64())
+            .unwrap_or(0);
+
         let error = doc
             .get(&obj_id, "error")
             .ok()
@@ -893,6 +907,8 @@ fn read_pool_state_from_doc(doc: &automerge::AutoCommit) -> Option<crate::pool_d
             warming,
             pool_size,
             error,
+            consecutive_failures,
+            retry_in_secs,
         })
     };
 

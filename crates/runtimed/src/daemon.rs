@@ -1607,6 +1607,8 @@ impl Daemon {
                 match env {
                     Some(env) => {
                         debug!("[runtimed] Took {} env: {:?}", env_type, env.venv_path);
+                        // Update PoolDoc immediately so clients see the count change
+                        self.update_pool_doc().await;
                         // Spawn replenishment
                         let daemon = self.clone();
                         match env_type {
@@ -1659,6 +1661,8 @@ impl Daemon {
                         }
                     }
                 }
+                // Update PoolDoc immediately so clients see the returned env
+                self.update_pool_doc().await;
                 Response::Returned
             }
 
@@ -2388,12 +2392,16 @@ print("warmup complete")
                 available: uv_available as u64,
                 warming: uv_warming as u64,
                 pool_size: self.config.uv_pool_size as u64,
+                consecutive_failures: uv_error.as_ref().map_or(0, |e| e.consecutive_failures),
+                retry_in_secs: uv_error.as_ref().map_or(0, |e| e.retry_in_secs),
                 error: uv_error.map(|e| e.message),
             },
             conda: crate::pool_doc::RuntimePoolState {
                 available: conda_available as u64,
                 warming: conda_warming as u64,
                 pool_size: self.config.conda_pool_size as u64,
+                consecutive_failures: conda_error.as_ref().map_or(0, |e| e.consecutive_failures),
+                retry_in_secs: conda_error.as_ref().map_or(0, |e| e.retry_in_secs),
                 error: conda_error.map(|e| e.message),
             },
         };

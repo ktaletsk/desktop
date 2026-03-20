@@ -3340,10 +3340,14 @@ struct PoolStateEvent {
     uv_warming: u64,
     uv_pool_size: u64,
     uv_error: Option<String>,
+    uv_consecutive_failures: u32,
+    uv_retry_in_secs: u64,
     conda_available: u64,
     conda_warming: u64,
     conda_pool_size: u64,
     conda_error: Option<String>,
+    conda_consecutive_failures: u32,
+    conda_retry_in_secs: u64,
 }
 
 impl From<&runtimed::pool_doc::PoolState> for PoolStateEvent {
@@ -3353,10 +3357,14 @@ impl From<&runtimed::pool_doc::PoolState> for PoolStateEvent {
             uv_warming: state.uv.warming,
             uv_pool_size: state.uv.pool_size,
             uv_error: state.uv.error.clone(),
+            uv_consecutive_failures: state.uv.consecutive_failures,
+            uv_retry_in_secs: state.uv.retry_in_secs,
             conda_available: state.conda.available,
             conda_warming: state.conda.warming,
             conda_pool_size: state.conda.pool_size,
             conda_error: state.conda.error.clone(),
+            conda_consecutive_failures: state.conda.consecutive_failures,
+            conda_retry_in_secs: state.conda.retry_in_secs,
         }
     }
 }

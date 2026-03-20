@@ -286,6 +286,10 @@ export interface PoolStateEvent {
   uv_pool_size: number;
   /** UV pool error (null if healthy). */
   uv_error: string | null;
+  /** UV pool: consecutive failure count (0 if healthy). */
+  uv_consecutive_failures: number;
+  /** UV pool: seconds until next retry (0 if healthy or imminent). */
+  uv_retry_in_secs: number;
   /** Conda pool: available prewarmed environments. */
   conda_available: number;
   /** Conda pool: environments currently warming. */
@@ -294,4 +298,8 @@ export interface PoolStateEvent {
   conda_pool_size: number;
   /** Conda pool error (null if healthy). */
   conda_error: string | null;
+  /** Conda pool: consecutive failure count (0 if healthy). */
+  conda_consecutive_failures: number;
+  /** Conda pool: seconds until next retry (0 if healthy or imminent). */
+  conda_retry_in_secs: number;
 }

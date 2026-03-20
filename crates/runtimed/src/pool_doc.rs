@@ -35,7 +35,12 @@ pub struct RuntimePoolState {
     pub available: u64,
     pub warming: u64,
     pub pool_size: u64,
+    /// Human-readable error message (None if healthy).
     pub error: Option<String>,
+    /// Number of consecutive failures (0 if healthy).
+    pub consecutive_failures: u32,
+    /// Seconds until next retry (0 if retry is imminent or healthy).
+    pub retry_in_secs: u64,
 }
 
 /// Full pool state snapshot.
@@ -58,30 +63,44 @@ pub struct PoolDoc {
 
 impl PoolDoc {
     /// Create a new empty PoolDoc with the schema scaffolded.
+    ///
+    /// These operations on a fresh `AutoCommit` are infallible — there are no
+    /// conflicting keys or invalid object IDs. The `expect` calls document this
+    /// invariant rather than propagating impossible errors.
+    #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         let mut doc = AutoCommit::new();
         doc.set_actor(automerge::ActorId::from(b"runtimed:pool".as_slice()));
 
-        // Scaffold the schema
+        // Scaffold the schema — fresh AutoCommit, these cannot fail
         let uv = doc
             .put_object(ROOT, "uv", ObjType::Map)
-            .expect("scaffold uv");
+            .expect("fresh AutoCommit: put_object cannot fail");
         doc.put(&uv, "available", 0u64)
-            .expect("scaffold uv.available");
-        doc.put(&uv, "warming", 0u64).expect("scaffold uv.warming");
+            .expect("fresh AutoCommit: put cannot fail");
+        doc.put(&uv, "warming", 0u64)
+            .expect("fresh AutoCommit: put cannot fail");
         doc.put(&uv, "pool_size", 0u64)
-            .expect("scaffold uv.pool_size");
+            .expect("fresh AutoCommit: put cannot fail");
+        doc.put(&uv, "consecutive_failures", 0u64)
+            .expect("fresh AutoCommit: put cannot fail");
+        doc.put(&uv, "retry_in_secs", 0u64)
+            .expect("fresh AutoCommit: put cannot fail");
         // error starts as null (absent)
 
         let conda = doc
             .put_object(ROOT, "conda", ObjType::Map)
-            .expect("scaffold conda");
+            .expect("fresh AutoCommit: put_object cannot fail");
         doc.put(&conda, "available", 0u64)
-            .expect("scaffold conda.available");
+            .expect("fresh AutoCommit: put cannot fail");
         doc.put(&conda, "warming", 0u64)
-            .expect("scaffold conda.warming");
+            .expect("fresh AutoCommit: put cannot fail");
         doc.put(&conda, "pool_size", 0u64)
-            .expect("scaffold conda.pool_size");
+            .expect("fresh AutoCommit: put cannot fail");
+        doc.put(&conda, "consecutive_failures", 0u64)
+            .expect("fresh AutoCommit: put cannot fail");
+        doc.put(&conda, "retry_in_secs", 0u64)
+            .expect("fresh AutoCommit: put cannot fail");
 
         PoolDoc {
             doc,
@@ -123,6 +142,13 @@ impl PoolDoc {
         self.doc.put(&uv_id, "available", state.uv.available)?;
         self.doc.put(&uv_id, "warming", state.uv.warming)?;
         self.doc.put(&uv_id, "pool_size", state.uv.pool_size)?;
+        self.doc.put(
+            &uv_id,
+            "consecutive_failures",
+            state.uv.consecutive_failures as u64,
+        )?;
+        self.doc
+            .put(&uv_id, "retry_in_secs", state.uv.retry_in_secs)?;
         match &state.uv.error {
             Some(err) => self.doc.put(&uv_id, "error", err.as_str())?,
             None => {
@@ -144,6 +170,13 @@ impl PoolDoc {
         self.doc.put(&conda_id, "warming", state.conda.warming)?;
         self.doc
             .put(&conda_id, "pool_size", state.conda.pool_size)?;
+        self.doc.put(
+            &conda_id,
+            "consecutive_failures",
+            state.conda.consecutive_failures as u64,
+        )?;
+        self.doc
+            .put(&conda_id, "retry_in_secs", state.conda.retry_in_secs)?;
         match &state.conda.error {
             Some(err) => self.doc.put(&conda_id, "error", err.as_str())?,
             None => {
@@ -187,6 +220,22 @@ impl PoolDoc {
             .and_then(|(v, _)| v.to_u64())
             .unwrap_or(0);
 
+        let consecutive_failures = self
+            .doc
+            .get(&obj_id, "consecutive_failures")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| v.to_u64())
+            .unwrap_or(0) as u32;
+
+        let retry_in_secs = self
+            .doc
+            .get(&obj_id, "retry_in_secs")
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| v.to_u64())
+            .unwrap_or(0);
+
         let error = self
             .doc
             .get(&obj_id, "error")
@@ -199,6 +248,8 @@ impl PoolDoc {
             warming,
             pool_size,
             error,
+            consecutive_failures,
+            retry_in_secs,
         })
     }
 
@@ -236,28 +287,27 @@ impl PoolDoc {
     }
 }
 
-impl Default for PoolDoc {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_new_doc_has_zero_state() {
         let doc = PoolDoc::new();
-        let state = doc.read_state().unwrap();
+        let state = doc.read_state().expect("fresh doc should have state");
         assert_eq!(state.uv.available, 0);
         assert_eq!(state.uv.warming, 0);
         assert_eq!(state.uv.pool_size, 0);
         assert_eq!(state.uv.error, None);
+        assert_eq!(state.uv.consecutive_failures, 0);
+        assert_eq!(state.uv.retry_in_secs, 0);
         assert_eq!(state.conda.available, 0);
         assert_eq!(state.conda.warming, 0);
         assert_eq!(state.conda.pool_size, 0);
         assert_eq!(state.conda.error, None);
+        assert_eq!(state.conda.consecutive_failures, 0);
+        assert_eq!(state.conda.retry_in_secs, 0);
     }
 
     #[test]
@@ -269,19 +319,25 @@ mod tests {
                 warming: 1,
                 pool_size: 4,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
             conda: RuntimePoolState {
                 available: 2,
                 warming: 0,
                 pool_size: 3,
                 error: Some("rattler failed".to_string()),
+                consecutive_failures: 3,
+                retry_in_secs: 30,
             },
         };
 
         let changed = doc.update(&state);
         assert!(changed);
 
-        let read = doc.read_state().unwrap();
+        let read = doc
+            .read_state()
+            .expect("state should be readable after update");
         assert_eq!(read.uv.available, 3);
         assert_eq!(read.uv.warming, 1);
         assert_eq!(read.uv.pool_size, 4);
@@ -290,6 +346,8 @@ mod tests {
         assert_eq!(read.conda.warming, 0);
         assert_eq!(read.conda.pool_size, 3);
         assert_eq!(read.conda.error, Some("rattler failed".to_string()));
+        assert_eq!(read.conda.consecutive_failures, 3);
+        assert_eq!(read.conda.retry_in_secs, 30);
     }
 
     #[test]
@@ -301,12 +359,16 @@ mod tests {
                 warming: 0,
                 pool_size: 3,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
             conda: RuntimePoolState {
                 available: 0,
                 warming: 0,
                 pool_size: 0,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
         };
 
@@ -325,17 +387,21 @@ mod tests {
                 warming: 0,
                 pool_size: 2,
                 error: Some("venv creation failed".to_string()),
+                consecutive_failures: 2,
+                retry_in_secs: 15,
             },
             conda: RuntimePoolState {
                 available: 0,
                 warming: 0,
                 pool_size: 0,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
         };
         doc.update(&with_error);
         assert_eq!(
-            doc.read_state().unwrap().uv.error,
+            doc.read_state().expect("state should be readable").uv.error,
             Some("venv creation failed".to_string())
         );
 
@@ -346,16 +412,23 @@ mod tests {
                 warming: 0,
                 pool_size: 2,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
             conda: RuntimePoolState {
                 available: 0,
                 warming: 0,
                 pool_size: 0,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
         };
         doc.update(&without_error);
-        assert_eq!(doc.read_state().unwrap().uv.error, None);
+        assert_eq!(
+            doc.read_state().expect("state should be readable").uv.error,
+            None
+        );
     }
 
     #[test]
@@ -372,12 +445,16 @@ mod tests {
                 warming: 0,
                 pool_size: 4,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
             conda: RuntimePoolState {
                 available: 1,
                 warming: 2,
                 pool_size: 3,
                 error: None,
+                consecutive_failures: 0,
+                retry_in_secs: 0,
             },
         };
         server.update(&state);

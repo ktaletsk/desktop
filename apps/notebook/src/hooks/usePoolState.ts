@@ -6,6 +6,10 @@ import type { PoolStateEvent } from "../types";
 export interface PoolErrorWithTimestamp {
   /** Error message from the pool. */
   message: string;
+  /** Number of consecutive failures. */
+  consecutiveFailures: number;
+  /** Seconds until next retry (0 if imminent). */
+  retryInSecs: number;
   /** When this state was received (epoch ms). */
   receivedAt: number;
 }
@@ -39,7 +43,11 @@ function errorsEqual(
 ): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  return a.message === b.message;
+  return (
+    a.message === b.message &&
+    a.consecutiveFailures === b.consecutiveFailures &&
+    a.retryInSecs === b.retryInSecs
+  );
 }
 
 /**
@@ -69,10 +77,20 @@ export function usePoolState() {
       const payload = event.payload;
 
       const uvError: PoolErrorWithTimestamp | null = payload.uv_error
-        ? { message: payload.uv_error, receivedAt: now }
+        ? {
+            message: payload.uv_error,
+            consecutiveFailures: payload.uv_consecutive_failures,
+            retryInSecs: payload.uv_retry_in_secs,
+            receivedAt: now,
+          }
         : null;
       const condaError: PoolErrorWithTimestamp | null = payload.conda_error
-        ? { message: payload.conda_error, receivedAt: now }
+        ? {
+            message: payload.conda_error,
+            consecutiveFailures: payload.conda_consecutive_failures,
+            retryInSecs: payload.conda_retry_in_secs,
+            receivedAt: now,
+          }
         : null;
 
       // Check if errors changed — reset dismiss state on new errors
