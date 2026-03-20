@@ -7,8 +7,8 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { filter, from, interval, switchMap, tap } from "rxjs";
 import { getBlobPort, refreshBlobPort, resetBlobPort } from "../lib/blob-port";
 import {
   isKernelStatus,
@@ -18,6 +18,7 @@ import {
 import { logger } from "../lib/logger";
 import { subscribeBroadcast } from "../lib/notebook-frame-bus";
 import { resetRuntimeState, useRuntimeState } from "../lib/runtime-state";
+import { fromTauriEvent } from "../lib/tauri-rx";
 import type {
   DaemonBroadcast,
   DaemonNotebookResponse,
@@ -248,7 +249,6 @@ export function useDaemonKernel({
 
   useEffect(() => {
     let cancelled = false;
-    const webview = getCurrentWebview();
 
     // Ensure blob port is fresh on mount
     refreshBlobPort();
@@ -429,29 +429,37 @@ export function useDaemonKernel({
       }
     });
 
-    // Listen for daemon disconnection
-    const unlistenDisconnect = webview.listen(
-      "daemon:disconnected",
-      async () => {
-        if (cancelled) return;
-        logger.warn("[daemon-kernel] Daemon disconnected, resetting state");
-        // Reset RuntimeStateDoc store — next sync will repopulate
-        resetRuntimeState();
-        resetBlobPort();
+    // ── Daemon lifecycle (RxJS) ───────────────────────────────────
+    //
+    // daemon:disconnected → reset state, attempt reconnect
+    // daemon:ready → refresh blob port
+    //
+    // switchMap on disconnect cancels any in-flight reconnect on rapid
+    // disconnect/reconnect cycles (same pattern as useAutomergeNotebook).
 
-        try {
-          await invoke("reconnect_to_daemon");
-          logger.debug("[daemon-kernel] Reconnected to daemon");
-          refreshBlobPort();
-        } catch (e) {
-          logger.error("[daemon-kernel] Failed to reconnect:", e);
-        }
-      },
-    );
+    const disconnectSub = fromTauriEvent("daemon:disconnected")
+      .pipe(
+        tap(() => {
+          logger.warn("[daemon-kernel] Daemon disconnected, resetting state");
+          resetRuntimeState();
+          resetBlobPort();
+        }),
+        switchMap(() =>
+          from(
+            invoke("reconnect_to_daemon")
+              .then(() => {
+                logger.debug("[daemon-kernel] Reconnected to daemon");
+                refreshBlobPort();
+              })
+              .catch((e: unknown) => {
+                logger.error("[daemon-kernel] Failed to reconnect:", e);
+              }),
+          ),
+        ),
+      )
+      .subscribe();
 
-    // Listen for daemon ready signal
-    const unlistenReady = webview.listen("daemon:ready", () => {
-      if (cancelled) return;
+    const readySub = fromTauriEvent("daemon:ready").subscribe(() => {
       logger.debug("[daemon-kernel] Daemon ready");
       refreshBlobPort();
     });
@@ -463,8 +471,8 @@ export function useDaemonKernel({
         busyTimerRef.current = null;
       }
       unsubscribeBroadcast();
-      unlistenDisconnect.then((fn) => fn()).catch(() => {});
-      unlistenReady.then((fn) => fn()).catch(() => {});
+      disconnectSub.unsubscribe();
+      readySub.unsubscribe();
     };
   }, []);
 
@@ -649,48 +657,62 @@ export function useDaemonKernel({
     [],
   );
 
-  // ── Connection health watchdog ──────────────────────────────────────
+  // ── Connection health watchdog (RxJS) ─────────────────────────────
   //
   // Detects broken daemon connections that the relay didn't catch (e.g.,
-  // daemon restarted during a pending request). If the kernel is supposed
-  // to be active (busy/idle/starting) but the connection is gone, trigger
-  // reconnection automatically so the user doesn't get stuck.
+  // daemon restarted during a pending request). Uses interval() piped
+  // through filter (kernel active?) → switchMap (check + reconnect).
+  //
+  // switchMap ensures only one health check is in flight at a time —
+  // if a check is slow, the next tick cancels it rather than stacking.
+
+  const kernelStatusRef = useRef(runtimeState.kernel.status);
+  kernelStatusRef.current = runtimeState.kernel.status;
+
   useEffect(() => {
     const HEALTH_CHECK_INTERVAL_MS = 10_000;
 
-    const intervalId = window.setInterval(async () => {
-      // Only check when kernel is expected to be running
-      const status = runtimeState.kernel.status;
-      if (status !== "busy" && status !== "idle" && status !== "starting") {
-        return;
-      }
-
-      try {
-        const connected = await invoke<boolean>("is_daemon_connected");
-        if (!connected) {
+    const healthSub = interval(HEALTH_CHECK_INTERVAL_MS)
+      .pipe(
+        filter(() => {
+          const status = kernelStatusRef.current;
+          return (
+            status === "busy" || status === "idle" || status === "starting"
+          );
+        }),
+        switchMap(() =>
+          from(invoke<boolean>("is_daemon_connected").catch(() => true)),
+        ),
+        filter((connected) => !connected),
+        switchMap(() => {
+          const status = kernelStatusRef.current;
           logger.warn(
             "[daemon-kernel] Health check: kernel status is '%s' but daemon disconnected, triggering reconnect",
             status,
           );
           resetRuntimeState();
           resetBlobPort();
-          try {
-            await invoke("reconnect_to_daemon");
-            logger.debug("[daemon-kernel] Health check reconnected");
-            refreshBlobPort();
-          } catch (e) {
-            logger.error("[daemon-kernel] Health check reconnect failed:", e);
-          }
-        }
-      } catch {
-        // invoke failed — window is likely closing, ignore
-      }
-    }, HEALTH_CHECK_INTERVAL_MS);
+          return from(
+            invoke("reconnect_to_daemon")
+              .then(() => {
+                logger.debug("[daemon-kernel] Health check reconnected");
+                refreshBlobPort();
+              })
+              .catch((e: unknown) => {
+                logger.error(
+                  "[daemon-kernel] Health check reconnect failed:",
+                  e,
+                );
+              }),
+          );
+        }),
+      )
+      .subscribe();
 
     return () => {
-      window.clearInterval(intervalId);
+      healthSub.unsubscribe();
     };
-  }, [runtimeState.kernel.status]);
+  }, []);
 
   return {
     /** Current kernel status (with busy throttle applied) */
