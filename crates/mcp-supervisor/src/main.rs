@@ -109,7 +109,7 @@ fn start_daemon(project_root: &Path) -> Option<std::process::Child> {
     }
 
     let mut cmd = std::process::Command::new(&runtimed);
-    cmd.args(["--dev", "run"])
+    cmd.args(["--dev", "--log-level", "info", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env("RUNTIMED_DEV", "1");
