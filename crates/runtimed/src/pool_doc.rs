@@ -67,7 +67,7 @@ impl PoolDoc {
     /// These operations on a fresh `AutoCommit` are infallible — there are no
     /// conflicting keys or invalid object IDs. The `expect` calls document this
     /// invariant rather than propagating impossible errors.
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, clippy::new_without_default)]
     pub fn new() -> Self {
         let mut doc = AutoCommit::new();
         doc.set_actor(automerge::ActorId::from(b"runtimed:pool".as_slice()));
