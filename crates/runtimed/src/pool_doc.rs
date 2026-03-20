@@ -396,22 +396,34 @@ mod tests {
                 client_doc
                     .sync()
                     .receive_sync_message(&mut client_to_server, msg)
-                    .unwrap();
+                    .expect("client should accept server sync message");
             }
             if let Some(msg) = msg_c {
                 server
                     .receive_sync_message(&mut server_to_client, msg)
-                    .unwrap();
+                    .expect("server should accept client sync message");
             }
         }
 
         // Client should have the same state
-        let (_, uv_id) = client_doc.get(ROOT, "uv").unwrap().unwrap();
-        let (avail, _) = client_doc.get(&uv_id, "available").unwrap().unwrap();
+        let (_, uv_id) = client_doc
+            .get(ROOT, "uv")
+            .expect("uv lookup should not error")
+            .expect("uv map should exist after sync");
+        let (avail, _) = client_doc
+            .get(&uv_id, "available")
+            .expect("available lookup should not error")
+            .expect("available field should exist after sync");
         assert_eq!(avail.to_u64(), Some(4));
 
-        let (_, conda_id) = client_doc.get(ROOT, "conda").unwrap().unwrap();
-        let (warming, _) = client_doc.get(&conda_id, "warming").unwrap().unwrap();
+        let (_, conda_id) = client_doc
+            .get(ROOT, "conda")
+            .expect("conda lookup should not error")
+            .expect("conda map should exist after sync");
+        let (warming, _) = client_doc
+            .get(&conda_id, "warming")
+            .expect("warming lookup should not error")
+            .expect("warming field should exist after sync");
         assert_eq!(warming.to_u64(), Some(2));
     }
 }
