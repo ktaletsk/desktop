@@ -1,9 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { debounceTime, from, Subject, switchMap } from "rxjs";
+import { from, switchMap } from "rxjs";
 import { getBlobPort, refreshBlobPort } from "../lib/blob-port";
-import { createFramePipeline } from "../lib/frame-pipeline";
-import { frame_types, sendFrame } from "../lib/frame-types";
 import { logger } from "../lib/logger";
 import {
   type CellSnapshot,
@@ -18,33 +16,36 @@ import {
   updateNotebookCells,
   useCellIds,
 } from "../lib/notebook-cells";
+import { subscribeBroadcast, emitBroadcast } from "../lib/notebook-frame-bus";
 import {
-  cloneNotebookFile,
-  openNotebookFile,
-  saveNotebook,
-} from "../lib/notebook-file-ops";
-import { subscribeBroadcast } from "../lib/notebook-frame-bus";
-import { setNotebookHandle } from "../lib/notebook-metadata";
-import { resetRuntimeState } from "../lib/runtime-state";
+  notifyMetadataChanged,
+  setNotebookHandle,
+} from "../lib/notebook-metadata";
+import { resetRuntimeState, setRuntimeState } from "../lib/runtime-state";
 import { fromTauriEvent } from "../lib/tauri-rx";
+import { TauriTransport } from "../lib/tauri-transport";
+import type { NotebookHandle } from "../wasm/runtimed-wasm/runtimed_wasm.js";
 import type { DaemonBroadcast, JupyterOutput } from "../types";
-import init, { NotebookHandle } from "../wasm/runtimed-wasm/runtimed_wasm.js";
 
-// Module-level WASM init — runs before React renders.
-const wasmReady: Promise<void> = init().then(() => {
-  logger.info("[automerge-notebook] WASM initialized");
-});
+import { SyncEngine } from "@nteract/runtimed";
 
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
+// ── WASM init ────────────────────────────────────────────────────────
+
+const wasmReady = (async () => {
+  const { default: init } =
+    await import("../wasm/runtimed-wasm/runtimed_wasm.js");
+  await init();
+})();
+
+// ── Hook ─────────────────────────────────────────────────────────────
 
 /**
- * Local-first notebook hook backed by `runtimed-wasm` NotebookHandle.
+ * Core Automerge notebook hook — manages the WASM document, sync lifecycle,
+ * and cell store.
  *
- * All document mutations execute instantly inside the WASM Automerge
- * document. The external store is derived from the doc. Sync messages
- * flow through the Tauri relay to the daemon.
+ * Uses {@link SyncEngine} from `@nteract/runtimed` for all sync management
+ * and {@link TauriTransport} for the IPC layer. The hook subscribes to engine
+ * events and writes to the React cell/runtime stores.
  */
 export function useAutomergeNotebook() {
   const cellIds = useCellIds();
@@ -53,12 +54,12 @@ export function useAutomergeNotebook() {
   const [isLoading, setIsLoading] = useState(true);
 
   const handleRef = useRef<NotebookHandle | null>(null);
-  const awaitingInitialSyncRef = useRef(true);
   const sessionIdRef = useRef(crypto.randomUUID().slice(0, 8));
   const outputCacheRef = useRef<Map<string, JupyterOutput>>(new Map());
 
-  // RxJS subjects for debounced outbound sync.
-  const sourceSync$ = useRef(new Subject<void>());
+  // SyncEngine + TauriTransport refs (stable across re-renders).
+  const engineRef = useRef<SyncEngine | null>(null);
+  const transportRef = useRef<TauriTransport | null>(null);
 
   // Refresh blob port on mount.
   useEffect(() => {
@@ -94,36 +95,6 @@ export function useAutomergeNotebook() {
     replaceNotebookCells(newCells);
   }, []);
 
-  /** Flush local CRDT changes to the Tauri relay (fire-and-forget).
-   *  Uses flush_local_changes + cancel_last_flush to prevent the sync
-   *  state consumption race from #1067. */
-  const syncToRelay = useCallback((handle: NotebookHandle) => {
-    const msg = handle.flush_local_changes();
-    if (msg) {
-      sendFrame(frame_types.AUTOMERGE_SYNC, msg).catch((e: unknown) => {
-        handle.cancel_last_flush();
-        logger.warn("[automerge-notebook] sync to relay failed:", e);
-      });
-    }
-
-    // Also initiate RuntimeStateDoc sync so the daemon sends kernel status,
-    // trust state, etc. Without this, if the daemon's initial RuntimeStateSync
-    // frame arrived before the WASM handle was ready, the frontend would stay
-    // stuck on "not_started" with no way to recover (#runtime-state-race).
-    const stateMsg = handle.flush_runtime_state_sync();
-    if (stateMsg) {
-      sendFrame(frame_types.RUNTIME_STATE_SYNC, stateMsg).catch(
-        (e: unknown) => {
-          handle.cancel_last_runtime_state_flush();
-          logger.warn(
-            "[automerge-notebook] runtime state sync to relay failed:",
-            e,
-          );
-        },
-      );
-    }
-  }, []);
-
   /** Sync re-read cells from WASM (cache-only, no blob fetches). */
   const rematerializeCellsSync = useCallback((handle: NotebookHandle) => {
     const json = handle.get_cells_json();
@@ -138,19 +109,20 @@ export function useAutomergeNotebook() {
   /**
    * Guard + commit helper for WASM mutations.
    * Returns the handle if ready, or null if bootstrapping.
-   * After the mutation callback runs, re-materializes and syncs.
+   * After the mutation callback runs, re-materializes and schedules sync.
    */
   const commitMutation = useCallback(
     (mutate: (handle: NotebookHandle) => boolean) => {
       const handle = handleRef.current;
-      if (!handle || awaitingInitialSyncRef.current) return false;
+      const engine = engineRef.current;
+      if (!handle || !engine || !engine.synced) return false;
       if (!mutate(handle)) return false;
       rematerializeCellsSync(handle);
-      syncToRelay(handle);
+      engine.scheduleFlush();
       setDirty(true);
       return true;
     },
-    [rematerializeCellsSync, syncToRelay],
+    [rematerializeCellsSync],
   );
 
   // ── Bootstrap ──────────────────────────────────────────────────────
@@ -158,33 +130,117 @@ export function useAutomergeNotebook() {
   const bootstrap = useCallback(async () => {
     await wasmReady;
 
-    const handle = NotebookHandle.create_empty_with_actor(
-      `human:${sessionIdRef.current}`,
-    );
+    // Create WASM handle.
+    const { NotebookHandle: NH } =
+      await import("../wasm/runtimed-wasm/runtimed_wasm.js");
+    const handle: NotebookHandle = (
+      NH as typeof NotebookHandle
+    ).create_empty_with_actor(`human:${sessionIdRef.current}`);
 
+    // Clean up previous handle.
     handleRef.current?.free();
     handleRef.current = handle;
     setNotebookHandle(handle);
 
-    awaitingInitialSyncRef.current = true;
-    setIsLoading(true);
+    // Clean up previous engine + transport.
+    engineRef.current?.stop();
+    transportRef.current?.disconnect();
 
-    syncToRelay(handle);
-    logger.info("[automerge-notebook] Bootstrap: empty handle, awaiting sync");
+    // Create transport + engine.
+    const transport = new TauriTransport();
+    await transport.connect();
+    transportRef.current = transport;
+
+    const engine = new SyncEngine(handle, transport, {
+      flushDebounceMs: 20,
+      initialSyncTimeoutMs: 3000,
+    });
+    engineRef.current = engine;
+
+    // ── Subscribe to engine events ───────────────────────────────
+
+    engine.on("initial_sync_complete", () => {
+      setIsLoading(false);
+      // Full materialization on initial sync.
+      const h = handleRef.current;
+      if (h) {
+        materializeCells(h)
+          .then(() => {
+            notifyMetadataChanged();
+          })
+          .catch((err: unknown) => {
+            logger.warn(
+              "[automerge-notebook] initial materialize failed:",
+              err,
+            );
+            setIsLoading(false);
+          });
+      }
+    });
+
+    engine.on("cells_changed", (event) => {
+      // Re-materialize from WASM after inbound sync changes.
+      // For now, full re-materialize. The frame pipeline's coalescing
+      // and incremental materialization can be layered on top later.
+      const h = handleRef.current;
+      if (h) {
+        // Emit text attributions as broadcasts for CodeMirror.
+        if (event.attributions && event.attributions.length > 0) {
+          emitBroadcast({
+            type: "text_attribution",
+            attributions: event.attributions,
+          });
+        }
+
+        // Sync re-read (cache-only) for fast visual feedback.
+        // TODO: Use incremental materialization with changeset for
+        // output-heavy cells (blob resolution). For now, sync read
+        // is fast enough for source/metadata changes and outputs
+        // that are already cached.
+        rematerializeCellsSync(h);
+      }
+    });
+
+    engine.on("broadcast", (event) => {
+      emitBroadcast(event.payload);
+    });
+
+    engine.on("runtime_state_changed", (event) => {
+      setRuntimeState(
+        event.state as import("../lib/runtime-state").RuntimeState,
+      );
+    });
+
+    engine.on("sync_retry", () => {
+      logger.info("[automerge-notebook] SyncEngine retrying initial sync");
+    });
+
+    engine.on("error", (event) => {
+      logger.warn(
+        `[automerge-notebook] SyncEngine error (${event.context}):`,
+        event.error,
+      );
+    });
+
+    // Start the engine — sends initial sync, arms retry timer.
+    engine.start();
+
+    setIsLoading(true);
+    logger.info(
+      "[automerge-notebook] Bootstrap: SyncEngine started, awaiting sync",
+    );
     return true;
-  }, [syncToRelay]);
+  }, [materializeCells, rematerializeCellsSync]);
 
   // ── Lifecycle (single effect) ──────────────────────────────────────
 
   useEffect(() => {
     let cancelled = false;
 
-    awaitingInitialSyncRef.current = true;
     setIsLoading(true);
     void bootstrap().catch((error) => {
       logger.error("[automerge-notebook] Bootstrap failed", error);
       if (!cancelled) {
-        awaitingInitialSyncRef.current = false;
         setIsLoading(false);
       }
     });
@@ -197,7 +253,6 @@ export function useAutomergeNotebook() {
           refreshBlobPort();
           resetNotebookCells();
           resetRuntimeState();
-          awaitingInitialSyncRef.current = true;
           setIsLoading(true);
           return from(
             bootstrap().catch((err: unknown) => {
@@ -210,35 +265,6 @@ export function useAutomergeNotebook() {
         }),
       )
       .subscribe();
-
-    // Inbound frame pipeline (WASM demux → coalesce → materialize → store).
-    const frameSub = createFramePipeline({
-      getHandle: () => handleRef.current,
-      getAwaitingInitialSync: () => awaitingInitialSyncRef.current,
-      setAwaitingInitialSync: (v) => {
-        awaitingInitialSyncRef.current = v;
-      },
-      setIsLoading,
-      materializeCells,
-      outputCache: outputCacheRef.current,
-      retrySyncToRelay: () => {
-        const handle = handleRef.current;
-        if (!handle) return;
-        // Reset sync state so flush_local_changes() produces a fresh
-        // request instead of returning null (which it does when the
-        // handle believes it's already in sync with the peer).
-        handle.reset_sync_state();
-        syncToRelay(handle);
-      },
-    });
-
-    // Source sync: 20ms debounce for batching rapid keystrokes.
-    const sourceSyncSub = sourceSync$.current
-      .pipe(debounceTime(20))
-      .subscribe(() => {
-        const handle = handleRef.current;
-        if (handle) syncToRelay(handle);
-      });
 
     // Bulk output clearing (run-all / restart-and-run-all).
     const clearOutputsSub = fromTauriEvent<string[]>(
@@ -256,15 +282,16 @@ export function useAutomergeNotebook() {
 
     return () => {
       cancelled = true;
-      frameSub.unsubscribe();
       lifecycleSub.unsubscribe();
-      sourceSyncSub.unsubscribe();
       clearOutputsSub.unsubscribe();
 
-      // Flush pending local changes before freeing handle.
-      if (handleRef.current) {
-        syncToRelay(handleRef.current);
-      }
+      // Stop the engine (flushes pending changes).
+      engineRef.current?.stop();
+      engineRef.current = null;
+
+      // Disconnect transport.
+      transportRef.current?.disconnect();
+      transportRef.current = null;
 
       resetNotebookCells();
       resetRuntimeState();
@@ -272,33 +299,34 @@ export function useAutomergeNotebook() {
       handleRef.current?.free();
       handleRef.current = null;
     };
-  }, [bootstrap, materializeCells, syncToRelay]);
+  }, [bootstrap]);
 
   // ── Cell mutations ─────────────────────────────────────────────────
 
   const updateCellSource = useCallback((cellId: string, source: string) => {
     const handle = handleRef.current;
-    if (!handle || awaitingInitialSyncRef.current) return;
+    const engine = engineRef.current;
+    if (!handle || !engine || !engine.synced) return;
 
     const updated = handle.update_source(cellId, source);
     if (!updated) return;
 
     updateCellById(cellId, (c) => ({ ...c, source }));
-    sourceSync$.current.next();
+    engine.scheduleFlush();
     setDirty(true);
   }, []);
 
   /**
    * Clear outputs for a local UI action (Ctrl-Enter, menu clear).
-   * Writes to the CRDT first so the store stays in sync with the
-   * source of truth, then updates the store for instant feedback.
+   * Writes to WASM CRDT + React store optimistically, then syncs.
    */
   const clearOutputsLocal = useCallback((cellId: string) => {
     const handle = handleRef.current;
+    const engine = engineRef.current;
     if (handle) {
       handle.clear_outputs(cellId);
       handle.set_execution_count(cellId, "null");
-      sourceSync$.current.next();
+      engine?.scheduleFlush();
       setDirty(true);
     }
 
@@ -310,16 +338,17 @@ export function useAutomergeNotebook() {
   }, []);
 
   /**
-   * Clear outputs from every code cell via a single WASM call.
-   * Updates the CRDT atomically, then refreshes the store.
+   * Clear all outputs for a local UI action (restart-and-run-all, menu).
+   * Returns the list of cell IDs that were cleared.
    */
   const clearAllOutputsLocal = useCallback(() => {
     const handle = handleRef.current;
+    const engine = engineRef.current;
     if (!handle) return;
     const clearedIds: string[] = handle.clear_all_outputs();
     if (clearedIds.length === 0) return;
 
-    sourceSync$.current.next();
+    engine?.scheduleFlush();
     setDirty(true);
 
     const clearedSet = new Set(clearedIds);
@@ -332,11 +361,7 @@ export function useAutomergeNotebook() {
     );
   }, []);
 
-  /**
-   * Apply a daemon output-clear into the store. Store-only —
-   * the daemon already wrote to the CRDT, so we just update the
-   * local store. No CRDT mutation, no sync, no dirty flag.
-   */
+  /** Clear outputs when notified by a broadcast from another window. */
   const clearOutputsFromDaemon = useCallback((cellId: string) => {
     updateCellById(cellId, (c) =>
       c.cell_type === "code" ? { ...c, outputs: [], execution_count: null } : c,
@@ -344,55 +369,93 @@ export function useAutomergeNotebook() {
   }, []);
 
   const addCell = useCallback(
-    (cellType: "code" | "markdown" | "raw", afterCellId?: string | null) => {
+    (
+      afterCellId: string | null,
+      cellType: "code" | "markdown",
+      initialSource?: string,
+    ) => {
       const handle = handleRef.current;
+      const engine = engineRef.current;
+      if (!handle || !engine || !engine.synced) return null;
 
-      if (!handle || awaitingInitialSyncRef.current) {
-        const placeholderId = crypto.randomUUID();
-        return cellType === "code"
-          ? {
-              cell_type: "code" as const,
-              id: placeholderId,
-              source: "",
-              outputs: [],
-              execution_count: null,
-              metadata: {},
-            }
-          : {
-              cell_type: cellType,
-              id: placeholderId,
-              source: "",
-              metadata: {},
-            };
+      const placeholderId = crypto.randomUUID();
+
+      // Optimistic store write for instant placeholder rendering.
+      if (cellType === "code") {
+        updateNotebookCells((prev) => {
+          const idx = afterCellId
+            ? prev.findIndex((c) => c.id === afterCellId) + 1
+            : 0;
+          const newCell = {
+            cell_type: cellType as "code",
+            id: placeholderId,
+            source: initialSource ?? "",
+            outputs: [],
+            execution_count: null,
+            metadata: {},
+          };
+          const next = [...prev];
+          next.splice(idx, 0, newCell);
+          return next;
+        });
+      } else {
+        updateNotebookCells((prev) => {
+          const idx = afterCellId
+            ? prev.findIndex((c) => c.id === afterCellId) + 1
+            : 0;
+          const newCell = {
+            cell_type: cellType as "markdown",
+            id: placeholderId,
+            source: initialSource ?? "",
+            metadata: {},
+          };
+          const next = [...prev];
+          next.splice(idx, 0, newCell);
+          return next;
+        });
       }
 
-      const cellId = crypto.randomUUID();
-      handle.add_cell_after(cellId, cellType, afterCellId ?? null);
-      rematerializeCellsSync(handle);
-      syncToRelay(handle);
-      setFocusedCellId(cellId);
-      setDirty(true);
+      // CRDT mutation — this generates the real cell ID.
+      const cellId = placeholderId;
+      handle.add_cell_after(cellId, cellType, afterCellId ?? undefined);
+      if (initialSource) {
+        handle.update_source(cellId, initialSource);
+      }
 
-      const cell = getNotebookCellsSnapshot().find((c) => c.id === cellId);
-      return (
-        cell ?? {
-          cell_type: cellType,
-          id: cellId,
-          source: "",
-          ...(cellType === "code"
-            ? { outputs: [], execution_count: null }
-            : {}),
-          metadata: {},
+      // Re-read from WASM to get the canonical state (replaces placeholder).
+      const cell = handle.get_cell(cellId);
+      if (cell) {
+        if (cell.cell_type === "code") {
+          updateCellById(cellId, () => ({
+            cell_type: "code" as const,
+            id: cell.id,
+            source: cell.source,
+            outputs: [],
+            execution_count: null,
+            metadata: cell.metadata_json ? JSON.parse(cell.metadata_json) : {},
+          }));
+        } else {
+          updateCellById(cellId, () => ({
+            cell_type: cell.cell_type as "markdown" | "raw",
+            id: cell.id,
+            source: cell.source,
+            metadata: cell.metadata_json ? JSON.parse(cell.metadata_json) : {},
+          }));
         }
-      );
+        cell.free();
+      }
+
+      engine.scheduleFlush();
+      setDirty(true);
+      return cellId;
     },
-    [rematerializeCellsSync, syncToRelay],
+    [],
   );
 
   const moveCell = useCallback(
-    (cellId: string, afterCellId?: string | null) => {
+    (cellId: string, afterCellId: string | null) => {
       commitMutation((handle) => {
-        handle.move_cell(cellId, afterCellId ?? null);
+        handle.move_cell(cellId, afterCellId ?? undefined);
         return true;
       });
     },
@@ -402,8 +465,7 @@ export function useAutomergeNotebook() {
   const deleteCell = useCallback(
     (cellId: string) => {
       commitMutation((handle) => {
-        if (handle.cell_count() <= 1) return false;
-        return !!handle.delete_cell(cellId);
+        return handle.delete_cell(cellId);
       });
     },
     [commitMutation],
@@ -412,7 +474,7 @@ export function useAutomergeNotebook() {
   const setCellSourceHidden = useCallback(
     (cellId: string, hidden: boolean) => {
       commitMutation((handle) => {
-        return !!handle.set_cell_source_hidden(cellId, hidden);
+        return handle.set_cell_source_hidden(cellId, hidden);
       });
     },
     [commitMutation],
@@ -421,43 +483,46 @@ export function useAutomergeNotebook() {
   const setCellOutputsHidden = useCallback(
     (cellId: string, hidden: boolean) => {
       commitMutation((handle) => {
-        return !!handle.set_cell_outputs_hidden(cellId, hidden);
+        return handle.set_cell_outputs_hidden(cellId, hidden);
       });
     },
     [commitMutation],
   );
 
-  // ── Sync flush ─────────────────────────────────────────────────────
+  // ── Sync operations ────────────────────────────────────────────────
 
-  /** Flush pending debounced sync immediately (call before execute/save). */
+  /**
+   * Flush local CRDT changes immediately (bypasses debounce).
+   *
+   * Call before operations that depend on the daemon having the latest
+   * state, e.g., before `executeCell` or `save`.
+   */
   const flushSync = useCallback(async () => {
-    const handle = handleRef.current;
-    if (!handle) return;
-    // Bypasses the debounce; any pending emission becomes a no-op.
-    const msg = handle.flush_local_changes();
-    if (msg) {
-      try {
-        await sendFrame(frame_types.AUTOMERGE_SYNC, msg);
-      } catch (e) {
-        // flush_local_changes advanced sync_state (in_flight, sent_hashes).
-        // Cancel to prevent sent_hashes from permanently filtering out
-        // the change data we never delivered (#1067).
-        handle.cancel_last_flush();
-        logger.warn("[flushSync] failed, rolled back sync state", e);
-      }
+    const engine = engineRef.current;
+    if (!engine) return;
+    try {
+      await engine.flush();
+    } catch (e) {
+      // flush() already rolled back sync state via cancel_last_flush.
+      logger.warn("[flushSync] failed, sync state rolled back", e);
     }
   }, []);
 
   // ── File operations ────────────────────────────────────────────────
 
   const save = useCallback(async () => {
+    const { saveNotebook } = await import("../lib/notebook-file-ops");
     const saved = await saveNotebook(flushSync);
     if (saved) setDirty(false);
   }, [flushSync]);
 
-  const openNotebook = useCallback(() => openNotebookFile(), []);
+  const openNotebook = useCallback(() => {
+    import("../lib/notebook-file-ops").then((m) => m.openNotebookFile());
+  }, []);
 
-  const cloneNotebook = useCallback(() => cloneNotebookFile(), []);
+  const cloneNotebook = useCallback(() => {
+    import("../lib/notebook-file-ops").then((m) => m.cloneNotebookFile());
+  }, []);
 
   // ── Output overlays (optimistic, pre-sync) ─────────────────────────
 
@@ -478,7 +543,11 @@ export function useAutomergeNotebook() {
               output.display_id === displayId
             ) {
               changed = true;
-              return { ...output, data: newData, metadata: newMetadata };
+              return {
+                ...output,
+                data: { ...output.data, ...newData },
+                metadata: { ...output.metadata, ...newMetadata },
+              };
             }
             return output;
           });
@@ -490,32 +559,34 @@ export function useAutomergeNotebook() {
   );
 
   /**
-   * Apply a daemon execution-count update into the store. Store-only —
-   * the daemon already wrote to the CRDT.
+   * Apply execution count from daemon broadcast (optimistic overlay).
+   * The CRDT will catch up via sync, but this gives instant visual feedback.
    */
   const applyExecutionCountFromDaemon = useCallback(
-    (cellId: string, count: number) => {
+    (cellId: string, executionCount: number) => {
       updateCellById(cellId, (c) =>
-        c.cell_type === "code" ? { ...c, execution_count: count } : c,
+        c.cell_type === "code" ? { ...c, execution_count: executionCount } : c,
       );
     },
     [],
   );
 
-  // ── Public interface ───────────────────────────────────────────────
-
   // ── CRDT bridge deps ───────────────────────────────────────────────
   // Stable getter for the WASM handle (reads ref at call time).
   const getHandle = useCallback(() => handleRef.current, []);
-  // Trigger a debounced sync to the daemon (same Subject the old
-  // updateCellSource used via sourceSync$).
-  const triggerSync = useCallback(() => sourceSync$.current.next(), []);
+  // Trigger a debounced sync to the daemon.
+  const triggerSync = useCallback(() => {
+    engineRef.current?.scheduleFlush();
+  }, []);
 
   return {
     cellIds,
-    isLoading,
     focusedCellId,
     setFocusedCellId,
+    dirty,
+    isLoading,
+
+    // Cell mutations
     updateCellSource,
     clearOutputsLocal,
     clearAllOutputsLocal,
@@ -523,18 +594,26 @@ export function useAutomergeNotebook() {
     addCell,
     moveCell,
     deleteCell,
+    setCellSourceHidden,
+    setCellOutputsHidden,
+
+    // Sync
+    flushSync,
+
+    // File operations
     save,
     openNotebook,
     cloneNotebook,
-    dirty,
-    setDirty,
+
+    // Output overlays
     updateOutputByDisplayId,
     applyExecutionCountFromDaemon,
-    setCellSourceHidden,
-    setCellOutputsHidden,
-    flushSync,
-    // CRDT bridge context deps
+
+    // For child components that need direct WASM access
     getHandle,
     triggerSync,
+
+    // Snapshot for save/export
+    getNotebookCellsSnapshot,
   };
 }

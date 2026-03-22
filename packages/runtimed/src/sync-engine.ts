@@ -19,7 +19,7 @@
  * @module
  */
 
-import type { NotebookTransport, FrameTypeValue } from "./transport.ts";
+import type { NotebookTransport } from "./transport.ts";
 import { FrameType } from "./transport.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -135,7 +135,11 @@ export interface UnknownFrameEvent {
  * state changes.
  */
 export type SyncEngineEvent =
-  | { type: "cells_changed"; changeset: CellChangeset | null; attributions: TextAttribution[] }
+  | {
+      type: "cells_changed";
+      changeset: CellChangeset | null;
+      attributions: TextAttribution[];
+    }
   | { type: "initial_sync_complete" }
   | { type: "broadcast"; payload: unknown }
   | { type: "presence"; payload: unknown }
@@ -468,10 +472,12 @@ export class SyncEngine {
     try {
       const msg = this.#handle.flush_local_changes();
       if (msg) {
-        this.#transport.sendFrame(FrameType.AUTOMERGE_SYNC, msg).catch((err) => {
-          this.#handle.cancel_last_flush();
-          this.#emit({ type: "error", error: err, context: "flush_send" });
-        });
+        this.#transport
+          .sendFrame(FrameType.AUTOMERGE_SYNC, msg)
+          .catch((err) => {
+            this.#handle.cancel_last_flush();
+            this.#emit({ type: "error", error: err, context: "flush_send" });
+          });
       }
     } catch (err) {
       this.#emit({ type: "error", error: err, context: "flush_local_changes" });
