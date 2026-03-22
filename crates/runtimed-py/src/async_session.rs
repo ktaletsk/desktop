@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::error::to_py_err;
 use crate::event_stream::ExecutionEventStream;
+
 use crate::output::{Cell, PyRuntimeState};
 use crate::session_core::{self, SessionState};
 use crate::subscription::EventSubscription;
@@ -1008,6 +1009,24 @@ impl AsyncSession {
         let cell_id = cell_id.to_string();
         future_into_py(py, async move {
             session_core::queue_cell(&state, &notebook_id, &cell_id).await
+        })
+    }
+
+    /// Submit a cell for execution, returning an Execution handle.
+    ///
+    /// Unlike `execute_cell()` which blocks until completion, this returns
+    /// immediately with a handle that can be used to observe or cancel the
+    /// execution.
+    ///
+    /// Args:
+    ///     cell_id: The cell ID to execute.
+    ///
+    /// Returns a coroutine that resolves to an Execution handle.
+    fn execute<'py>(&self, py: Python<'py>, cell_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let notebook_id = self.notebook_id.clone();
+        future_into_py(py, async move {
+            session_core::execute_cell_handle(&state, &notebook_id, &cell_id).await
         })
     }
 

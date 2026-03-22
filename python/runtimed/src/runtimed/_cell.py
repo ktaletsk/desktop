@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from runtimed.runtimed import (
         AsyncSession,
         Cell,
+        Execution,
         ExecutionEvent,
         ExecutionResult,
         Output,
@@ -125,13 +126,37 @@ class CellHandle:
         await self._session.set_cell_type(self._id, cell_type)
         return self
 
+    async def execute(self) -> Execution:
+        """Submit this cell for execution and return a handle to track it.
+
+        The cell's outputs update through the CRDT regardless of whether
+        anyone holds the returned handle. Use it to observe the execution::
+
+            execution = await cell.execute()
+            result = await execution.result(timeout=30)
+
+        Or stream events::
+
+            execution = await cell.execute()
+            async for event in execution.stream():
+                print(event)
+        """
+        return await self._session.execute(self._id)
+
     async def run(self, timeout_secs: float = 60.0) -> ExecutionResult:
-        """Execute this cell and wait for results."""
-        return await self._session.execute_cell(self._id, timeout_secs)
+        """Execute this cell and wait for results.
+
+        Sugar for ``(await cell.execute()).result(timeout=timeout_secs)``.
+        """
+        execution = await self.execute()
+        return await execution.result(timeout=timeout_secs)
 
     async def queue(self) -> CellHandle:
-        """Queue this cell for execution without waiting."""
-        await self._session.queue_cell(self._id)
+        """Queue this cell for execution without waiting.
+
+        Sugar for ``await cell.execute()`` with the handle discarded.
+        """
+        await self.execute()
         return self
 
     async def delete(self) -> None:
@@ -171,15 +196,14 @@ class CellHandle:
     ) -> AsyncIterator[ExecutionEvent]:
         """Execute and stream events as an async iterator.
 
+        Sugar for ``(await cell.execute()).stream(...)``.
+
         Yields ``ExecutionEvent`` objects until execution completes.
         Use ``signal_only=True`` to receive only start/done signals
         without output payloads.
         """
-        return await self._session.stream_execute(
-            self._id,
-            timeout_secs,
-            signal_only,
-        )
+        execution = await self.execute()
+        return execution.stream(timeout_secs=timeout_secs, signal_only=signal_only)
 
     def __repr__(self) -> str:
         return f"Cell({self._id[:8]}, {self.cell_type})"

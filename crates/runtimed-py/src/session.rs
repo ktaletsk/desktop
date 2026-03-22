@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::error::to_py_err;
 use crate::event_stream::ExecutionEventIterator;
+use crate::execution::Execution;
 use crate::output::{Cell, ExecutionResult, NotebookConnectionInfo, SyncEnvironmentResult};
 use crate::session_core::{self, SessionState};
 use crate::subscription::EventIteratorSubscription;
@@ -797,6 +798,25 @@ impl Session {
     /// Queue a cell for execution without waiting for the result.
     fn queue_cell(&self, cell_id: &str) -> PyResult<()> {
         self.runtime.block_on(session_core::queue_cell(
+            &self.state,
+            &self.notebook_id,
+            cell_id,
+        ))
+    }
+
+    /// Submit a cell for execution, returning an Execution handle.
+    ///
+    /// Unlike `execute_cell()` which blocks until completion, this returns
+    /// immediately with a handle that can be used to observe or cancel the
+    /// execution.
+    ///
+    /// Args:
+    ///     cell_id: The cell ID to execute.
+    ///
+    /// Returns:
+    ///     An Execution handle.
+    fn execute(&self, cell_id: &str) -> PyResult<Execution> {
+        self.runtime.block_on(session_core::execute_cell_handle(
             &self.state,
             &self.notebook_id,
             cell_id,

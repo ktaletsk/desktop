@@ -18,6 +18,7 @@ mod client;
 mod daemon_paths;
 mod error;
 mod event_stream;
+mod execution;
 mod output;
 mod output_resolver;
 mod session;
@@ -29,6 +30,7 @@ use async_session::AsyncSession;
 use client::Client;
 use error::RuntimedError;
 use event_stream::{ExecutionEventIterator, ExecutionEventStream};
+use execution::Execution;
 use output::{
     Cell, CompletionItem, CompletionResult, ExecutionEvent, ExecutionResult, HistoryEntry,
     NotebookConnectionInfo, Output, PyEnvState, PyKernelState, PyRuntimeState, QueueState,
@@ -77,6 +79,9 @@ fn runtimed(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Iterator types for streaming execution
     m.add_class::<ExecutionEventStream>()?;
     m.add_class::<ExecutionEventIterator>()?;
+
+    // Execution handle
+    m.add_class::<Execution>()?;
 
     // Subscription types for independent event listening
     m.add_class::<EventSubscription>()?;

@@ -21,6 +21,7 @@ from runtimed.runtimed import (  # noqa: F401
     CompletionItem,
     CompletionResult,
     EnvState,
+    Execution,
     ExecutionEvent,
     ExecutionResult,
     HistoryEntry,

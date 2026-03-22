@@ -1149,6 +1149,61 @@ pub(crate) async fn queue_cell(
     }
 }
 
+/// Submit a cell for execution and return an Execution handle.
+///
+/// This is the primitive that `session.execute()` calls. It sends the
+/// ExecuteCell request, gets back the execution_id, and constructs
+/// an Execution handle without waiting for results.
+pub(crate) async fn execute_cell_handle(
+    state: &Arc<Mutex<SessionState>>,
+    notebook_id: &str,
+    cell_id: &str,
+) -> PyResult<crate::execution::Execution> {
+    // Auto-start kernel if not running
+    {
+        let st = state.lock().await;
+        if !st.kernel_started {
+            drop(st);
+            ensure_kernel_started(state, notebook_id).await?;
+        }
+    }
+
+    // Emit focus presence — executing the cell
+    emit_focus_presence(state, cell_id).await;
+
+    let st = state.lock().await;
+    let handle = st
+        .handle
+        .as_ref()
+        .ok_or_else(|| to_py_err("Not connected"))?;
+
+    handle.confirm_sync().await.map_err(to_py_err)?;
+
+    let response = handle
+        .send_request(NotebookRequest::ExecuteCell {
+            cell_id: cell_id.to_string(),
+        })
+        .await
+        .map_err(to_py_err)?;
+
+    let execution_id = match response {
+        NotebookResponse::CellQueued { execution_id, .. } => execution_id,
+        NotebookResponse::Error { error } => return Err(to_py_err(error)),
+        other => return Err(to_py_err(format!("Unexpected response: {:?}", other))),
+    };
+
+    let blob_base_url = st.blob_base_url.clone();
+    let blob_store_path = st.blob_store_path.clone();
+
+    Ok(crate::execution::Execution {
+        execution_id,
+        cell_id: cell_id.to_string(),
+        state: Arc::clone(state),
+        blob_base_url,
+        blob_store_path,
+    })
+}
+
 /// Wait for execution to complete, then read outputs from the Automerge doc.
 ///
 /// Uses the broadcast stream only as a signal for when execution is done.
