@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { logger } from "../lib/logger";
 
 /** Trust status from the backend */
@@ -89,11 +89,40 @@ export function useTrust() {
     checkTrust();
   }, [checkTrust]);
 
-  // Re-check trust when daemon (re)connects — handles the startup race where
-  // the initial mount-time check fires before the relay handle is stored.
+  // Use needs_trust_approval from daemon:ready payload as the authoritative
+  // initial trust state. The daemon computes this from the .ipynb file during
+  // room creation — before the Automerge doc is populated via streaming load.
+  // Without this, checkTrust() queries the Automerge doc which may still be
+  // empty, returning NoDependencies and skipping the trust dialog.
+  const hasReceivedDaemonReady = useRef(false);
   useEffect(() => {
     const webview = getCurrentWebview();
-    const unlistenReady = webview.listen("daemon:ready", () => {
+    const unlistenReady = webview.listen<{
+      notebook_id: string;
+      cell_count: number;
+      needs_trust_approval: boolean;
+    }>("daemon:ready", (event) => {
+      const { needs_trust_approval } = event.payload;
+      hasReceivedDaemonReady.current = true;
+
+      if (needs_trust_approval) {
+        // The daemon says this notebook has untrusted deps — set a provisional
+        // "untrusted" state immediately so the dialog appears, then do the full
+        // check to get dependency details (dep names, typosquat warnings, etc.)
+        logger.info(
+          "[trust] daemon:ready says needs_trust_approval=true, showing dialog",
+        );
+        setTrustInfo({
+          status: "untrusted",
+          uv_dependencies: [],
+          conda_dependencies: [],
+          conda_channels: [],
+        });
+      }
+
+      // Full check to populate dependency lists and typosquat warnings.
+      // This reads from the Automerge doc which may now have metadata
+      // (streaming load may have completed by the time this runs).
       checkTrust();
     });
     return () => {
