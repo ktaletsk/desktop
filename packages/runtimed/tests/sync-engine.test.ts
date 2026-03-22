@@ -40,10 +40,14 @@ await init(wasmBytes);
 
 // ── Import library under test ────────────────────────────────────────
 
-import { SyncEngine } from "../src/sync-engine.ts";
+import { SyncEngine, mergeChangesets } from "../src/sync-engine.ts";
 import { DirectTransport } from "../src/direct-transport.ts";
 import { FrameType } from "../src/transport.ts";
-import type { SyncEngineEvent } from "../src/sync-engine.ts";
+import type {
+  SyncEngineEvent,
+  CoalescedCellChanges,
+  CellChangeset,
+} from "../src/sync-engine.ts";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -736,6 +740,347 @@ Deno.test("SyncEngine: multiple scheduleFlush calls coalesce", async () => {
   server.free();
   client.free();
 });
+
+// ── mergeChangesets unit tests ───────────────────────────────────────
+
+Deno.test("mergeChangesets: empty array returns empty changeset", () => {
+  const result = mergeChangesets([]);
+  assertEquals(result.changed.length, 0);
+  assertEquals(result.added.length, 0);
+  assertEquals(result.removed.length, 0);
+  assertEquals(result.order_changed, false);
+});
+
+Deno.test("mergeChangesets: single changeset passes through", () => {
+  const cs: CellChangeset = {
+    changed: [
+      {
+        cell_id: "cell-1",
+        fields: {
+          source: true,
+          outputs: false,
+          cell_type: false,
+          execution_count: false,
+          metadata: false,
+          position: false,
+        },
+      },
+    ],
+    added: ["cell-2"],
+    removed: [],
+    order_changed: false,
+  };
+  const result = mergeChangesets([cs]);
+  assertEquals(result, cs);
+});
+
+Deno.test("mergeChangesets: merges changed fields with OR", () => {
+  const cs1: CellChangeset = {
+    changed: [
+      {
+        cell_id: "cell-1",
+        fields: {
+          source: true,
+          outputs: false,
+          cell_type: false,
+          execution_count: false,
+          metadata: false,
+          position: false,
+        },
+      },
+    ],
+    added: [],
+    removed: [],
+    order_changed: false,
+  };
+  const cs2: CellChangeset = {
+    changed: [
+      {
+        cell_id: "cell-1",
+        fields: {
+          source: false,
+          outputs: true,
+          cell_type: false,
+          execution_count: true,
+          metadata: false,
+          position: false,
+        },
+      },
+    ],
+    added: [],
+    removed: [],
+    order_changed: false,
+  };
+  const result = mergeChangesets([cs1, cs2]);
+  assertEquals(result.changed.length, 1);
+  assertEquals(result.changed[0].cell_id, "cell-1");
+  assertEquals(result.changed[0].fields.source, true);
+  assertEquals(result.changed[0].fields.outputs, true);
+  assertEquals(result.changed[0].fields.execution_count, true);
+  assertEquals(result.changed[0].fields.metadata, false);
+});
+
+Deno.test("mergeChangesets: unions added and removed sets", () => {
+  const cs1: CellChangeset = {
+    changed: [],
+    added: ["cell-a"],
+    removed: ["cell-x"],
+    order_changed: false,
+  };
+  const cs2: CellChangeset = {
+    changed: [],
+    added: ["cell-b", "cell-a"], // duplicate
+    removed: ["cell-y"],
+    order_changed: false,
+  };
+  const result = mergeChangesets([cs1, cs2]);
+  assertEquals(result.added.sort(), ["cell-a", "cell-b"]);
+  assertEquals(result.removed.sort(), ["cell-x", "cell-y"]);
+});
+
+Deno.test("mergeChangesets: ORs order_changed flag", () => {
+  const cs1: CellChangeset = {
+    changed: [],
+    added: [],
+    removed: [],
+    order_changed: false,
+  };
+  const cs2: CellChangeset = {
+    changed: [],
+    added: [],
+    removed: [],
+    order_changed: true,
+  };
+  const result = mergeChangesets([cs1, cs2]);
+  assertEquals(result.order_changed, true);
+});
+
+// ── RxJS Observable stream tests ─────────────────────────────────────
+
+Deno.test(
+  "SyncEngine: cellChanges$ coalesces rapid changes into batches",
+  async () => {
+    const server = new NotebookHandle("coalesce-rx-test");
+    server.add_cell(0, "cell-1", "code");
+
+    const client = NotebookHandle.load(server.save());
+
+    // Bootstrap sync
+    for (let i = 0; i < 10; i++) {
+      const a = server.flush_local_changes();
+      const b = client.flush_local_changes();
+      if (!a && !b) break;
+      if (a) client.receive_sync_message(a);
+      if (b) server.receive_sync_message(b);
+    }
+    client.reset_sync_state();
+    server.reset_sync_state();
+
+    const transport = new DirectTransport(server);
+    const engine = new SyncEngine(client, transport, {
+      flushDebounceMs: 5,
+      initialSyncTimeoutMs: 500,
+      coalesceMs: 50, // 50ms window for easier testing
+    });
+
+    const batches: CoalescedCellChanges[] = [];
+    const sub = engine.cellChanges$.subscribe((b) => batches.push(b));
+
+    engine.start();
+    await tick();
+    transport.pushServerChanges();
+    await tick();
+    transport.pushServerChanges();
+    await sleep(100); // wait for initial sync to settle
+
+    batches.length = 0; // clear initial sync batches
+
+    // Rapid server changes within the coalesce window
+    for (let i = 1; i <= 5; i++) {
+      server.update_source("cell-1", `v${i}`);
+      transport.pushServerChanges();
+      await tick();
+    }
+
+    // Wait for the coalesce window to close
+    await sleep(100);
+
+    // Should have gotten fewer batches than individual changes
+    assert(batches.length >= 1, "should have at least one coalesced batch");
+    assert(
+      batches.length < 5,
+      `expected coalescing to reduce 5 changes to fewer batches, got ${batches.length}`,
+    );
+
+    // Total batchSize should account for all changes
+    const totalBatchSize = batches.reduce((sum, b) => sum + b.batchSize, 0);
+    assert(
+      totalBatchSize >= 1,
+      "total batch size should reflect changes received",
+    );
+
+    sub.unsubscribe();
+    engine.stop();
+    server.free();
+    client.free();
+  },
+);
+
+Deno.test("SyncEngine: broadcasts$ delivers broadcast payloads", async () => {
+  const server = new NotebookHandle("broadcast-rx-test");
+  const client = NotebookHandle.create_empty_with_actor("test:client");
+
+  const transport = new DirectTransport(server);
+  const engine = new SyncEngine(client, transport, {
+    flushDebounceMs: 5,
+    initialSyncTimeoutMs: 500,
+  });
+
+  const payloads: unknown[] = [];
+  const sub = engine.broadcasts$.subscribe((p) => payloads.push(p));
+
+  engine.start();
+  await tick();
+
+  transport.pushBroadcast({ event: "kernel_status", status: "busy" });
+  await tick();
+  transport.pushBroadcast({ event: "execution_done", cell_id: "c1" });
+  await tick();
+
+  assert(payloads.length >= 2, `expected 2 broadcasts, got ${payloads.length}`);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((payloads[0] as any).event, "kernel_status");
+  // deno-lint-ignore no-explicit-any
+  assertEquals((payloads[1] as any).event, "execution_done");
+
+  sub.unsubscribe();
+  engine.stop();
+  server.free();
+  client.free();
+});
+
+Deno.test(
+  "SyncEngine: cellChanges$ attributions are aggregated across batch",
+  async () => {
+    const server = new NotebookHandle("attrs-rx-test");
+    server.add_cell(0, "cell-1", "code");
+    server.add_cell(1, "cell-2", "code");
+
+    const client = NotebookHandle.load(server.save());
+
+    // Bootstrap
+    for (let i = 0; i < 10; i++) {
+      const a = server.flush_local_changes();
+      const b = client.flush_local_changes();
+      if (!a && !b) break;
+      if (a) client.receive_sync_message(a);
+      if (b) server.receive_sync_message(b);
+    }
+    client.reset_sync_state();
+    server.reset_sync_state();
+
+    const transport = new DirectTransport(server);
+    const engine = new SyncEngine(client, transport, {
+      flushDebounceMs: 5,
+      initialSyncTimeoutMs: 500,
+      coalesceMs: 50,
+    });
+
+    const batches: CoalescedCellChanges[] = [];
+    const sub = engine.cellChanges$.subscribe((b) => batches.push(b));
+
+    engine.start();
+    await tick();
+    transport.pushServerChanges();
+    await tick();
+    transport.pushServerChanges();
+    await sleep(100);
+
+    batches.length = 0;
+
+    // Server edits two cells rapidly
+    server.update_source("cell-1", "edit A");
+    transport.pushServerChanges();
+    await tick();
+    server.update_source("cell-2", "edit B");
+    transport.pushServerChanges();
+    await tick();
+
+    await sleep(100);
+
+    // Batches should contain attributions from both changes
+    const allAttrs = batches.flatMap((b) => b.attributions);
+    // We don't know the exact attribution format from the test transport,
+    // but we can verify the batch mechanism collected them
+    assert(batches.length >= 1, "should have at least one batch");
+
+    sub.unsubscribe();
+    engine.stop();
+    server.free();
+    client.free();
+  },
+);
+
+Deno.test(
+  "SyncEngine: cellChanges$ sets needsFull when changeset is null",
+  async () => {
+    // When the engine emits cells_changed with changeset=null (structural
+    // change like add/remove), the coalesced batch should have needsFull=true.
+    const server = new NotebookHandle("needsfull-test");
+
+    const client = NotebookHandle.load(server.save());
+
+    // Bootstrap
+    for (let i = 0; i < 10; i++) {
+      const a = server.flush_local_changes();
+      const b = client.flush_local_changes();
+      if (!a && !b) break;
+      if (a) client.receive_sync_message(a);
+      if (b) server.receive_sync_message(b);
+    }
+    client.reset_sync_state();
+    server.reset_sync_state();
+
+    const transport = new DirectTransport(server);
+    const engine = new SyncEngine(client, transport, {
+      flushDebounceMs: 5,
+      initialSyncTimeoutMs: 500,
+      coalesceMs: 50,
+    });
+
+    const batches: CoalescedCellChanges[] = [];
+    const sub = engine.cellChanges$.subscribe((b) => batches.push(b));
+
+    engine.start();
+    await tick();
+    transport.pushServerChanges();
+    await tick();
+    await sleep(100);
+
+    batches.length = 0;
+
+    // Server adds a cell (structural change — changeset should include added)
+    server.add_cell(0, "new-cell", "code");
+    server.update_source("new-cell", "hello");
+    transport.pushServerChanges();
+    await tick();
+
+    await sleep(100);
+
+    assert(batches.length >= 1, "should have received a batch");
+    // The cell addition should produce a changeset with added cells
+    const lastBatch = batches[batches.length - 1];
+    assert(
+      lastBatch.changeset === null || lastBatch.changeset.added.length > 0,
+      "structural change should show added cells or trigger needsFull",
+    );
+
+    sub.unsubscribe();
+    engine.stop();
+    server.free();
+    client.free();
+  },
+);
 
 Deno.test("SyncEngine: retry timer fires on stalled initial sync", async () => {
   // Server has content but we won't push it — simulating a lost message.

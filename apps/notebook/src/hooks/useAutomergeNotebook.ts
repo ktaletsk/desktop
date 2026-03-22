@@ -205,12 +205,84 @@ export function useAutomergeNotebook() {
           });
         }
 
-        // Full async materialization — resolves manifest hashes from
-        // the blob HTTP server. The coalescing ensures we don't start
-        // a new materialization while the previous one is resolving blobs.
-        materializeCells(h).catch((err: unknown) => {
-          logger.warn("[automerge-notebook] materialize failed:", err);
-        });
+        // Structural changes (add/remove/reorder) need full materialization.
+        // Field-only changes (outputs, execution_count, metadata) get
+        // targeted per-cell updates — we MUST NOT overwrite source text
+        // because CodeMirror owns it via the CRDT-bridge. Replacing source
+        // from the store causes splice_source index-out-of-bounds crashes
+        // when text_attribution broadcasts arrive with stale positions.
+        const cs = batch.changeset;
+        const needsFull =
+          batch.needsFull ||
+          (cs !== null &&
+            (cs.added.length > 0 || cs.removed.length > 0 || cs.order_changed));
+
+        if (needsFull) {
+          materializeCells(h).catch((err: unknown) => {
+            logger.warn("[automerge-notebook] full materialize failed:", err);
+          });
+        } else if (cs !== null && cs.changed.length > 0) {
+          // Targeted update: only touch outputs, execution_count, metadata
+          // for cells that changed. Never touch source (CodeMirror owns it).
+          for (const cell of cs.changed) {
+            if (
+              cell.fields.outputs ||
+              cell.fields.execution_count ||
+              cell.fields.metadata
+            ) {
+              const outputs = h.get_cell_outputs(cell.cell_id);
+              const ecStr = h.get_cell_execution_count(cell.cell_id);
+              const ec = ecStr && ecStr !== "null" ? parseInt(ecStr, 10) : null;
+              const metadata = h.get_cell_metadata(cell.cell_id) ?? {};
+
+              updateCellById(cell.cell_id, (c) => {
+                if (c.cell_type !== "code") return c;
+
+                // Resolve outputs from cache (sync path).
+                // Outputs that are manifest hashes not in cache will show
+                // as loading — a subsequent full materialize will resolve them.
+                const resolvedOutputs = (outputs ?? []).map(
+                  (o: string) =>
+                    outputCacheRef.current.get(o) ??
+                    (typeof o === "string" && o.length === 16
+                      ? (c.outputs.find(
+                          (existing: JupyterOutput) =>
+                            existing && "_manifest" in existing,
+                        ) ?? { output_type: "loading", _manifest: o })
+                      : JSON.parse(o)),
+                );
+
+                return {
+                  ...c,
+                  outputs: resolvedOutputs,
+                  execution_count: ec,
+                  metadata,
+                };
+              });
+            }
+          }
+
+          // If any outputs had unresolved manifest hashes, trigger an
+          // async materialization to resolve them from the blob server.
+          const hasUnresolved = cs.changed.some(
+            (cell) =>
+              cell.fields.outputs &&
+              (h.get_cell_outputs(cell.cell_id) ?? []).some(
+                (o: string) =>
+                  typeof o === "string" &&
+                  o.length === 16 &&
+                  !outputCacheRef.current.has(o),
+              ),
+          );
+          if (hasUnresolved) {
+            materializeCells(h).catch((err: unknown) => {
+              logger.warn(
+                "[automerge-notebook] blob resolve materialize failed:",
+                err,
+              );
+            });
+          }
+        }
       }),
     );
 
