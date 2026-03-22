@@ -458,16 +458,30 @@ export class SyncEngine {
 
     // ── Initial sync handshake ───────────────────────────────────
     if (this.#awaitingInitialSync) {
-      // Check if the doc has content — the daemon may have sent it
-      // before the transport was listening (relay emits frames as soon
-      // as the room is created, but our transport connects later).
-      // In that case `changed` is false (daemon thinks we already have
-      // it) but the doc actually has cells from the sync exchange.
+      // Detect initial sync completion. Three signals (any one suffices):
+      //
+      // 1. `changed=true` — the doc gained content from this sync frame.
+      //    Normal path for notebooks that have cells.
+      //
+      // 2. `cell_count() > 0` — the doc has cells even though `changed`
+      //    is false. Happens when the daemon sent content before the
+      //    transport was listening (relay emits frames immediately, but
+      //    our TauriTransport connects later). The daemon's sync state
+      //    has advanced, so subsequent frames report changed=false.
+      //
+      // 3. `reply` exists — we generated a sync reply, meaning we
+      //    successfully received a daemon sync message and responded.
+      //    This covers empty notebooks (0 cells, changed=true on first
+      //    mount but changed=false on React strict mode's second mount
+      //    because the daemon's relay state already advanced). A reply
+      //    means the handshake completed — we're in sync, even if
+      //    the notebook is genuinely empty.
       const handle = this.#getHandle();
       const hasContent = handle ? handle.cell_count() > 0 : false;
+      const hasReply = event.reply != null && event.reply.length > 0;
 
-      if (event.changed || hasContent) {
-        // Content arrived (or was already present) — initial sync complete.
+      if (event.changed || hasContent || hasReply) {
+        // Initial sync complete — we've exchanged with the daemon.
         this.#awaitingInitialSync = false;
         this.#clearRetryTimer();
         this.#emit({ type: "initial_sync_complete" });
@@ -479,8 +493,9 @@ export class SyncEngine {
           attributions: event.attributions ?? [],
         });
       } else {
-        // Handshake round (bloom filter exchange, no content yet).
-        // Restart the retry timer.
+        // Handshake round with no reply generated (e.g., the very first
+        // sync message we sent, before the daemon responds). Restart the
+        // retry timer.
         this.#armRetryTimer();
       }
       return;
