@@ -193,20 +193,30 @@ export function createFramePipeline(deps: FramePipelineDeps): Subscription {
             });
           }
 
-          // ── Send inline sync reply immediately (fire-and-forget) ───
+          // ── Send inline sync reply immediately ─────────────────────
           // The reply was generated atomically inside WASM's receive_frame,
           // eliminating the consumption race from #1067 where a separate
           // generate_sync_reply() could be preempted by flushSync.
+          //
+          // If delivery fails, roll back sync state (cancel_last_flush)
+          // to prevent sent_hashes from permanently filtering out local
+          // change data the daemon never received. Without this, a client
+          // with unflushed local edits whose reply is dropped enters a
+          // non-converging sync loop (Codex review of #1068).
           if (e.reply) {
             sendFrame(
               frame_types.AUTOMERGE_SYNC,
               new Uint8Array(e.reply),
-            ).catch((err: unknown) =>
+            ).catch((err: unknown) => {
+              const handle = deps.getHandle();
+              if (handle) {
+                handle.cancel_last_flush();
+              }
               logger.warn(
-                "[frame-pipeline] inline sync reply send failed:",
+                "[frame-pipeline] inline sync reply send failed, rolled back sync state:",
                 err,
-              ),
-            );
+              );
+            });
           }
 
           // ── Initial sync: materialize immediately (no coalescing) ──
