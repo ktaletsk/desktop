@@ -137,14 +137,17 @@ export function useAutomergeNotebook() {
       NH as typeof NotebookHandle
     ).create_empty_with_actor(`human:${sessionIdRef.current}`);
 
-    // Clean up previous handle.
+    // Clean up previous engine + transport BEFORE freeing the handle.
+    // The engine's stop() calls flushNow() which needs the handle alive.
+    engineRef.current?.stop();
+    engineRef.current = null;
+    transportRef.current?.disconnect();
+    transportRef.current = null;
+
+    // Now safe to free the old handle.
     handleRef.current?.free();
     handleRef.current = handle;
     setNotebookHandle(handle);
-
-    // Clean up previous engine + transport.
-    engineRef.current?.stop();
-    transportRef.current?.disconnect();
 
     // Create transport + engine.
     const transport = new TauriTransport();
