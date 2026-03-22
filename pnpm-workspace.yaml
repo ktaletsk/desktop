@@ -1,6 +1,7 @@
 packages:
   - apps/*
+  - packages/*
 
 onlyBuiltDependencies:
-  - '@fortawesome/fontawesome-free'
+  - "@fortawesome/fontawesome-free"
   - esbuild

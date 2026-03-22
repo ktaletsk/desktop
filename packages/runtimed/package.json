@@ -1,0 +1,28 @@
+{
+  "name": "@nteract/runtimed",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Transport-agnostic JavaScript bindings for nteract notebook documents. Wraps the runtimed WASM CRDT engine with a clean API for sync, cell mutations, and runtime state.",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nteract/desktop",
+    "directory": "packages/runtimed"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "runtimed-wasm": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}
