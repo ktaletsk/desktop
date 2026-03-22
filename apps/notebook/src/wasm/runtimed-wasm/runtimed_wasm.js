@@ -364,6 +364,18 @@ export class NotebookHandle {
         wasm.notebookhandle_cancel_last_flush(this.__wbg_ptr);
     }
     /**
+     * Roll back runtime-state sync state after a failed
+     * `flush_runtime_state_sync()` delivery.
+     *
+     * Mirrors `cancel_last_flush()` for the notebook doc: clears
+     * `in_flight` and `sent_hashes` on `state_sync_state` so the next
+     * `flush_runtime_state_sync()` or `generate_runtime_state_sync_reply()`
+     * produces a message instead of returning `None`.
+     */
+    cancel_last_runtime_state_flush() {
+        wasm.notebookhandle_cancel_last_runtime_state_flush(this.__wbg_ptr);
+    }
+    /**
      * Get the number of cells in the document.
      * @returns {number}
      */
@@ -559,6 +571,36 @@ export class NotebookHandle {
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
             wasm.notebookhandle_flush_local_changes(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getArrayU8FromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export4(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Generate an initial RuntimeStateDoc sync message.
+     *
+     * Call this during bootstrap (alongside `flush_local_changes` for the
+     * notebook doc) so the daemon knows we need the full RuntimeStateDoc.
+     * Without this, if the daemon's initial `RuntimeStateSync` frame arrives
+     * before the WASM handle is ready, the kernel status is never synced
+     * and the frontend stays stuck on "not_started".
+     *
+     * If the returned message cannot be delivered, the caller MUST call
+     * `cancel_last_runtime_state_flush()` to prevent `sent_hashes` from
+     * permanently filtering out the undelivered state data.
+     * @returns {Uint8Array | undefined}
+     */
+    flush_runtime_state_sync() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.notebookhandle_flush_runtime_state_sync(retptr, this.__wbg_ptr);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             let v1;
