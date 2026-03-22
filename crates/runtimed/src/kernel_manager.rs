@@ -822,11 +822,21 @@ impl RoomKernel {
                         );
 
                         // Look up (cell_id, execution_id) from msg_id
-                        let cell_entry = message
-                            .parent_header
-                            .as_ref()
-                            .and_then(|h| cell_id_map.lock().ok()?.get(&h.msg_id).cloned());
-                        let cell_id = cell_entry.as_ref().map(|(cid, _)| cid.clone());
+                        let cell_entry =
+                            message
+                                .parent_header
+                                .as_ref()
+                                .and_then(|h| match cell_id_map.lock() {
+                                    Ok(map) => map.get(&h.msg_id).cloned(),
+                                    Err(e) => {
+                                        warn!("[kernel-manager] cell_id_map lock poisoned: {}", e);
+                                        None
+                                    }
+                                });
+                        let (cell_id, execution_id) = match &cell_entry {
+                            Some((cid, eid)) => (Some(cid.clone()), eid.clone()),
+                            None => (None, String::new()),
+                        };
 
                         // Handle different message types
                         match &message.content {
@@ -902,14 +912,10 @@ impl RoomKernel {
                                     };
                                     let _ = persist_tx.send(Some(persist_bytes));
 
-                                    let exec_id = cell_entry
-                                        .as_ref()
-                                        .map(|(_, eid)| eid.clone())
-                                        .unwrap_or_default();
                                     let _ =
                                         broadcast_tx.send(NotebookBroadcast::ExecutionStarted {
                                             cell_id: cid.clone(),
-                                            execution_id: exec_id,
+                                            execution_id: execution_id.clone(),
                                             execution_count,
                                         });
                                 }
@@ -1055,10 +1061,7 @@ impl RoomKernel {
                                     };
                                     let _ = persist_tx.send(Some(persist_bytes));
 
-                                    let exec_id = cell_entry
-                                        .as_ref()
-                                        .map(|(_, eid)| eid.clone())
-                                        .unwrap_or_default();
+                                    let exec_id = execution_id.clone();
                                     let _ = broadcast_tx.send(NotebookBroadcast::Output {
                                         cell_id: cid.clone(),
                                         execution_id: exec_id,
@@ -1175,10 +1178,7 @@ impl RoomKernel {
                                         };
                                         let _ = persist_tx.send(Some(persist_bytes));
 
-                                        let exec_id = cell_entry
-                                            .as_ref()
-                                            .map(|(_, eid)| eid.clone())
-                                            .unwrap_or_default();
+                                        let exec_id = execution_id.clone();
                                         let _ = broadcast_tx.send(NotebookBroadcast::Output {
                                             cell_id: cid.clone(),
                                             execution_id: exec_id,
@@ -1337,10 +1337,7 @@ impl RoomKernel {
                                         };
                                         let _ = persist_tx.send(Some(persist_bytes));
 
-                                        let exec_id = cell_entry
-                                            .as_ref()
-                                            .map(|(_, eid)| eid.clone())
-                                            .unwrap_or_default();
+                                        let exec_id = execution_id.clone();
                                         let _ = broadcast_tx.send(NotebookBroadcast::Output {
                                             cell_id: cid.clone(),
                                             execution_id: exec_id,
@@ -1556,8 +1553,18 @@ impl RoomKernel {
                             JupyterMessageContent::ExecuteReply(ref reply) => {
                                 // Get cell_id from msg_id mapping
                                 let cell_entry = msg.parent_header.as_ref().and_then(|h| {
-                                    shell_cell_id_map.lock().ok()?.get(&h.msg_id).cloned()
+                                    match shell_cell_id_map.lock() {
+                                        Ok(map) => map.get(&h.msg_id).cloned(),
+                                        Err(e) => {
+                                            warn!("[kernel-manager] cell_id_map lock poisoned (shell): {}", e);
+                                            None
+                                        }
+                                    }
                                 });
+                                let execution_id = cell_entry
+                                    .as_ref()
+                                    .map(|(_, eid)| eid.clone())
+                                    .unwrap_or_default();
                                 let cell_id = cell_entry.as_ref().map(|(cid, _)| cid.clone());
 
                                 // Process page payloads - convert to display_data outputs
@@ -1622,10 +1629,7 @@ impl RoomKernel {
                                             let _ = shell_persist_tx.send(Some(persist_bytes));
 
                                             // Broadcast to all windows
-                                            let exec_id = cell_entry
-                                                .as_ref()
-                                                .map(|(_, eid)| eid.clone())
-                                                .unwrap_or_default();
+                                            let exec_id = execution_id.clone();
                                             let _ = shell_broadcast_tx.send(
                                                 NotebookBroadcast::Output {
                                                     cell_id: cid.clone(),
@@ -1642,10 +1646,7 @@ impl RoomKernel {
                                 // Broadcast execution done for error status
                                 if reply.status != jupyter_protocol::ReplyStatus::Ok {
                                     if let Some(ref cid) = cell_id {
-                                        let exec_id = cell_entry
-                                            .as_ref()
-                                            .map(|(_, eid)| eid.clone())
-                                            .unwrap_or_default();
+                                        let exec_id = execution_id.clone();
                                         let _ = shell_broadcast_tx.send(
                                             NotebookBroadcast::ExecutionDone {
                                                 cell_id: cid.clone(),

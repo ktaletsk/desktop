@@ -53,14 +53,20 @@ impl Execution {
     /// Current execution status: "pending", "running", "done", or "error".
     ///
     /// Sync read from the local RuntimeStateDoc replica. Uses try_lock
-    /// to avoid blocking — returns "done" if the lock is contended (the
-    /// execution almost certainly finished if something else is busy).
+    /// to avoid blocking — returns "running" if the lock is contended
+    /// (another async operation is in progress, so the execution is
+    /// likely still active).
     #[getter]
     fn status(&self) -> PyResult<String> {
-        let st = self
-            .state
-            .try_lock()
-            .map_err(|_| to_py_err("Session state locked"))?;
+        let st = match self.state.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Lock is held by an async operation (e.g. collect_outputs,
+                // stream, or another concurrent call). The execution is
+                // almost certainly still in flight.
+                return Ok("running".to_string());
+            }
+        };
 
         if let Some(handle) = st.handle.as_ref() {
             if let Ok(rs) = handle.get_runtime_state() {

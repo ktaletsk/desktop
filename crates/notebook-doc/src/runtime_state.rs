@@ -569,6 +569,14 @@ impl RuntimeStateDoc {
                 let executing_exec_id = self.read_opt_str(q, "executing_execution_id");
                 let queued_cell_ids = self.read_str_list(q, "queued");
                 let queued_exec_ids = self.read_str_list(q, "queued_execution_ids");
+                if queued_cell_ids.len() != queued_exec_ids.len() {
+                    log::warn!(
+                        "[runtime-state] Parallel list length mismatch: queued={} vs queued_execution_ids={}. \
+                         Padding with empty execution_ids.",
+                        queued_cell_ids.len(),
+                        queued_exec_ids.len(),
+                    );
+                }
                 QueueState {
                     executing: executing_cell_id.map(|cid| QueueEntry {
                         cell_id: cid,
