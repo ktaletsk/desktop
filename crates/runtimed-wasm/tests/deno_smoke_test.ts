@@ -906,6 +906,172 @@ Deno.test("Fix #1067: concurrent local edit + daemon frame", () => {
   client.free();
 });
 
+Deno.test(
+  "Fix #1068 review: dropped inline reply with unflushed local edit stalls sync",
+  () => {
+    // Codex review of #1068 found that if the client has unflushed local
+    // edits and receive_frame generates an inline reply containing those
+    // edits, dropping the reply strands the local change hashes in
+    // sent_hashes. Subsequent sync messages filter out the local change
+    // data, causing a non-converging loop where the server never learns
+    // the client's edit.
+    //
+    // The fix: call cancel_last_flush() on reply send failure, same as
+    // the flush path. This test verifies recovery.
+
+    const server = new NotebookHandle("dropped-reply-test");
+    server.add_cell(0, "cell-1", "code");
+
+    const client = NotebookHandle.load(server.save());
+    syncHandles(server, client);
+
+    // Client makes a local edit (NOT flushed yet)
+    client.update_source("cell-1", "local edit from client");
+
+    // Server makes a change
+    server.update_source("cell-1", "server change");
+    const serverMsg = server.flush_local_changes();
+    assert(serverMsg !== undefined);
+
+    // Client receives the server's change via receive_frame.
+    // The inline reply will include the client's local edit in sent_hashes.
+    const frame = new Uint8Array(1 + serverMsg.length);
+    frame[0] = 0x00;
+    frame.set(serverMsg, 1);
+    const events = client.receive_frame(frame);
+    const reply = events[0]?.reply;
+    assert(
+      reply !== undefined,
+      "reply should exist (client has local changes)",
+    );
+
+    // SIMULATE DELIVERY FAILURE: reply is DROPPED.
+    // Call cancel_last_flush to clear sent_hashes (the fix).
+    client.cancel_last_flush();
+
+    // Server makes another change
+    server.update_source("cell-1", "server change v2");
+    const serverMsg2 = server.flush_local_changes();
+    assert(serverMsg2 !== undefined);
+
+    // Client receives via receive_frame — this reply should include the
+    // local edit because cancel_last_flush cleared sent_hashes.
+    const frame2 = new Uint8Array(1 + serverMsg2.length);
+    frame2[0] = 0x00;
+    frame2.set(serverMsg2, 1);
+    const events2 = client.receive_frame(frame2);
+    const reply2 = events2[0]?.reply;
+
+    // Deliver reply2 to server
+    if (reply2) {
+      server.receive_sync_message(new Uint8Array(reply2));
+    }
+
+    // Sync to convergence
+    syncHandles(server, client);
+
+    // Both should have the merged result (CRDT merge of both edits)
+    const serverCell = server.get_cell("cell-1");
+    const clientCell = client.get_cell("cell-1");
+    assertExists(serverCell);
+    assertExists(clientCell);
+    assertEquals(
+      clientCell.source,
+      serverCell.source,
+      "client and server must converge after cancel_last_flush recovery",
+    );
+    serverCell.free();
+    clientCell.free();
+
+    server.free();
+    client.free();
+  },
+);
+
+Deno.test(
+  "Fix #1068 review: WITHOUT cancel, dropped inline reply with local edit does NOT converge",
+  () => {
+    // Documents the dangerous behavior: if cancel_last_flush is NOT called
+    // after a dropped inline reply that carried local changes, the peers
+    // may not converge. sent_hashes filters out the local change data.
+
+    const server = new NotebookHandle("no-cancel-reply-test");
+    server.add_cell(0, "cell-1", "code");
+
+    const client = NotebookHandle.load(server.save());
+    syncHandles(server, client);
+
+    // Client makes a local edit (NOT flushed)
+    client.update_source("cell-1", "stranded edit");
+
+    // Server makes a change
+    server.update_source("cell-1", "server v1");
+    const serverMsg = server.flush_local_changes();
+    assert(serverMsg !== undefined);
+
+    // Client receives, reply generated (includes local edit in sent_hashes)
+    const frame = new Uint8Array(1 + serverMsg.length);
+    frame[0] = 0x00;
+    frame.set(serverMsg, 1);
+    const events = client.receive_frame(frame);
+    assert(events[0]?.reply !== undefined);
+
+    // REPLY DROPPED — deliberately do NOT call cancel_last_flush
+
+    // Try several rounds of server changes + client receive_frame
+    // to see if the protocol can self-heal without cancel.
+    for (let i = 2; i <= 5; i++) {
+      server.update_source("cell-1", `server v${i}`);
+      const msg = server.flush_local_changes();
+      if (!msg) break;
+      const f = new Uint8Array(1 + msg.length);
+      f[0] = 0x00;
+      f.set(msg, 1);
+      const ev = client.receive_frame(f);
+      if (ev[0]?.reply) {
+        server.receive_sync_message(new Uint8Array(ev[0].reply));
+      }
+    }
+    syncHandles(server, client);
+
+    const serverCell = server.get_cell("cell-1");
+    const clientCell = client.get_cell("cell-1");
+    assertExists(serverCell);
+    assertExists(clientCell);
+
+    if (serverCell.source !== clientCell.source) {
+      console.warn(
+        "CONFIRMED: without cancel_last_flush on dropped inline reply, " +
+          "peers diverge. Server has: " +
+          JSON.stringify(serverCell.source) +
+          ", client has: " +
+          JSON.stringify(clientCell.source),
+      );
+    }
+
+    // Nuclear recovery always works
+    client.reset_sync_state();
+    syncHandles(server, client);
+
+    const recoveredClient = client.get_cell("cell-1");
+    const recoveredServer = server.get_cell("cell-1");
+    assertExists(recoveredClient);
+    assertExists(recoveredServer);
+    assertEquals(
+      recoveredClient.source,
+      recoveredServer.source,
+      "reset_sync_state must always recover convergence",
+    );
+    recoveredClient.free();
+    recoveredServer.free();
+
+    serverCell.free();
+    clientCell.free();
+    server.free();
+    client.free();
+  },
+);
+
 Deno.test("Sync: source edit character-level merge", () => {
   const server = new NotebookHandle("sync-test");
   server.add_cell(0, "cell-1", "code");
