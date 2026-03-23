@@ -17,7 +17,11 @@ import {
   updateNotebookCells,
   useCellIds,
 } from "../lib/notebook-cells";
-import { subscribeBroadcast, emitBroadcast } from "../lib/notebook-frame-bus";
+import {
+  subscribeBroadcast,
+  emitBroadcast,
+  emitPresence,
+} from "../lib/notebook-frame-bus";
 import {
   notifyMetadataChanged,
   setNotebookHandle,
@@ -310,6 +314,12 @@ export function useAutomergeNotebook() {
     rxSub.add(
       engine.broadcasts$.subscribe((payload) => {
         emitBroadcast(payload);
+      }),
+    );
+
+    rxSub.add(
+      engine.presence$.subscribe((payload) => {
+        emitPresence(payload);
       }),
     );
 
