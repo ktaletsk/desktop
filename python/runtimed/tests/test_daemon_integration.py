@@ -1676,6 +1676,16 @@ class TestBasicConnectivity:
         assert "AsyncSession" in r
         assert async_session.notebook_id in r
 
+    @pytest.mark.asyncio
+    async def test_list_active_notebooks_no_coroutine_warning(self, async_client):
+        """Regression: list_active_notebooks must not emit RuntimeWarning (#1148)."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            rooms = await async_client.list_active_notebooks()
+        assert isinstance(rooms, list)
+
 
 class TestDocumentFirstExecution:
     """Test document-first execution pattern."""
