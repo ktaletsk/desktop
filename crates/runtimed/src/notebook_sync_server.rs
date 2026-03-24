@@ -159,6 +159,12 @@ fn build_launched_config(
                 config.conda_channels = Some(get_inline_conda_channels(snapshot));
             }
         }
+        "uv:prewarmed" => {
+            // Store paths so hot-sync can install deps into the prewarmed venv
+            // uv_deps stays None to indicate no baseline deps were installed
+            config.venv_path = venv_path;
+            config.python_path = python_path;
+        }
         _ => {}
     }
 
@@ -3778,12 +3784,18 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
             }
         };
 
-        let launched = kernel.launched_config().clone();
+        let mut launched = kernel.launched_config().clone();
 
-        // Only UV inline deps support hot-sync
+        // For prewarmed UV envs, treat as empty baseline so hot-sync can
+        // install deps added after launch (instead of requiring a restart).
+        if launched.uv_deps.is_none() && kernel.env_source() == "uv:prewarmed" {
+            launched.uv_deps = Some(vec![]);
+        }
+
+        // Hot-sync requires a UV env with tracked deps
         if launched.uv_deps.is_none() {
             return NotebookResponse::SyncEnvironmentFailed {
-                error: "Hot-sync only supported for UV inline dependencies".to_string(),
+                error: "Hot-sync only supported for UV environments".to_string(),
                 needs_restart: true,
             };
         }
@@ -7843,6 +7855,58 @@ mod tests {
         let snapshot = snapshot_with_uv(vec!["numpy".to_string()]);
         // When the kernel isn't tracking any deps, diff is None (no drift to report)
         assert!(compute_env_sync_diff(&launched, &snapshot).is_none());
+    }
+
+    #[test]
+    fn test_build_launched_config_uv_prewarmed_stores_paths() {
+        let venv = PathBuf::from("/tmp/pool/env-abc");
+        let python = PathBuf::from("/tmp/pool/env-abc/bin/python");
+        let config = build_launched_config(
+            "python",
+            "uv:prewarmed",
+            None,
+            None,
+            Some(venv.clone()),
+            Some(python.clone()),
+        );
+        assert_eq!(config.venv_path.as_ref(), Some(&venv));
+        assert_eq!(config.python_path.as_ref(), Some(&python));
+        assert!(config.uv_deps.is_none(), "prewarmed should not set uv_deps");
+    }
+
+    #[test]
+    fn test_compute_env_sync_diff_prewarmed_promoted_to_empty_baseline() {
+        // Simulates handle_sync_environment promoting uv_deps from None to
+        // Some([]) for a prewarmed kernel, then computing the diff.
+        let mut launched = LaunchedEnvConfig {
+            venv_path: Some(PathBuf::from("/tmp/pool/env-abc")),
+            python_path: Some(PathBuf::from("/tmp/pool/env-abc/bin/python")),
+            ..LaunchedEnvConfig::default()
+        };
+        // Promote to empty baseline (what handle_sync_environment does)
+        launched.uv_deps = Some(vec![]);
+
+        let snapshot = snapshot_with_uv(vec!["httpx".to_string()]);
+        let diff = compute_env_sync_diff(&launched, &snapshot).expect("should detect added deps");
+        assert_eq!(diff.added, vec!["httpx".to_string()]);
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn test_build_launched_config_conda_prewarmed_no_paths() {
+        // conda:prewarmed falls through to the default branch — no paths stored
+        let config = build_launched_config(
+            "python",
+            "conda:prewarmed",
+            None,
+            None,
+            Some(PathBuf::from("/tmp/conda-env")),
+            Some(PathBuf::from("/tmp/conda-env/bin/python")),
+        );
+        assert!(config.venv_path.is_none());
+        assert!(config.python_path.is_none());
+        assert!(config.uv_deps.is_none());
+        assert!(config.conda_deps.is_none());
     }
 
     // ── check_and_broadcast_sync_state tests ──────────────────────────────
