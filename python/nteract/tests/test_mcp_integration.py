@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -464,3 +465,28 @@ async def test_get_all_cells_pagination(mcp_client: ClientSession):
 
     # Index should be 1 (the original index, not reset to 0)
     assert text.startswith("1 |")
+
+
+@pytest.mark.asyncio
+async def test_open_notebook_returns_cells(mcp_client: ClientSession):
+    """open_notebook should return a cell summary like join_notebook."""
+    fixture = str(
+        Path(__file__).resolve().parents[3]
+        / "crates"
+        / "notebook"
+        / "fixtures"
+        / "audit-test"
+        / "1-vanilla.ipynb"
+    )
+
+    result = await mcp_client.call_tool("open_notebook", {"path": fixture})
+    data = _parse_json(result)
+
+    assert "notebook_id" in data
+    assert "path" in data
+    assert "cells" in data
+
+    cells_text = data["cells"]
+    # 1-vanilla.ipynb has two code cells, one with `import sys`
+    assert "| code |" in cells_text
+    assert "import sys" in cells_text
