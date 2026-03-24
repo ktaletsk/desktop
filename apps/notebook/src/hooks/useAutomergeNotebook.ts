@@ -349,7 +349,7 @@ export function useAutomergeNotebook() {
       "[automerge-notebook] Bootstrap: SyncEngine started, awaiting sync",
     );
     return true;
-  }, [materializeCells, rematerializeCellsSync]);
+  }, [materializeCells]);
 
   // ── Lifecycle (single effect) ──────────────────────────────────────
 

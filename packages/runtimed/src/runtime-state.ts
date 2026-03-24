@@ -57,10 +57,10 @@ export interface ExecutionTransition {
 }
 
 export interface RuntimeState {
-  kernel: KernelState | null;
-  queue: QueueState | null;
-  env_sync: EnvState | null;
-  trust: TrustState | null;
+  kernel: KernelState;
+  queue: QueueState;
+  env: EnvState;
+  trust: TrustState;
   last_saved: string | null;
   executions: Record<string, ExecutionState>;
 }
