@@ -608,6 +608,7 @@ async def list_active_notebooks() -> list[dict[str, Any]]:
             "has_runtime": info.has_runtime,
             "runtime_type": info.runtime_type,
             "status": info.status,
+            "is_draining": info.is_draining,
         }
         for info in notebooks
     ]
@@ -1511,6 +1512,7 @@ async def resource_rooms() -> str:
                     "has_runtime": info.has_runtime,
                     "runtime_type": info.runtime_type,
                     "status": info.status,
+                    "is_draining": info.is_draining,
                 }
                 for info in notebooks
             ]
