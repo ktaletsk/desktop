@@ -43,7 +43,9 @@ use crate::kernel_manager::{DenoLaunchedConfig, LaunchedEnvConfig, RoomKernel};
 use crate::markdown_assets::resolve_markdown_assets;
 use crate::notebook_doc::{notebook_doc_filename, CellSnapshot, NotebookDoc};
 use crate::notebook_metadata::NotebookMetadataSnapshot;
-use crate::protocol::{EnvSyncDiff, NotebookBroadcast, NotebookRequest, NotebookResponse};
+use crate::protocol::{
+    EnvSyncDiff, NotebookBroadcast, NotebookRequest, NotebookResponse, QueueEntry,
+};
 use notebook_doc::presence::{self, PresenceState};
 use notebook_doc::runtime_state::RuntimeStateDoc;
 
@@ -2245,6 +2247,7 @@ async fn auto_launch_kernel(
             // Take the command receiver and spawn a task to process execution events
             if let Some(mut cmd_rx) = kernel.take_command_rx() {
                 let room_kernel = room.kernel.clone();
+                let room_broadcast_tx = room.kernel_broadcast_tx.clone();
                 let room_presence = room.presence.clone();
                 let room_presence_tx = room.presence_tx.clone();
                 let room_state_doc = room.state_doc.clone();
@@ -2253,12 +2256,20 @@ async fn auto_launch_kernel(
                     use crate::kernel_manager::QueueCommand;
                     while let Some(cmd) = cmd_rx.recv().await {
                         match cmd {
-                            QueueCommand::ExecutionDone { cell_id } => {
-                                debug!("[notebook-sync] ExecutionDone for {}", cell_id);
+                            QueueCommand::ExecutionDone {
+                                cell_id,
+                                execution_id,
+                            } => {
+                                debug!(
+                                    "[notebook-sync] ExecutionDone for {} ({})",
+                                    cell_id, execution_id
+                                );
                                 let env_source = {
                                     let mut guard = room_kernel.lock().await;
                                     if let Some(ref mut k) = *guard {
-                                        if let Err(e) = k.execution_done(&cell_id).await {
+                                        if let Err(e) =
+                                            k.execution_done(&cell_id, &execution_id).await
+                                        {
                                             warn!("[notebook-sync] execution_done error: {}", e);
                                         }
                                         Some(k.env_source().to_string())
@@ -2301,16 +2312,29 @@ async fn auto_launch_kernel(
                             }
                             QueueCommand::KernelDied => {
                                 warn!("[notebook-sync] Kernel died, unblocking execution queue");
-                                let env_source = {
+                                let (env_source, interrupted) = {
                                     let mut guard = room_kernel.lock().await;
                                     if let Some(ref mut k) = *guard {
                                         let es = k.env_source().to_string();
-                                        k.kernel_died();
-                                        Some(es)
+                                        let interrupted = k.kernel_died();
+                                        (Some(es), interrupted)
                                     } else {
-                                        None
+                                        (None, None)
                                     }
                                 };
+                                // Emit ExecutionDone for the interrupted execution so
+                                // clients tracking by execution_id get a terminal signal.
+                                if let Some((cell_id, execution_id)) = interrupted {
+                                    info!(
+                                        "[notebook-sync] Emitting ExecutionDone for interrupted cell {} ({})",
+                                        cell_id, execution_id
+                                    );
+                                    let _ =
+                                        room_broadcast_tx.send(NotebookBroadcast::ExecutionDone {
+                                            cell_id,
+                                            execution_id,
+                                        });
+                                }
                                 // Write error status + cleared queue to state doc
                                 {
                                     let mut sd = room_state_doc.write().await;
@@ -2937,6 +2961,7 @@ async fn handle_notebook_request(
                     // Take the command receiver and spawn a task to process execution events
                     if let Some(mut cmd_rx) = kernel.take_command_rx() {
                         let room_kernel = room.kernel.clone();
+                        let room_broadcast_tx = room.kernel_broadcast_tx.clone();
                         let room_presence = room.presence.clone();
                         let room_presence_tx = room.presence_tx.clone();
                         let room_state_doc = room.state_doc.clone();
@@ -2945,15 +2970,20 @@ async fn handle_notebook_request(
                             use crate::kernel_manager::QueueCommand;
                             while let Some(cmd) = cmd_rx.recv().await {
                                 match cmd {
-                                    QueueCommand::ExecutionDone { cell_id } => {
+                                    QueueCommand::ExecutionDone {
+                                        cell_id,
+                                        execution_id,
+                                    } => {
                                         info!(
-                                            "[notebook-sync] Processing ExecutionDone for {}",
-                                            cell_id
+                                            "[notebook-sync] Processing ExecutionDone for {} ({})",
+                                            cell_id, execution_id
                                         );
                                         let env_source = {
                                             let mut guard = room_kernel.lock().await;
                                             if let Some(ref mut k) = *guard {
-                                                if let Err(e) = k.execution_done(&cell_id).await {
+                                                if let Err(e) =
+                                                    k.execution_done(&cell_id, &execution_id).await
+                                                {
                                                     warn!(
                                                         "[notebook-sync] execution_done error: {}",
                                                         e
@@ -3001,16 +3031,30 @@ async fn handle_notebook_request(
                                     }
                                     QueueCommand::KernelDied => {
                                         warn!("[notebook-sync] Kernel died, unblocking execution queue");
-                                        let env_source = {
+                                        let (env_source, interrupted) = {
                                             let mut guard = room_kernel.lock().await;
                                             if let Some(ref mut k) = *guard {
                                                 let es = k.env_source().to_string();
-                                                k.kernel_died();
-                                                Some(es)
+                                                let interrupted = k.kernel_died();
+                                                (Some(es), interrupted)
                                             } else {
-                                                None
+                                                (None, None)
                                             }
                                         };
+                                        // Emit ExecutionDone for the interrupted execution so
+                                        // clients tracking by execution_id get a terminal signal.
+                                        if let Some((cell_id, execution_id)) = interrupted {
+                                            info!(
+                                                "[notebook-sync] Emitting ExecutionDone for interrupted cell {} ({})",
+                                                cell_id, execution_id
+                                            );
+                                            let _ = room_broadcast_tx.send(
+                                                NotebookBroadcast::ExecutionDone {
+                                                    cell_id,
+                                                    execution_id,
+                                                },
+                                            );
+                                        }
                                         // Write error status + cleared queue to state doc
                                         {
                                             let mut sd = room_state_doc.write().await;
@@ -3084,7 +3128,10 @@ async fn handle_notebook_request(
             let mut kernel_guard = room.kernel.lock().await;
             if let Some(ref mut kernel) = *kernel_guard {
                 match kernel.queue_cell(cell_id.clone(), code).await {
-                    Ok(()) => NotebookResponse::CellQueued { cell_id },
+                    Ok(execution_id) => NotebookResponse::CellQueued {
+                        cell_id,
+                        execution_id,
+                    },
                     Err(e) => NotebookResponse::Error {
                         error: format!("Failed to queue cell: {}", e),
                     },
@@ -3149,7 +3196,10 @@ async fn handle_notebook_request(
             let mut kernel_guard = room.kernel.lock().await;
             if let Some(ref mut kernel) = *kernel_guard {
                 match kernel.queue_cell(cell_id.clone(), source).await {
-                    Ok(()) => NotebookResponse::CellQueued { cell_id },
+                    Ok(execution_id) => NotebookResponse::CellQueued {
+                        cell_id,
+                        execution_id,
+                    },
                     Err(e) => NotebookResponse::Error {
                         error: format!("Failed to queue cell: {}", e),
                     },
@@ -3274,7 +3324,7 @@ async fn handle_notebook_request(
             let kernel_guard = room.kernel.lock().await;
             if let Some(ref kernel) = *kernel_guard {
                 NotebookResponse::QueueState {
-                    executing: kernel.executing_cell().cloned(),
+                    executing: kernel.executing_entry(),
                     queued: kernel.queued_cells(),
                 }
             } else {
@@ -3293,22 +3343,29 @@ async fn handle_notebook_request(
                 let cells = doc.get_cells();
 
                 // Queue all code cells in document order
-                let mut count = 0;
+                let mut queued = Vec::new();
                 for cell in cells {
                     if cell.cell_type == "code" {
-                        if let Err(e) = kernel
+                        match kernel
                             .queue_cell(cell.id.clone(), cell.source.clone())
                             .await
                         {
-                            return NotebookResponse::Error {
-                                error: format!("Failed to queue cell {}: {}", cell.id, e),
-                            };
+                            Ok(execution_id) => {
+                                queued.push(QueueEntry {
+                                    cell_id: cell.id.clone(),
+                                    execution_id,
+                                });
+                            }
+                            Err(e) => {
+                                return NotebookResponse::Error {
+                                    error: format!("Failed to queue cell {}: {}", cell.id, e),
+                                };
+                            }
                         }
-                        count += 1;
                     }
                 }
 
-                NotebookResponse::AllCellsQueued { count }
+                NotebookResponse::AllCellsQueued { queued }
             } else {
                 NotebookResponse::NoKernel {}
             }
