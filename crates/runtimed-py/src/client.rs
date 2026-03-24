@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
+use crate::daemon_paths::resolve_notebook_path;
 use crate::error::to_py_err;
 use crate::session::Session;
 
@@ -167,13 +168,17 @@ impl Client {
 
     /// Join an existing notebook room by ID and return a connected Session.
     ///
+    /// Relative paths (e.g. ``"notebook.ipynb"``) are resolved to absolute
+    /// paths so they match the canonical room keys used by the daemon.
+    ///
     /// Args:
-    ///     notebook_id: The notebook room ID to join.
+    ///     notebook_id: The notebook room ID to join (UUID or file path).
     ///     peer_label: Optional label override (defaults to client's peer_label).
     #[pyo3(signature = (notebook_id, peer_label=None))]
     fn join_notebook(&self, notebook_id: &str, peer_label: Option<String>) -> PyResult<Session> {
         let label = peer_label.or_else(|| self.peer_label.clone());
-        Session::join_notebook_with_socket(self.socket_path.clone(), notebook_id, label)
+        let resolved = resolve_notebook_path(notebook_id);
+        Session::join_notebook_with_socket(self.socket_path.clone(), &resolved, label)
     }
 
     fn __repr__(&self) -> String {
