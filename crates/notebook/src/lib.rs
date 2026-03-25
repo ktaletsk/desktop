@@ -3682,41 +3682,77 @@ fn correct_window_scale(window: &tauri::WebviewWindow, saved_scale_factor: Optio
 /// For untitled notebooks, the current working directory is captured at startup
 /// for project file detection (pyproject.toml, pixi.toml, environment.yaml).
 pub fn run(notebook_path: Option<PathBuf>, runtime: Option<Runtime>) -> anyhow::Result<()> {
-    // Initialize logging - write to both stderr and log file (same pattern as runtimed)
+    // Initialize logging via tauri-plugin-log — unified backend for both Rust
+    // log::* macros and frontend JS log calls. Writes to notebook.log, stderr,
+    // and forwards to webview console.
     let log_path = runt_workspace::default_notebook_log_path();
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path);
 
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-
-    if let Ok(file) = log_file {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-
-        let file = Arc::new(Mutex::new(file));
-        builder.format(move |_buf, record| {
-            let formatted = format!(
-                "{} [{}] {}: {}\n",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.target(),
-                record.args()
-            );
-            eprint!("{}", formatted);
-            if let Ok(mut f) = file.lock() {
-                let _ = f.write_all(formatted.as_bytes());
-                let _ = f.flush();
-            }
-            Ok(())
-        });
+    // Rotate previous session's log before the plugin opens the file.
+    // tauri-plugin-log's RotationStrategy is size-based, not per-startup,
+    // so we do our own rename here to preserve the previous session.
+    let prev_log = log_path.with_extension("log.1");
+    if log_path.exists() {
+        let _ = std::fs::rename(&log_path, &prev_log);
     }
-    builder.init();
+
+    let log_dir = log_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("log path has no parent directory"))?
+        .to_path_buf();
+    let log_file_name = log_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+
+    let log_plugin = {
+        use tauri_plugin_log::{Target, TargetKind, TimezoneStrategy};
+        let mut log_builder = tauri_plugin_log::Builder::new()
+            .clear_targets()
+            .targets([
+                // Write to our existing notebook.log location
+                Target::new(TargetKind::Folder {
+                    path: log_dir,
+                    file_name: log_file_name,
+                }),
+                // Also print to stderr (matches previous dual-output behavior)
+                Target::new(TargetKind::Stderr),
+                // Forward Rust logs to webview console for devtools
+                Target::new(TargetKind::Webview),
+            ])
+            .timezone_strategy(TimezoneStrategy::UseLocal)
+            .level(log::LevelFilter::Info)
+            .format(move |out, message, record| {
+                out.finish(format_args!(
+                    "{} [{}] {}: {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    record.level(),
+                    record.target(),
+                    message
+                ))
+            });
+        // Respect RUST_LOG for level override. Supports both bare levels
+        // (e.g. "debug") and module-level filters (e.g. "notebook=debug,info").
+        // Module filters use the plugin's level_for() API; the global default
+        // comes from the last bare level or stays at info.
+        if let Ok(rust_log) = std::env::var("RUST_LOG") {
+            for directive in rust_log.split(',') {
+                let directive = directive.trim();
+                if directive.is_empty() {
+                    continue;
+                }
+                if let Some((module, level_str)) = directive.split_once('=') {
+                    if let Ok(level) = level_str.parse::<log::LevelFilter>() {
+                        log_builder = log_builder.level_for(module.to_string(), level);
+                    }
+                } else if let Ok(level) = directive.parse::<log::LevelFilter>() {
+                    log_builder = log_builder.level(level);
+                }
+            }
+        }
+        log_builder.build()
+    };
 
     shell_env::load_shell_environment();
 
@@ -3949,6 +3985,7 @@ pub fn run(notebook_path: Option<PathBuf>, runtime: Option<Runtime>) -> anyhow::
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
+        .plugin(log_plugin)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())

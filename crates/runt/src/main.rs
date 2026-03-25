@@ -2887,11 +2887,20 @@ async fn diagnostics_command(output_dir: Option<PathBuf>) -> Result<()> {
 
     let timestamp = chrono::Local::now().format("%Y-%m-%d-%H%M%S");
     let output_dir = output_dir.unwrap_or_else(|| {
-        // Prefer ~/Desktop if it exists, otherwise fall back to the system
-        // temp directory (always exists) so the command never fails on accounts
-        // without a Desktop folder.
-        dirs::desktop_dir()
-            .filter(|p| p.exists())
+        // Prefer current directory if writable, otherwise fall back to the
+        // system temp directory (always exists).
+        std::env::current_dir()
+            .ok()
+            .filter(|p| {
+                // Quick writability check — try creating a temp file
+                let probe = p.join(".runt-diag-probe");
+                std::fs::File::create(&probe)
+                    .map(|_| {
+                        let _ = std::fs::remove_file(&probe);
+                        true
+                    })
+                    .unwrap_or(false)
+            })
             .unwrap_or_else(std::env::temp_dir)
     });
     let archive_name = format!("runt-diagnostics-{}.tar.gz", timestamp);
@@ -2924,15 +2933,32 @@ async fn diagnostics_command(output_dir: Option<PathBuf>) -> Result<()> {
     if prev_daemon_log.exists() {
         tar.append_path_with_name(&prev_daemon_log, "runtimed.log.1")?;
         println!("  {} runtimed.log.1 (previous session)", "✓".green());
+    } else {
+        println!(
+            "  {} runtimed.log.1 (previous session not found)",
+            "–".yellow()
+        );
     }
 
-    // 2. Notebook log
+    // 2. Notebook log (current session)
     let notebook_log = runt_workspace::default_notebook_log_path();
     if notebook_log.exists() {
         tar.append_path_with_name(&notebook_log, "notebook.log")?;
         println!("  {} notebook.log", "✓".green());
     } else {
         println!("  {} notebook.log (not found)", "–".yellow());
+    }
+
+    // 2b. Previous notebook session log (rotated on app startup)
+    let prev_notebook_log = notebook_log.with_extension("log.1");
+    if prev_notebook_log.exists() {
+        tar.append_path_with_name(&prev_notebook_log, "notebook.log.1")?;
+        println!("  {} notebook.log.1 (previous session)", "✓".green());
+    } else {
+        println!(
+            "  {} notebook.log.1 (previous session not found)",
+            "–".yellow()
+        );
     }
 
     // 3. daemon status --json
