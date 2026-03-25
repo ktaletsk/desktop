@@ -353,6 +353,60 @@ async def _get_single_cell_status(notebook: runtimed.Notebook, cell_id: str) -> 
         return None
 
 
+def _read_runtime_info(notebook: runtimed.Notebook) -> dict[str, Any]:
+    """Read runtime info snapshot from the notebook's local CRDT replica."""
+    info: dict[str, Any] = {}
+    try:
+        rs = notebook.runtime
+        kernel = rs.kernel
+
+        info["kernel_status"] = kernel.status
+
+        if kernel.language:
+            info["language"] = kernel.language
+
+        if kernel.name:
+            info["kernel_name"] = kernel.name
+
+        if kernel.env_source:
+            info["env_source"] = kernel.env_source
+            if kernel.env_source.startswith("conda:"):
+                info["package_manager"] = "conda"
+            elif kernel.env_source.startswith("uv:"):
+                info["package_manager"] = "uv"
+            elif kernel.env_source == "deno":
+                info["package_manager"] = "deno"
+
+        env = rs.env
+        if not env.in_sync:
+            info["env_in_sync"] = False
+
+    except Exception:
+        if not info:
+            info["kernel_status"] = "unknown"
+
+    return info
+
+
+async def _collect_runtime_info(notebook: runtimed.Notebook) -> dict[str, Any]:
+    """Collect runtime info, waiting briefly for the RuntimeStateDoc to sync.
+
+    The daemon writes kernel status (e.g. "starting") to the RuntimeStateDoc
+    after the peer joins, so there's a brief window where the client sees
+    "not_started" even though the kernel is being launched. Poll for up to
+    ~500ms to let the state doc catch up.
+    """
+    info = _read_runtime_info(notebook)
+    if info.get("kernel_status") not in ("not_started", "unknown", ""):
+        return info
+    for _ in range(5):
+        await asyncio.sleep(0.1)
+        info = _read_runtime_info(notebook)
+        if info.get("kernel_status") not in ("not_started", "unknown", ""):
+            return info
+    return info
+
+
 def _format_cell_summary(
     index: int,
     cell: runtimed.CellHandle,
@@ -826,9 +880,16 @@ class NteractServer:
                 for i, cell in enumerate(srv._notebook.cells)
             ]
 
+            runtime_info = await _collect_runtime_info(srv._notebook)
+            deps: list[str] = []
+            with contextlib.suppress(Exception):
+                deps = await srv._notebook.get_dependencies()
+
             return {
                 "notebook_id": srv._notebook.notebook_id,
                 "connected": True,
+                "runtime": runtime_info,
+                "dependencies": deps,
                 "cells": "\n".join(lines),
             }
 
@@ -860,9 +921,16 @@ class NteractServer:
                 for i, cell in enumerate(srv._notebook.cells)
             ]
 
+            runtime_info = await _collect_runtime_info(srv._notebook)
+            deps: list[str] = []
+            with contextlib.suppress(Exception):
+                deps = await srv._notebook.get_dependencies()
+
             return {
                 "notebook_id": srv._notebook.notebook_id,
                 "path": path,
+                "runtime": runtime_info,
+                "dependencies": deps,
                 "cells": "\n".join(lines),
             }
 
@@ -914,9 +982,13 @@ class NteractServer:
                 with contextlib.suppress(Exception):
                     await srv._notebook.restart()
 
+            runtime_info = await _collect_runtime_info(srv._notebook)
+            if "language" not in runtime_info:
+                runtime_info["language"] = runtime
+
             return {
                 "notebook_id": srv._notebook.notebook_id,
-                "runtime": runtime,
+                "runtime": runtime_info,
                 "dependencies": dependencies or [],
             }
 
