@@ -1845,15 +1845,19 @@ fn create_notebook_window_for_daemon(
     // ghost notebooks appear in the upgrade dialog and saved session.
     registry.prune_stale_entries(app);
 
-    // If a window with this label already exists, append a unique suffix so the same
-    // notebook can be open in multiple windows simultaneously. The first window keeps
-    // the deterministic label (window-state geometry persists); additional windows get
-    // a UUID suffix and connect as additional peers to the same daemon room.
-    let label = if app.get_webview_window(&label).is_some() {
-        format!("{}-{}", label, &uuid::Uuid::new_v4().to_string()[..8])
-    } else {
-        label
-    };
+    // If a window with this label already exists, focus it instead of opening a
+    // duplicate. Opening the same file in multiple windows causes state
+    // inconsistencies (dirty flags, titles, session restore). See #1173.
+    if let Some(existing) = app.get_webview_window(&label) {
+        info!(
+            "[window] Focusing existing window '{}' instead of opening duplicate",
+            label
+        );
+        let _ = existing.show();
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        return Ok(label);
+    }
 
     // Placeholder notebook_id — daemon will provide the canonical one.
     let placeholder_id = match &mode {
