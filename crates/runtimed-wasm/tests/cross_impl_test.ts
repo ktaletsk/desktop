@@ -166,23 +166,26 @@ Deno.test({
   name: "Cross-impl: Python Session can create and execute cell (Rust↔Rust baseline)",
   ignore: !hasDaemon,
   fn: async () => {
-    // Baseline: prove the Python Session (Rust automerge) works end-to-end
+    // Baseline: prove the Python AsyncSession (Rust automerge) works end-to-end
     const result = await runPython(`
-import json
-from runtimed.runtimed import NativeClient
+import asyncio, json
+from runtimed._internals import NativeAsyncClient
 
-c = NativeClient()
-s = c.join_notebook("cross-baseline")
-s.start_kernel(kernel_type="python", env_source="auto")
+async def main():
+    c = NativeAsyncClient()
+    s = await c.join_notebook("cross-baseline")
+    await s.start_kernel(kernel_type="python", env_source="auto")
 
-cell_id = s.create_cell('print("baseline")', cell_type="code")
-result = s.execute_cell(cell_id, timeout_secs=15)
+    cell_id = await s.create_cell('print("baseline")', cell_type="code")
+    result = await s.execute_cell(cell_id, timeout_secs=15)
 
-print(json.dumps({
-    "cell_id": result.cell_id,
-    "success": result.success,
-    "stdout": result.stdout or "",
-}))
+    print(json.dumps({
+        "cell_id": result.cell_id,
+        "success": result.success,
+        "stdout": result.stdout or "",
+    }))
+
+asyncio.run(main())
 `);
 
     const parsed = JSON.parse(result);
@@ -205,26 +208,29 @@ Deno.test({
 
     const docHex = toHex(handle.save());
 
-    // Python creates a Session for a different notebook,
+    // Python creates an AsyncSession for a different notebook,
     // then we verify byte-level compatibility by having Python
     // create its own cell and check the round-trip
     const result = await runPython(`
-import json
-from runtimed.runtimed import NativeClient
+import asyncio, json
+from runtimed._internals import NativeAsyncClient
 
-c = NativeClient()
-s = c.join_notebook("wasm-compat-check")
+async def main():
+    c = NativeAsyncClient()
+    s = await c.join_notebook("wasm-compat-check")
 
-# Create a cell via Rust automerge
-cell_id = s.create_cell("x = 42", cell_type="code")
-cells = s.get_cells()
+    # Create a cell via Rust automerge
+    cell_id = await s.create_cell("x = 42", cell_type="code")
+    cells = await s.get_cells()
 
-print(json.dumps({
-    "cell_count": len(cells),
-    "cell_id": cells[0].id,
-    "source": cells[0].source,
-    "wasm_doc_hex_length": ${docHex.length},
-}))
+    print(json.dumps({
+        "cell_count": len(cells),
+        "cell_id": cells[0].id,
+        "source": cells[0].source,
+        "wasm_doc_hex_length": ${docHex.length},
+    }))
+
+asyncio.run(main())
 `);
 
     const parsed = JSON.parse(result);
@@ -245,27 +251,30 @@ Deno.test({
     // we verify the cell can execute. Then we verify our WASM can load
     // and modify a doc that was produced by saving a Rust-created doc.
     const result = await runPython(`
-import json
-from runtimed.runtimed import NativeClient
+import asyncio, json
+from runtimed._internals import NativeAsyncClient
 
-c = NativeClient()
-s = c.join_notebook("cross-exec")
-s.start_kernel(kernel_type="python", env_source="auto")
+async def main():
+    c = NativeAsyncClient()
+    s = await c.join_notebook("cross-exec")
+    await s.start_kernel(kernel_type="python", env_source="auto")
 
-cell_id = s.create_cell('print("cross-impl verified!")', cell_type="code")
-result = s.execute_cell(cell_id, timeout_secs=15)
+    cell_id = await s.create_cell('print("cross-impl verified!")', cell_type="code")
+    result = await s.execute_cell(cell_id, timeout_secs=15)
 
-# Also get all cells to verify structure
-cells = s.get_cells()
+    # Also get all cells to verify structure
+    cells = await s.get_cells()
 
-print(json.dumps({
-    "success": result.success,
-    "stdout": result.stdout or "",
-    "cell_count": len(cells),
-    "cell_id": cells[0].id,
-    "cell_type": cells[0].cell_type,
-    "source": cells[0].source,
-}))
+    print(json.dumps({
+        "success": result.success,
+        "stdout": result.stdout or "",
+        "cell_count": len(cells),
+        "cell_id": cells[0].id,
+        "cell_type": cells[0].cell_type,
+        "source": cells[0].source,
+    }))
+
+asyncio.run(main())
 `);
 
     const parsed = JSON.parse(result);
@@ -289,39 +298,42 @@ Deno.test({
     // This proves that when our WASM eventually connects to the same room,
     // the Rust-side doc will contain cells our WASM can read.
     const result = await runPython(`
-import json, time
-from runtimed.runtimed import NativeClient
+import asyncio, json
+from runtimed._internals import NativeAsyncClient
 
-c = NativeClient()
+async def main():
+    c = NativeAsyncClient()
 
-# First session creates cells
-s1 = c.join_notebook("multi-peer-test")
+    # First session creates cells
+    s1 = await c.join_notebook("multi-peer-test")
 
-cell1 = s1.create_cell("# cell from peer 1", cell_type="code")
+    cell1 = await s1.create_cell("# cell from peer 1", cell_type="code")
 
-# Second session joins the same room
-s2 = c.join_notebook("multi-peer-test")
+    # Second session joins the same room
+    s2 = await c.join_notebook("multi-peer-test")
 
-# Give sync a moment
-time.sleep(0.5)
+    # Give sync a moment
+    await asyncio.sleep(0.5)
 
-cells_s2 = s2.get_cells()
+    cells_s2 = await s2.get_cells()
 
-# s2 adds its own cell
-cell2 = s2.create_cell("# cell from peer 2", cell_type="markdown")
+    # s2 adds its own cell
+    cell2 = await s2.create_cell("# cell from peer 2", cell_type="markdown")
 
-time.sleep(0.5)
+    await asyncio.sleep(0.5)
 
-cells_s1 = s1.get_cells()
-cells_s2_final = s2.get_cells()
+    cells_s1 = await s1.get_cells()
+    cells_s2_final = await s2.get_cells()
 
-print(json.dumps({
-    "s2_initial_count": len(cells_s2),
-    "s1_final_count": len(cells_s1),
-    "s2_final_count": len(cells_s2_final),
-    "s1_ids": [c.id for c in cells_s1],
-    "s2_ids": [c.id for c in cells_s2_final],
-}))
+    print(json.dumps({
+        "s2_initial_count": len(cells_s2),
+        "s1_final_count": len(cells_s1),
+        "s2_final_count": len(cells_s2_final),
+        "s1_ids": [c.id for c in cells_s1],
+        "s2_ids": [c.id for c in cells_s2_final],
+    }))
+
+asyncio.run(main())
 `);
 
     const parsed = JSON.parse(result);
@@ -349,14 +361,18 @@ Deno.test({
     // and exports the raw Automerge doc bytes. WASM loads those bytes and
     // verifies byte-level compatibility.
     const docHex = await runPython(`
-from runtimed.runtimed import NativeClient
+import asyncio
+from runtimed._internals import NativeAsyncClient
 
-c = NativeClient()
-s = c.join_notebook("export-bytes-test")
-cell_id = s.create_cell("x = 42", cell_type="code")
-s.confirm_sync()
-doc_bytes = s.get_automerge_doc_bytes()
-print(doc_bytes.hex())
+async def main():
+    c = NativeAsyncClient()
+    s = await c.join_notebook("export-bytes-test")
+    cell_id = await s.create_cell("x = 42", cell_type="code")
+    await s.confirm_sync()
+    doc_bytes = await s.get_automerge_doc_bytes()
+    print(doc_bytes.hex())
+
+asyncio.run(main())
 `);
 
     const docBytes = fromHex(docHex);

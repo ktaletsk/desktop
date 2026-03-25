@@ -28,12 +28,10 @@ class TestModuleExports:
         """CellHandle is exported from runtimed."""
         assert hasattr(runtimed, "CellHandle")
 
-    def test_native_types_exported(self):
-        """Native types are accessible for advanced use."""
-        assert hasattr(runtimed, "NativeAsyncClient")
-        assert hasattr(runtimed, "NativeClient")
-        assert hasattr(runtimed, "AsyncSession")
-        assert hasattr(runtimed, "Session")
+    def test_internal_types_not_exported(self):
+        """Internal native types are not re-exported from the package."""
+        assert not hasattr(runtimed, "NativeAsyncClient")
+        assert not hasattr(runtimed, "AsyncSession")
 
     def test_runtime_state_types_exported(self):
         """Runtime state types use clean names."""
@@ -42,8 +40,10 @@ class TestModuleExports:
         assert hasattr(runtimed, "EnvState")
 
     def test_deprecated_types_removed(self):
-        """DaemonClient is no longer exported."""
+        """Removed types are no longer exported."""
         assert not hasattr(runtimed, "DaemonClient")
+        assert not hasattr(runtimed, "NativeClient")
+        assert not hasattr(runtimed, "Session")
 
     def test_all_exports(self):
         """Check __all__ exports match expected items exactly."""
@@ -90,11 +90,6 @@ class TestClientConstruction:
         """Client can be instantiated without a daemon."""
         client = runtimed.Client()
         assert repr(client) == "Client()"
-
-    def test_native_client_creates(self):
-        """NativeClient can be instantiated."""
-        client = runtimed.NativeClient()
-        assert "NativeClient" in repr(client) or "Client" in repr(client)
 
 
 class TestNotebookInfo:
@@ -148,15 +143,19 @@ class TestCreateNotebookValidation:
 
     def test_create_notebook_rejects_nonexistent_path(self):
         """create_notebook raises FileNotFoundError for non-existent working_dir."""
-        client = runtimed.NativeAsyncClient()
+        from runtimed._internals import NativeAsyncClient
+
+        client = NativeAsyncClient()
         with pytest.raises(FileNotFoundError, match="working_dir does not exist"):
             client.create_notebook(working_dir="/sessions/fake-path")
 
     def test_create_notebook_rejects_file_as_working_dir(self, tmp_path):
         """create_notebook raises NotADirectoryError when working_dir is a file."""
+        from runtimed._internals import NativeAsyncClient
+
         test_file = tmp_path / "test_file.txt"
         test_file.write_text("test")
-        client = runtimed.NativeAsyncClient()
+        client = NativeAsyncClient()
         with pytest.raises(NotADirectoryError, match="working_dir is not a directory"):
             client.create_notebook(working_dir=str(test_file))
 
