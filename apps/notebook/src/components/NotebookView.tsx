@@ -492,6 +492,8 @@ function NotebookViewContent({
     const focusedIndex = cellIds.indexOf(focusedCellId);
     return focusedIndex > 0 ? cellIds[focusedIndex - 1] : null;
   }, [focusedCellId, cellIds]);
+  const previousCellIdRef = useRef(previousCellId);
+  previousCellIdRef.current = previousCellId;
 
   // Compute the cell ID that follows the focused cell (keeps its output bright)
   const nextCellId = useMemo(() => {
@@ -501,6 +503,8 @@ function NotebookViewContent({
       ? cellIds[focusedIndex + 1]
       : null;
   }, [focusedCellId, cellIds]);
+  const nextCellIdRef = useRef(nextCellId);
+  nextCellIdRef.current = nextCellId;
 
   // Prevent horizontal scroll drift (can happen during text selection)
   useEffect(() => {
@@ -695,8 +699,8 @@ function NotebookViewContent({
             cell={cell}
             language={language}
             isFocused={isFocused}
-            isPreviousCellFromFocused={cell.id === previousCellId}
-            isNextCellFromFocused={cell.id === nextCellId}
+            isPreviousCellFromFocused={cell.id === previousCellIdRef.current}
+            isNextCellFromFocused={cell.id === nextCellIdRef.current}
             isExecuting={isExecuting}
             isQueued={isQueued}
             pagePayload={pagePayload}
@@ -766,8 +770,8 @@ function NotebookViewContent({
             key={cell.id}
             cell={cell}
             isFocused={isFocused}
-            isPreviousCellFromFocused={cell.id === previousCellId}
-            isNextCellFromFocused={cell.id === nextCellId}
+            isPreviousCellFromFocused={cell.id === previousCellIdRef.current}
+            isNextCellFromFocused={cell.id === nextCellIdRef.current}
             searchQuery={searchQuery}
             onFocus={() => {
               focusSourceRef.current = "mouse";
@@ -811,8 +815,6 @@ function NotebookViewContent({
     },
     [
       focusedCellId,
-      previousCellId,
-      nextCellId,
       executingCellIds,
       queuedCellIds,
       pagePayloads,
