@@ -882,17 +882,27 @@ impl RoomKernel {
                                     _ => "unknown",
                                 };
 
+                                // Broadcast to all peers immediately for real-time UI
                                 let _ = broadcast_tx.send(NotebookBroadcast::KernelStatus {
                                     status: status_str.to_string(),
                                     cell_id: cell_id.clone(),
                                 });
 
-                                // Only write known statuses to RuntimeStateDoc — skip "unknown"
-                                // to avoid polluting the schema with values clients can't handle.
+                                // Write to RuntimeStateDoc — but skip transient
+                                // busy/idle from non-execution requests (autocomplete,
+                                // inspect, etc.) which have no cell_entry. These cause
+                                // rapid busy→idle thrashing that generates excessive
+                                // Automerge sync traffic. The broadcast above still
+                                // fires for real-time UI; only the CRDT write is skipped.
                                 if status_str != "unknown" {
-                                    let mut sd = state_doc_for_iopub.write().await;
-                                    if sd.set_kernel_status(status_str) {
-                                        let _ = state_changed_for_iopub.send(());
+                                    let is_transient = cell_entry.is_none()
+                                        && (status_str == "busy" || status_str == "idle");
+
+                                    if !is_transient {
+                                        let mut sd = state_doc_for_iopub.write().await;
+                                        if sd.set_kernel_status(status_str) {
+                                            let _ = state_changed_for_iopub.send(());
+                                        }
                                     }
                                 }
 
