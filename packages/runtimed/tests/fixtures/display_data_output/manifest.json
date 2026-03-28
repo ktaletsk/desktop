@@ -1,0 +1,10 @@
+{
+  "description": "Cell produces display_data with manifest hash (simulated image)",
+  "expected": {
+    "cell_id": "cell-1",
+    "execution_count": "1",
+    "output_count": 1,
+    "output_is_manifest_hash": true
+  },
+  "scenario": "display_data_output"
+}

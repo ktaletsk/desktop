@@ -1,0 +1,15 @@
+{
+  "description": "Daemon creates cell, executes, streams 3 stdout lines",
+  "expected": {
+    "cell_id": "cell-1",
+    "execution_count": "1",
+    "output_count": 3,
+    "outputs": [
+      "{\"name\":\"stdout\",\"output_type\":\"stream\",\"text\":\"0\\n\"}",
+      "{\"name\":\"stdout\",\"output_type\":\"stream\",\"text\":\"1\\n\"}",
+      "{\"name\":\"stdout\",\"output_type\":\"stream\",\"text\":\"2\\n\"}"
+    ],
+    "source": "for i in range(3):\n    print(i)"
+  },
+  "scenario": "output_streaming"
+}

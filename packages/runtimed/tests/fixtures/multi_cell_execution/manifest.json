@@ -1,0 +1,24 @@
+{
+  "description": "Two code cells + markdown, sequential execution",
+  "expected": {
+    "cell_count": 3,
+    "cells": [
+      {
+        "cell_id": "cell-1",
+        "execution_count": "1",
+        "output_count": 0
+      },
+      {
+        "cell_id": "cell-2",
+        "execution_count": "2",
+        "output_count": 1
+      },
+      {
+        "cell_id": "cell-3",
+        "cell_type": "markdown",
+        "source": "# Results"
+      }
+    ]
+  },
+  "scenario": "multi_cell_execution"
+}

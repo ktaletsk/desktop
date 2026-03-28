@@ -1,0 +1,10 @@
+{
+  "description": "Daemon executes cell that raises ZeroDivisionError",
+  "expected": {
+    "cell_id": "cell-1",
+    "execution_count": "1",
+    "output_count": 1,
+    "source": "1 / 0"
+  },
+  "scenario": "execution_with_error"
+}

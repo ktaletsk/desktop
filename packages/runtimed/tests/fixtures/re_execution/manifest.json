@@ -1,0 +1,9 @@
+{
+  "description": "Cell executed twice — only second execution's outputs remain",
+  "expected": {
+    "cell_id": "cell-1",
+    "execution_count": "2",
+    "output_count": 1
+  },
+  "scenario": "re_execution"
+}
