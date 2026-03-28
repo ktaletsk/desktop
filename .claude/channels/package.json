@@ -1,0 +1,7 @@
+{
+  "name": "nteract-ci-channel",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0"
+  }
+}
