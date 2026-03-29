@@ -30,9 +30,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ContentRef {
-    Inline { inline: String },
+    Inline {
+        inline: String,
+    },
     #[allow(dead_code)]
-    Blob { blob: String, size: u64 },
+    Blob {
+        blob: String,
+        size: u64,
+    },
 }
 
 /// Output manifest — the JSON structure stored in the blob store.
