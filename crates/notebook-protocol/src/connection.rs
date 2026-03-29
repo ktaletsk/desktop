@@ -764,4 +764,284 @@ mod tests {
         let parsed: TestMsg = serde_json::from_slice(&frame.payload).unwrap();
         assert_eq!(parsed, msg);
     }
+
+    // ── Integration: real protocol types through the frame pipeline ─────
+
+    #[tokio::test]
+    async fn typed_frame_request_through_pipeline() {
+        use crate::protocol::NotebookRequest;
+
+        let req = NotebookRequest::ExecuteCell {
+            cell_id: "cell-abc".into(),
+        };
+
+        let mut buf = Vec::new();
+        send_typed_json_frame(&mut buf, NotebookFrameType::Request, &req)
+            .await
+            .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let frame = recv_typed_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(frame.frame_type, NotebookFrameType::Request);
+
+        // This is the exact deserialization path the daemon uses
+        let parsed: NotebookRequest = serde_json::from_slice(&frame.payload).unwrap();
+        assert!(
+            matches!(parsed, NotebookRequest::ExecuteCell { cell_id } if cell_id == "cell-abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_frame_response_through_pipeline() {
+        use crate::protocol::NotebookResponse;
+
+        let resp = NotebookResponse::Error {
+            error: "kernel died".into(),
+        };
+
+        let mut buf = Vec::new();
+        send_typed_json_frame(&mut buf, NotebookFrameType::Response, &resp)
+            .await
+            .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let frame = recv_typed_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(frame.frame_type, NotebookFrameType::Response);
+
+        // This is the exact deserialization path notebook-sync uses
+        let parsed: NotebookResponse = serde_json::from_slice(&frame.payload).unwrap();
+        assert!(matches!(parsed, NotebookResponse::Error { error } if error == "kernel died"));
+    }
+
+    #[tokio::test]
+    async fn typed_frame_broadcast_through_pipeline() {
+        use crate::protocol::NotebookBroadcast;
+
+        let bc = NotebookBroadcast::ExecutionDone {
+            cell_id: "c1".into(),
+            execution_id: "ex1".into(),
+        };
+
+        let mut buf = Vec::new();
+        send_typed_json_frame(&mut buf, NotebookFrameType::Broadcast, &bc)
+            .await
+            .unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let frame = recv_typed_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(frame.frame_type, NotebookFrameType::Broadcast);
+
+        let parsed: NotebookBroadcast = serde_json::from_slice(&frame.payload).unwrap();
+        assert!(matches!(
+            parsed,
+            NotebookBroadcast::ExecutionDone { cell_id, execution_id }
+                if cell_id == "c1" && execution_id == "ex1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_connection_sequence() {
+        // Simulate a real connection: preamble → handshake → request → response → broadcast
+        use crate::protocol::{NotebookBroadcast, NotebookRequest, NotebookResponse};
+
+        let mut wire = Vec::new();
+
+        // 1. Preamble
+        send_preamble(&mut wire).await.unwrap();
+
+        // 2. Handshake
+        let hs = Handshake::NotebookSync {
+            notebook_id: "test-notebook".into(),
+            protocol: Some("v2".into()),
+            working_dir: None,
+            initial_metadata: None,
+        };
+        send_json_frame(&mut wire, &hs).await.unwrap();
+
+        // 3. Request
+        let req = NotebookRequest::LaunchKernel {
+            kernel_type: "python".into(),
+            env_source: "uv:inline".into(),
+            notebook_path: Some("/tmp/test.ipynb".into()),
+        };
+        send_typed_json_frame(&mut wire, NotebookFrameType::Request, &req)
+            .await
+            .unwrap();
+
+        // 4. Response
+        let resp = NotebookResponse::KernelLaunched {
+            kernel_type: "python".into(),
+            env_source: "uv:inline".into(),
+            launched_config: crate::protocol::LaunchedEnvConfig::default(),
+        };
+        send_typed_json_frame(&mut wire, NotebookFrameType::Response, &resp)
+            .await
+            .unwrap();
+
+        // 5. Broadcast
+        let bc = NotebookBroadcast::KernelStatus {
+            status: "idle".into(),
+            cell_id: None,
+        };
+        send_typed_json_frame(&mut wire, NotebookFrameType::Broadcast, &bc)
+            .await
+            .unwrap();
+
+        // Now read it all back
+        let mut cursor = std::io::Cursor::new(wire);
+
+        // 1. Preamble
+        let version = recv_preamble(&mut cursor).await.unwrap();
+        assert_eq!(version, PROTOCOL_VERSION as u8);
+
+        // 2. Handshake
+        let parsed_hs: Handshake = recv_json_frame(&mut cursor).await.unwrap().unwrap();
+        assert!(matches!(
+            parsed_hs,
+            Handshake::NotebookSync { notebook_id, .. } if notebook_id == "test-notebook"
+        ));
+
+        // 3. Request
+        let frame = recv_typed_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(frame.frame_type, NotebookFrameType::Request);
+        let parsed_req: NotebookRequest = serde_json::from_slice(&frame.payload).unwrap();
+        assert!(matches!(parsed_req, NotebookRequest::LaunchKernel { .. }));
+
+        // 4. Response
+        let frame = recv_typed_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(frame.frame_type, NotebookFrameType::Response);
+        let parsed_resp: NotebookResponse = serde_json::from_slice(&frame.payload).unwrap();
+        assert!(matches!(
+            parsed_resp,
+            NotebookResponse::KernelLaunched { .. }
+        ));
+
+        // 5. Broadcast
+        let frame = recv_typed_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(frame.frame_type, NotebookFrameType::Broadcast);
+        let parsed_bc: NotebookBroadcast = serde_json::from_slice(&frame.payload).unwrap();
+        assert!(matches!(parsed_bc, NotebookBroadcast::KernelStatus { .. }));
+
+        // 6. EOF
+        assert!(recv_typed_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recv_typed_frame_rejects_empty_payload() {
+        // A frame with 0-byte payload (after length prefix) is invalid —
+        // no frame type byte to read.
+        let mut buf = Vec::new();
+        send_frame(&mut buf, &[]).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = recv_typed_frame(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn recv_typed_frame_rejects_unknown_type_byte() {
+        let mut buf = Vec::new();
+        // Manually write a frame with unknown type byte 0xFE
+        send_frame(&mut buf, &[0xFE, 0x01, 0x02]).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = recv_typed_frame(&mut cursor).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn frame_at_exact_max_size_succeeds() {
+        // A frame exactly at MAX_FRAME_SIZE should succeed
+        let data = vec![0u8; MAX_FRAME_SIZE];
+        let mut buf = Vec::new();
+        send_frame(&mut buf, &data).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let received = recv_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(received.len(), MAX_FRAME_SIZE);
+    }
+
+    #[tokio::test]
+    async fn control_frame_at_exact_max_size_succeeds() {
+        let data = vec![0u8; MAX_CONTROL_FRAME_SIZE];
+        let mut buf = Vec::new();
+        send_frame(&mut buf, &data).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let received = recv_control_frame(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(received.len(), MAX_CONTROL_FRAME_SIZE);
+    }
+
+    #[tokio::test]
+    async fn truncated_frame_body_is_eof_error() {
+        // Length says 100 bytes but only 10 follow
+        let len_bytes = 100u32.to_be_bytes();
+        let mut data = len_bytes.to_vec();
+        data.extend_from_slice(&[0u8; 10]);
+
+        let mut cursor = std::io::Cursor::new(data);
+        let result = recv_frame(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn notebook_frame_type_repr_matches_frame_type_constants() {
+        // The repr(u8) values must match the constants in notebook_doc::frame_types.
+        // If someone changes one without the other, this catches it.
+        assert_eq!(
+            NotebookFrameType::AutomergeSync as u8,
+            notebook_doc::frame_types::AUTOMERGE_SYNC
+        );
+        assert_eq!(
+            NotebookFrameType::Request as u8,
+            notebook_doc::frame_types::REQUEST
+        );
+        assert_eq!(
+            NotebookFrameType::Response as u8,
+            notebook_doc::frame_types::RESPONSE
+        );
+        assert_eq!(
+            NotebookFrameType::Broadcast as u8,
+            notebook_doc::frame_types::BROADCAST
+        );
+        assert_eq!(
+            NotebookFrameType::Presence as u8,
+            notebook_doc::frame_types::PRESENCE
+        );
+        assert_eq!(
+            NotebookFrameType::RuntimeStateSync as u8,
+            notebook_doc::frame_types::RUNTIME_STATE_SYNC
+        );
+    }
+
+    #[test]
+    fn all_frame_type_byte_values_are_handled() {
+        // Every valid frame type byte should parse, and every byte in 0..=0xFF
+        // that isn't valid should error. This ensures we don't accidentally
+        // add a new frame_types constant without updating TryFrom.
+        let valid: std::collections::HashSet<u8> = [
+            notebook_doc::frame_types::AUTOMERGE_SYNC,
+            notebook_doc::frame_types::REQUEST,
+            notebook_doc::frame_types::RESPONSE,
+            notebook_doc::frame_types::BROADCAST,
+            notebook_doc::frame_types::PRESENCE,
+            notebook_doc::frame_types::RUNTIME_STATE_SYNC,
+        ]
+        .into_iter()
+        .collect();
+
+        for byte in 0..=u8::MAX {
+            let result = NotebookFrameType::try_from(byte);
+            if valid.contains(&byte) {
+                assert!(result.is_ok(), "byte 0x{byte:02x} should be valid");
+            } else {
+                assert!(result.is_err(), "byte 0x{byte:02x} should be rejected");
+            }
+        }
+    }
 }

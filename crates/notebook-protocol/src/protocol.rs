@@ -311,6 +311,861 @@ pub enum NotebookRequest {
     CheckToolAvailable { tool: String },
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    // ── Helpers ────────────────────────────────────────────────────────
+
+    /// Parse JSON → T → JSON and assert the value round-trips cleanly.
+    fn assert_json_roundtrip<T: serde::Serialize + serde::de::DeserializeOwned>(json_str: &str) {
+        let parsed: T = serde_json::from_str(json_str).unwrap();
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        let expected: Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(reserialized, expected, "roundtrip mismatch for: {json_str}");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // NotebookRequest — wire format
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn request_discriminator_is_action() {
+        // The daemon dispatches on `action` — if this key name changes,
+        // every client breaks.
+        let req = NotebookRequest::ExecuteCell {
+            cell_id: "c1".into(),
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["action"], "execute_cell");
+        assert!(v.get("result").is_none(), "request must not have `result`");
+        assert!(v.get("event").is_none(), "request must not have `event`");
+    }
+
+    #[test]
+    fn request_launch_kernel_wire_shape() {
+        let json = r#"{"action":"launch_kernel","kernel_type":"python","env_source":"uv:inline","notebook_path":"/tmp/nb.ipynb"}"#;
+        assert_json_roundtrip::<NotebookRequest>(json);
+
+        // notebook_path is optional — None serializes as null (no skip_serializing_if)
+        let req = NotebookRequest::LaunchKernel {
+            kernel_type: "deno".into(),
+            env_source: "system".into(),
+            notebook_path: None,
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert!(v["notebook_path"].is_null());
+    }
+
+    #[test]
+    fn request_execute_cell_minimal() {
+        let json = r#"{"action":"execute_cell","cell_id":"abc-123"}"#;
+        assert_json_roundtrip::<NotebookRequest>(json);
+    }
+
+    #[test]
+    fn request_all_unit_variants_serialize_without_extra_fields() {
+        // These request variants carry no data beyond the action tag.
+        // Verify they produce exactly `{"action":"..."}` and nothing else.
+        let unit_variants: Vec<(NotebookRequest, &str)> = vec![
+            (
+                NotebookRequest::InterruptExecution {},
+                "interrupt_execution",
+            ),
+            (NotebookRequest::ShutdownKernel {}, "shutdown_kernel"),
+            (NotebookRequest::GetKernelInfo {}, "get_kernel_info"),
+            (NotebookRequest::GetQueueState {}, "get_queue_state"),
+            (NotebookRequest::RunAllCells {}, "run_all_cells"),
+            (NotebookRequest::SyncEnvironment {}, "sync_environment"),
+            (NotebookRequest::GetDocBytes {}, "get_doc_bytes"),
+            (
+                NotebookRequest::GetMetadataSnapshot {},
+                "get_metadata_snapshot",
+            ),
+        ];
+        for (req, expected_action) in unit_variants {
+            let v: Value = serde_json::to_value(&req).unwrap();
+            let obj = v.as_object().unwrap();
+            assert_eq!(obj.get("action").unwrap(), expected_action);
+            assert_eq!(
+                obj.len(),
+                1,
+                "{expected_action} should only have the `action` field, got: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_save_notebook_defaults() {
+        // format_cells is required; path is optional and skip_serializing_if
+        let req = NotebookRequest::SaveNotebook {
+            format_cells: false,
+            path: None,
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["format_cells"], false);
+        assert!(v.get("path").is_none(), "None path must be omitted");
+
+        // With path present
+        let req = NotebookRequest::SaveNotebook {
+            format_cells: true,
+            path: Some("/tmp/out.ipynb".into()),
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["path"], "/tmp/out.ipynb");
+    }
+
+    #[test]
+    fn request_save_notebook_path_defaults_on_missing() {
+        // A client that omits `path` entirely — serde(default) should fill in None
+        let json = r#"{"action":"save_notebook","format_cells":true}"#;
+        let req: NotebookRequest = serde_json::from_str(json).unwrap();
+        match req {
+            NotebookRequest::SaveNotebook { path, format_cells } => {
+                assert!(path.is_none());
+                assert!(format_cells);
+            }
+            other => panic!("expected SaveNotebook, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_complete_wire_shape() {
+        let json = r#"{"action":"complete","code":"import pa","cursor_pos":9}"#;
+        assert_json_roundtrip::<NotebookRequest>(json);
+    }
+
+    #[test]
+    fn request_get_history_wire_shape() {
+        let json = r#"{"action":"get_history","pattern":"import*","n":50,"unique":true}"#;
+        assert_json_roundtrip::<NotebookRequest>(json);
+
+        // pattern is optional
+        let json = r#"{"action":"get_history","pattern":null,"n":10,"unique":false}"#;
+        let req: NotebookRequest = serde_json::from_str(json).unwrap();
+        match req {
+            NotebookRequest::GetHistory { pattern, n, unique } => {
+                assert!(pattern.is_none());
+                assert_eq!(n, 10);
+                assert!(!unique);
+            }
+            other => panic!("expected GetHistory, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_send_comm_preserves_arbitrary_json() {
+        let msg = json!({"header": {"msg_id": "x"}, "content": {"comm_id": "w1"}});
+        let req = NotebookRequest::SendComm {
+            message: msg.clone(),
+        };
+        let v: Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["message"], msg);
+    }
+
+    #[test]
+    fn request_set_raw_metadata() {
+        let json = r#"{"action":"set_raw_metadata","key":"custom_key","value":"{\"foo\":1}"}"#;
+        assert_json_roundtrip::<NotebookRequest>(json);
+    }
+
+    #[test]
+    fn request_check_tool_available() {
+        let json = r#"{"action":"check_tool_available","tool":"deno"}"#;
+        assert_json_roundtrip::<NotebookRequest>(json);
+    }
+
+    #[test]
+    fn request_unknown_action_is_rejected() {
+        let json = r#"{"action":"do_magic","cell_id":"c1"}"#;
+        let result = serde_json::from_str::<NotebookRequest>(json);
+        assert!(result.is_err(), "unknown action must not silently succeed");
+    }
+
+    #[test]
+    fn request_missing_action_is_rejected() {
+        let json = r#"{"cell_id":"c1"}"#;
+        let result = serde_json::from_str::<NotebookRequest>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn request_missing_required_field_is_rejected() {
+        // ExecuteCell needs cell_id
+        let json = r#"{"action":"execute_cell"}"#;
+        let result = serde_json::from_str::<NotebookRequest>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn request_wrong_field_type_is_rejected() {
+        // cursor_pos should be usize, not string
+        let json = r#"{"action":"complete","code":"x","cursor_pos":"not_a_number"}"#;
+        let result = serde_json::from_str::<NotebookRequest>(json);
+        assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // NotebookResponse — wire format
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn response_discriminator_is_result() {
+        let resp = NotebookResponse::NoKernel {};
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"], "no_kernel");
+        assert!(v.get("action").is_none());
+        assert!(v.get("event").is_none());
+    }
+
+    #[test]
+    fn response_kernel_launched_wire_shape() {
+        let resp = NotebookResponse::KernelLaunched {
+            kernel_type: "python".into(),
+            env_source: "uv:inline".into(),
+            launched_config: LaunchedEnvConfig::default(),
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"], "kernel_launched");
+        assert_eq!(v["kernel_type"], "python");
+        assert_eq!(v["env_source"], "uv:inline");
+        // default LaunchedEnvConfig should omit all optional fields
+        assert!(v.get("uv_deps").is_none());
+        assert!(v.get("conda_deps").is_none());
+        assert!(v.get("venv_path").is_none());
+    }
+
+    #[test]
+    fn response_kernel_already_running_has_config() {
+        let config = LaunchedEnvConfig {
+            uv_deps: Some(vec!["numpy".into(), "pandas".into()]),
+            venv_path: Some("/tmp/venv".into()),
+            launch_id: Some("launch-001".into()),
+            ..Default::default()
+        };
+        let resp = NotebookResponse::KernelAlreadyRunning {
+            kernel_type: "python".into(),
+            env_source: "uv:inline".into(),
+            launched_config: config,
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"], "kernel_already_running");
+        assert_eq!(v["launched_config"]["uv_deps"], json!(["numpy", "pandas"]));
+        assert_eq!(v["launched_config"]["venv_path"], "/tmp/venv");
+        assert_eq!(v["launched_config"]["launch_id"], "launch-001");
+    }
+
+    #[test]
+    fn response_cell_queued() {
+        let json = r#"{"result":"cell_queued","cell_id":"c1","execution_id":"ex1"}"#;
+        assert_json_roundtrip::<NotebookResponse>(json);
+    }
+
+    #[test]
+    fn response_queue_state() {
+        let resp = NotebookResponse::QueueState {
+            executing: Some(QueueEntry {
+                cell_id: "c1".into(),
+                execution_id: "ex1".into(),
+            }),
+            queued: vec![QueueEntry {
+                cell_id: "c2".into(),
+                execution_id: "ex2".into(),
+            }],
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["executing"]["cell_id"], "c1");
+        assert_eq!(v["queued"][0]["cell_id"], "c2");
+
+        // Empty queue
+        let resp = NotebookResponse::QueueState {
+            executing: None,
+            queued: vec![],
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert!(v["executing"].is_null());
+        assert_eq!(v["queued"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn response_notebook_saved_wire_shape() {
+        // Without re-key
+        let resp = NotebookResponse::NotebookSaved {
+            path: "/home/user/nb.ipynb".into(),
+            new_notebook_id: None,
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["path"], "/home/user/nb.ipynb");
+        assert!(
+            v.get("new_notebook_id").is_none(),
+            "None new_notebook_id must be omitted"
+        );
+
+        // With re-key (ephemeral → file-path)
+        let resp = NotebookResponse::NotebookSaved {
+            path: "/home/user/nb.ipynb".into(),
+            new_notebook_id: Some("/home/user/nb.ipynb".into()),
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["new_notebook_id"], "/home/user/nb.ipynb");
+    }
+
+    #[test]
+    fn response_error_carries_message() {
+        let json = r#"{"result":"error","error":"kernel crashed"}"#;
+        assert_json_roundtrip::<NotebookResponse>(json);
+    }
+
+    #[test]
+    fn response_history_result() {
+        let resp = NotebookResponse::HistoryResult {
+            entries: vec![
+                HistoryEntry {
+                    session: 0,
+                    line: 1,
+                    source: "import os".into(),
+                },
+                HistoryEntry {
+                    session: 0,
+                    line: 2,
+                    source: "os.getcwd()".into(),
+                },
+            ],
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(v["entries"][0]["source"], "import os");
+        assert_eq!(v["entries"][1]["line"], 2);
+    }
+
+    #[test]
+    fn response_completion_result() {
+        let resp = NotebookResponse::CompletionResult {
+            items: vec![CompletionItem {
+                label: "pandas".into(),
+                kind: Some("module".into()),
+                detail: None,
+                source: Some("kernel".into()),
+            }],
+            cursor_start: 7,
+            cursor_end: 9,
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["items"][0]["label"], "pandas");
+        assert_eq!(v["items"][0]["kind"], "module");
+        assert!(
+            v["items"][0].get("detail").is_none(),
+            "None detail must be omitted"
+        );
+        assert_eq!(v["cursor_start"], 7);
+    }
+
+    #[test]
+    fn response_sync_environment_failed() {
+        let json =
+            r#"{"result":"sync_environment_failed","error":"pip failed","needs_restart":true}"#;
+        assert_json_roundtrip::<NotebookResponse>(json);
+    }
+
+    #[test]
+    fn response_doc_bytes_carries_raw_bytes() {
+        let resp = NotebookResponse::DocBytes {
+            bytes: vec![0x00, 0x85, 0xFF],
+        };
+        let v: Value = serde_json::to_value(&resp).unwrap();
+        // serde_json serializes Vec<u8> as an array of numbers
+        assert_eq!(v["bytes"], json!([0, 133, 255]));
+    }
+
+    #[test]
+    fn response_all_unit_variants() {
+        let variants: Vec<(NotebookResponse, &str)> = vec![
+            (
+                NotebookResponse::OutputsCleared {
+                    cell_id: "c1".into(),
+                },
+                "outputs_cleared",
+            ),
+            (NotebookResponse::InterruptSent {}, "interrupt_sent"),
+            (
+                NotebookResponse::KernelShuttingDown {},
+                "kernel_shutting_down",
+            ),
+            (NotebookResponse::NoKernel {}, "no_kernel"),
+            (NotebookResponse::Ok {}, "ok"),
+            (NotebookResponse::MetadataSet {}, "metadata_set"),
+            (
+                NotebookResponse::ToolAvailable { available: true },
+                "tool_available",
+            ),
+        ];
+        for (resp, expected_result) in variants {
+            let v: Value = serde_json::to_value(&resp).unwrap();
+            assert_eq!(v["result"], expected_result);
+        }
+    }
+
+    #[test]
+    fn response_unknown_result_is_rejected() {
+        let json = r#"{"result":"quantum_state","data":42}"#;
+        assert!(serde_json::from_str::<NotebookResponse>(json).is_err());
+    }
+
+    #[test]
+    fn response_missing_result_tag_is_rejected() {
+        let json = r#"{"error":"something broke"}"#;
+        assert!(serde_json::from_str::<NotebookResponse>(json).is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // NotebookBroadcast — wire format
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn broadcast_discriminator_is_event() {
+        let bc = NotebookBroadcast::KernelStatus {
+            status: "idle".into(),
+            cell_id: None,
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["event"], "kernel_status");
+        assert!(v.get("action").is_none());
+        assert!(v.get("result").is_none());
+    }
+
+    #[test]
+    fn broadcast_kernel_status_with_and_without_cell() {
+        let bc = NotebookBroadcast::KernelStatus {
+            status: "busy".into(),
+            cell_id: Some("c1".into()),
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["cell_id"], "c1");
+
+        let bc = NotebookBroadcast::KernelStatus {
+            status: "idle".into(),
+            cell_id: None,
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert!(v["cell_id"].is_null());
+    }
+
+    #[test]
+    fn broadcast_execution_started() {
+        let json = r#"{"event":"execution_started","cell_id":"c1","execution_id":"ex1","execution_count":42}"#;
+        assert_json_roundtrip::<NotebookBroadcast>(json);
+    }
+
+    #[test]
+    fn broadcast_output_wire_shape() {
+        // Without output_index (new output — append)
+        let bc = NotebookBroadcast::Output {
+            cell_id: "c1".into(),
+            execution_id: "ex1".into(),
+            output_type: "stream".into(),
+            output_json: r#"{"name":"stdout","text":"hello\n"}"#.into(),
+            output_index: None,
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["event"], "output");
+        assert_eq!(v["output_type"], "stream");
+        assert!(
+            v.get("output_index").is_none(),
+            "None output_index must be omitted (skip_serializing_if)"
+        );
+
+        // With output_index (update in place)
+        let bc = NotebookBroadcast::Output {
+            cell_id: "c1".into(),
+            execution_id: "ex1".into(),
+            output_type: "display_data".into(),
+            output_json: "{}".into(),
+            output_index: Some(3),
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["output_index"], 3);
+    }
+
+    #[test]
+    fn broadcast_output_index_defaults_to_none_on_missing() {
+        // Client sends output without output_index field — serde(default) fills None
+        let json = r#"{"event":"output","cell_id":"c1","execution_id":"ex1","output_type":"stream","output_json":"{}"}"#;
+        let bc: NotebookBroadcast = serde_json::from_str(json).unwrap();
+        match bc {
+            NotebookBroadcast::Output { output_index, .. } => {
+                assert!(output_index.is_none());
+            }
+            other => panic!("expected Output, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broadcast_display_update() {
+        let bc = NotebookBroadcast::DisplayUpdate {
+            display_id: "d1".into(),
+            data: json!({"text/plain": "updated"}),
+            metadata: serde_json::Map::new(),
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["event"], "display_update");
+        assert_eq!(v["display_id"], "d1");
+        assert_eq!(v["data"]["text/plain"], "updated");
+    }
+
+    #[test]
+    fn broadcast_queue_changed_empty_and_populated() {
+        let bc = NotebookBroadcast::QueueChanged {
+            executing: None,
+            queued: vec![],
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert!(v["executing"].is_null());
+        assert!(v["queued"].as_array().unwrap().is_empty());
+
+        let bc = NotebookBroadcast::QueueChanged {
+            executing: Some(QueueEntry {
+                cell_id: "c1".into(),
+                execution_id: "ex1".into(),
+            }),
+            queued: vec![
+                QueueEntry {
+                    cell_id: "c2".into(),
+                    execution_id: "ex2".into(),
+                },
+                QueueEntry {
+                    cell_id: "c3".into(),
+                    execution_id: "ex3".into(),
+                },
+            ],
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["executing"]["cell_id"], "c1");
+        assert_eq!(v["queued"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn broadcast_comm_with_buffers() {
+        let bc = NotebookBroadcast::Comm {
+            msg_type: "comm_open".into(),
+            content: json!({"comm_id": "w1", "target_name": "jupyter.widget"}),
+            buffers: vec![vec![1, 2, 3], vec![4, 5]],
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["msg_type"], "comm_open");
+        assert_eq!(v["buffers"], json!([[1, 2, 3], [4, 5]]));
+    }
+
+    #[test]
+    fn broadcast_comm_empty_buffers_included_by_default() {
+        // `buffers` has `#[serde(default)]` for deserialization but NO
+        // skip_serializing_if — verify empty buffers are present in output.
+        let bc = NotebookBroadcast::Comm {
+            msg_type: "comm_msg".into(),
+            content: json!({}),
+            buffers: vec![],
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["buffers"], json!([]));
+    }
+
+    #[test]
+    fn broadcast_comm_buffers_default_when_missing() {
+        // A message from an older daemon that omits buffers entirely
+        let json = r#"{"event":"comm","msg_type":"comm_msg","content":{}}"#;
+        let bc: NotebookBroadcast = serde_json::from_str(json).unwrap();
+        match bc {
+            NotebookBroadcast::Comm { buffers, .. } => {
+                assert!(buffers.is_empty());
+            }
+            other => panic!("expected Comm, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broadcast_comm_sync() {
+        let bc = NotebookBroadcast::CommSync {
+            comms: vec![CommSnapshot {
+                comm_id: "w1".into(),
+                target_name: "jupyter.widget".into(),
+                state: json!({"value": 42}),
+                model_module: Some("@jupyter-widgets/controls".into()),
+                model_name: Some("IntSliderModel".into()),
+                buffers: vec![],
+            }],
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["comms"][0]["comm_id"], "w1");
+        assert_eq!(v["comms"][0]["model_module"], "@jupyter-widgets/controls");
+        // empty buffers should be omitted (skip_serializing_if Vec::is_empty)
+        assert!(v["comms"][0].get("buffers").is_none());
+    }
+
+    #[test]
+    fn broadcast_env_progress_flattens_phase() {
+        // EnvProgress uses #[serde(flatten)] on the phase field.
+        // This means the phase's tag ("phase":"starting") merges into
+        // the broadcast object alongside "event":"env_progress".
+        let bc = NotebookBroadcast::EnvProgress {
+            env_type: "uv".into(),
+            phase: kernel_env::EnvProgressPhase::Starting {
+                env_hash: "abc123".into(),
+            },
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["event"], "env_progress");
+        assert_eq!(v["env_type"], "uv");
+        // Flattened phase fields appear at the top level
+        assert_eq!(v["phase"], "starting");
+        assert_eq!(v["env_hash"], "abc123");
+    }
+
+    #[test]
+    fn broadcast_env_sync_state_in_sync() {
+        let bc = NotebookBroadcast::EnvSyncState {
+            in_sync: true,
+            diff: None,
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["in_sync"], true);
+        assert!(v.get("diff").is_none(), "None diff must be omitted");
+    }
+
+    #[test]
+    fn broadcast_env_sync_state_out_of_sync() {
+        let bc = NotebookBroadcast::EnvSyncState {
+            in_sync: false,
+            diff: Some(EnvSyncDiff {
+                added: vec!["requests".into()],
+                removed: vec!["flask".into()],
+                channels_changed: false,
+                deno_changed: false,
+            }),
+        };
+        let v: Value = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["in_sync"], false);
+        assert_eq!(v["diff"]["added"], json!(["requests"]));
+        assert_eq!(v["diff"]["removed"], json!(["flask"]));
+    }
+
+    #[test]
+    fn broadcast_room_renamed() {
+        let json = r#"{"event":"room_renamed","new_notebook_id":"/home/user/saved.ipynb"}"#;
+        assert_json_roundtrip::<NotebookBroadcast>(json);
+    }
+
+    #[test]
+    fn broadcast_notebook_autosaved() {
+        let json = r#"{"event":"notebook_autosaved","path":"/tmp/nb.ipynb"}"#;
+        assert_json_roundtrip::<NotebookBroadcast>(json);
+    }
+
+    #[test]
+    fn broadcast_unknown_event_is_rejected() {
+        let json = r#"{"event":"wormhole_opened","target":"dimension_c137"}"#;
+        assert!(serde_json::from_str::<NotebookBroadcast>(json).is_err());
+    }
+
+    #[test]
+    fn broadcast_missing_event_tag_is_rejected() {
+        let json = r#"{"status":"idle"}"#;
+        assert!(serde_json::from_str::<NotebookBroadcast>(json).is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Data structs — wire format
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn launched_env_config_all_none_is_empty_object() {
+        let config = LaunchedEnvConfig::default();
+        let v: Value = serde_json::to_value(&config).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            obj.is_empty(),
+            "default LaunchedEnvConfig should serialize to {{}}, got: {v}"
+        );
+    }
+
+    #[test]
+    fn launched_env_config_populated() {
+        let config = LaunchedEnvConfig {
+            uv_deps: Some(vec!["numpy>=1.24".into()]),
+            conda_deps: None,
+            conda_channels: None,
+            deno_config: Some(DenoLaunchedConfig {
+                permissions: vec!["--allow-read".into(), "--allow-net".into()],
+                import_map: Some("import_map.json".into()),
+                config: None,
+                flexible_npm_imports: false,
+            }),
+            venv_path: Some("/tmp/.venv".into()),
+            python_path: Some("/tmp/.venv/bin/python".into()),
+            launch_id: Some("lid-1".into()),
+        };
+        let v: Value = serde_json::to_value(&config).unwrap();
+        assert_eq!(v["uv_deps"], json!(["numpy>=1.24"]));
+        assert!(v.get("conda_deps").is_none());
+        assert_eq!(
+            v["deno_config"]["permissions"],
+            json!(["--allow-read", "--allow-net"])
+        );
+        assert_eq!(v["deno_config"]["flexible_npm_imports"], false);
+    }
+
+    #[test]
+    fn deno_launched_config_defaults() {
+        // flexible_npm_imports defaults to true
+        let json = r#"{}"#;
+        let config: DenoLaunchedConfig = serde_json::from_str(json).unwrap();
+        assert!(config.flexible_npm_imports);
+        assert!(config.permissions.is_empty());
+        assert!(config.import_map.is_none());
+        assert!(config.config.is_none());
+    }
+
+    #[test]
+    fn pool_error_wire_shape() {
+        let err = PoolError {
+            message: "pip install failed".into(),
+            failed_package: Some("broken-pkg".into()),
+            consecutive_failures: 3,
+            retry_in_secs: 30,
+        };
+        let v: Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["message"], "pip install failed");
+        assert_eq!(v["failed_package"], "broken-pkg");
+        assert_eq!(v["consecutive_failures"], 3);
+        assert_eq!(v["retry_in_secs"], 30);
+    }
+
+    #[test]
+    fn pool_error_no_failed_package() {
+        let err = PoolError {
+            message: "timeout".into(),
+            failed_package: None,
+            consecutive_failures: 1,
+            retry_in_secs: 0,
+        };
+        let v: Value = serde_json::to_value(&err).unwrap();
+        assert!(v.get("failed_package").is_none());
+    }
+
+    #[test]
+    fn comm_snapshot_minimal() {
+        let snap = CommSnapshot {
+            comm_id: "w1".into(),
+            target_name: "jupyter.widget".into(),
+            state: json!({}),
+            model_module: None,
+            model_name: None,
+            buffers: vec![],
+        };
+        let v: Value = serde_json::to_value(&snap).unwrap();
+        assert!(v.get("model_module").is_none());
+        assert!(v.get("model_name").is_none());
+        assert!(v.get("buffers").is_none(), "empty buffers must be omitted");
+    }
+
+    #[test]
+    fn comm_snapshot_with_buffers() {
+        let snap = CommSnapshot {
+            comm_id: "w1".into(),
+            target_name: "jupyter.widget".into(),
+            state: json!({"value": [1, 2, 3]}),
+            model_module: None,
+            model_name: None,
+            buffers: vec![vec![0xFF, 0x00]],
+        };
+        let v: Value = serde_json::to_value(&snap).unwrap();
+        assert!(v.get("buffers").is_some());
+        assert_eq!(v["buffers"][0], json!([255, 0]));
+    }
+
+    #[test]
+    fn env_sync_diff_defaults() {
+        // All fields have serde(default) — empty JSON object should work
+        let json = r#"{}"#;
+        let diff: EnvSyncDiff = serde_json::from_str(json).unwrap();
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(!diff.channels_changed);
+        assert!(!diff.deno_changed);
+    }
+
+    #[test]
+    fn completion_item_skip_serializing_if_none() {
+        let item = CompletionItem {
+            label: "foo".into(),
+            kind: None,
+            detail: None,
+            source: None,
+        };
+        let v: Value = serde_json::to_value(&item).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "only `label` should be present: {v}");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Cross-type: discriminator tags are mutually exclusive
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn request_json_does_not_parse_as_response_or_broadcast() {
+        let req_json = r#"{"action":"execute_cell","cell_id":"c1"}"#;
+        assert!(serde_json::from_str::<NotebookResponse>(req_json).is_err());
+        assert!(serde_json::from_str::<NotebookBroadcast>(req_json).is_err());
+    }
+
+    #[test]
+    fn response_json_does_not_parse_as_request_or_broadcast() {
+        let resp_json = r#"{"result":"ok"}"#;
+        assert!(serde_json::from_str::<NotebookRequest>(resp_json).is_err());
+        assert!(serde_json::from_str::<NotebookBroadcast>(resp_json).is_err());
+    }
+
+    #[test]
+    fn broadcast_json_does_not_parse_as_request_or_response() {
+        let bc_json = r#"{"event":"kernel_status","status":"idle","cell_id":null}"#;
+        assert!(serde_json::from_str::<NotebookRequest>(bc_json).is_err());
+        assert!(serde_json::from_str::<NotebookResponse>(bc_json).is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Forward compatibility: extra fields are tolerated
+    // ════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn request_ignores_unknown_fields() {
+        // An older client receiving a request with new fields shouldn't fail
+        let json = r#"{"action":"execute_cell","cell_id":"c1","new_field_from_future":true}"#;
+        let req: NotebookRequest = serde_json::from_str(json).unwrap();
+        match req {
+            NotebookRequest::ExecuteCell { cell_id } => assert_eq!(cell_id, "c1"),
+            other => panic!("expected ExecuteCell, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_ignores_unknown_fields() {
+        let json = r#"{"result":"ok","extra":42}"#;
+        let resp: NotebookResponse = serde_json::from_str(json).unwrap();
+        assert!(matches!(resp, NotebookResponse::Ok {}));
+    }
+
+    #[test]
+    fn broadcast_ignores_unknown_fields() {
+        let json = r#"{"event":"kernel_error","error":"boom","stack_trace":"..."}"#;
+        let bc: NotebookBroadcast = serde_json::from_str(json).unwrap();
+        match bc {
+            NotebookBroadcast::KernelError { error } => assert_eq!(error, "boom"),
+            other => panic!("expected KernelError, got: {other:?}"),
+        }
+    }
+}
+
 /// Responses from daemon to notebook app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
