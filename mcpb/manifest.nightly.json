@@ -15,10 +15,10 @@
   "license": "BSD-3-Clause",
   "server": {
     "type": "node",
-    "entry_point": "server/launch.mjs",
+    "entry_point": "server/launch.js",
     "mcp_config": {
-      "command": "node",
-      "args": ["server/launch.mjs"],
+      "command": "runt-nightly",
+      "args": ["mcp"],
       "env": { "NTERACT_CHANNEL": "nightly" }
     }
   },
