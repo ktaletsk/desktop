@@ -14,9 +14,9 @@
  * nightly only looks for `runt-nightly`.
  */
 
-import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+const { execFileSync, spawn } = require("node:child_process");
+const { existsSync } = require("node:fs");
+const { join } = require("node:path");
 
 const channel = process.env.NTERACT_CHANNEL || "stable";
 const binaryName = channel === "nightly" ? "runt-nightly" : "runt";
@@ -92,29 +92,56 @@ function findBinary() {
   return null;
 }
 
+const log = (msg) => process.stderr.write(`[nteract-launcher] ${msg}\n`);
+
+log(`channel=${channel}, binary=${binaryName}, platform=${process.platform}`);
+
 const binary = findBinary();
 
 if (!binary) {
+  log(`ERROR: ${binaryName} not found in PATH or sidecar paths`);
+  log(`Searched sidecar paths: ${JSON.stringify(sidecarPaths())}`);
   process.stderr.write(
-    `Error: ${binaryName} not found.\n\n` +
-      `Install ${appName} from https://nteract.io to use this MCP server.\n` +
+    `\nInstall ${appName} from https://nteract.io to use this MCP server.\n` +
       `The app puts ${binaryName} on your PATH during installation.\n`,
   );
   process.exit(1);
 }
 
-// Launch runt mcp with stdio passthrough
+log(`Found binary: ${binary}`);
+log(`Launching: ${binary} mcp`);
+
+// Launch runt mcp with piped stdio — forward between this process and the child.
 const child = spawn(binary, ["mcp"], {
-  stdio: "inherit",
+  stdio: ["pipe", "pipe", "inherit"],
   env: process.env,
 });
 
+log(`Child spawned, pid=${child.pid}`);
+
+// Forward stdin from this process to the child
+process.stdin.on("data", (chunk) => {
+  log(`stdin → child: ${chunk.length} bytes`);
+  child.stdin.write(chunk);
+});
+process.stdin.on("end", () => {
+  log("stdin ended");
+  child.stdin.end();
+});
+
+// Forward stdout from the child to this process
+child.stdout.on("data", (chunk) => {
+  log(`child → stdout: ${chunk.length} bytes`);
+  process.stdout.write(chunk);
+});
+
 child.on("error", (err) => {
-  process.stderr.write(`Failed to start ${binary}: ${err.message}\n`);
+  log(`Child error: ${err.message}`);
   process.exit(1);
 });
 
 child.on("exit", (code, signal) => {
+  log(`Child exited: code=${code}, signal=${signal}`);
   if (signal) {
     process.kill(process.pid, signal);
   } else {
