@@ -60,9 +60,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
     }
 
     // Get our peer ID for presence broadcasts
-    let peer_id = handle
-        .get_actor_id()
-        .unwrap_or_else(|_| label.clone());
+    let peer_id = handle.get_actor_id().unwrap_or_else(|_| label.clone());
 
     // Install panic hook to restore terminal
     let original_hook = std::panic::take_hook();
@@ -239,13 +237,13 @@ async fn handle_edit_key(key: KeyEvent, app: &mut App, handle: &notebook_sync::D
     use state::CursorDir;
 
     // Helper: apply a splice to the CRDT if the edit produced one
-    let apply_splice =
-        |splice: Option<state::Splice>, app: &App, handle: &notebook_sync::DocHandle| {
-            if let (Some(splice), Some(cell_id)) = (splice, app.selected_cell_id()) {
-                let _ =
-                    handle.splice_source(cell_id, splice.index, splice.delete_count, &splice.text);
-            }
-        };
+    let apply_splice = |splice: Option<state::Splice>,
+                        app: &App,
+                        handle: &notebook_sync::DocHandle| {
+        if let (Some(splice), Some(cell_id)) = (splice, app.selected_cell_id()) {
+            let _ = handle.splice_source(cell_id, splice.index, splice.delete_count, &splice.text);
+        }
+    };
 
     match (key.modifiers, key.code) {
         // Exit edit mode
