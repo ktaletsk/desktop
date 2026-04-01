@@ -258,10 +258,25 @@ export const CodeMirrorEditor = forwardRef<
 
       viewRef.current = view;
 
-      if (autoFocus) {
-        // Defer focus to the next frame so the DOM is settled.
-        requestAnimationFrame(() => view.focus());
-      }
+      // Toggling the placeholder forces a decoration change that triggers
+      // updateInner(), rebuilding the line tiles. Without this, the initial
+      // tile DOM renders a few pixels too tall — CM's measure cycle alone
+      // won't call updateInner() when the viewport hasn't changed.
+      requestAnimationFrame(() => {
+        if (placeholder) {
+          view.dispatch({
+            effects: placeholderCompartment.current.reconfigure([]),
+          });
+          view.dispatch({
+            effects: placeholderCompartment.current.reconfigure(
+              placeholderExt(placeholder),
+            ),
+          });
+        }
+        if (autoFocus) {
+          view.focus();
+        }
+      });
 
       return () => {
         viewRef.current = null;
