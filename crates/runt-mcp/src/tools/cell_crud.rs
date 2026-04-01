@@ -136,15 +136,18 @@ pub async fn create_cell(
         .add_cell_with_source(&cell_id, cell_type, after_cell_id.as_deref(), source)
         .map_err(|e| McpError::internal_error(format!("Failed to create cell: {e}"), None))?;
 
-    // Sync so the daemon (and peers) know about the new cell before we send presence
-    let _ = handle.confirm_sync().await;
+    // When and_run is true, execute_and_wait already calls confirm_sync before
+    // executing, so skip the redundant sync + presence here to avoid ~2-4s overhead.
+    let will_execute = and_run && cell_type == "code";
+    if !will_execute {
+        let _ = handle.confirm_sync().await;
 
-    // Cursor at end of source (shows "finished typing")
-    let peer_label = server.get_peer_label().await;
-    let (end_line, end_col) = crate::presence::offset_to_line_col(source, source.len());
-    crate::presence::emit_cursor(handle, &cell_id, end_line, end_col, &peer_label).await;
+        let peer_label = server.get_peer_label().await;
+        let (end_line, end_col) = crate::presence::offset_to_line_col(source, source.len());
+        crate::presence::emit_cursor(handle, &cell_id, end_line, end_col, &peer_label).await;
+    }
 
-    if and_run && cell_type == "code" {
+    if will_execute {
         let result = execution::execute_and_wait(
             handle,
             &cell_id,
@@ -206,18 +209,22 @@ pub async fn set_cell(
         ));
     }
 
+    let current_type = handle.get_cell_type(cell_id).unwrap_or_default();
+    let will_execute = and_run && current_type == "code";
+
     if let Some(src) = source {
         handle
             .update_source(cell_id, src)
             .map_err(|e| McpError::internal_error(format!("Failed to update source: {e}"), None))?;
 
-        // Sync so peers see the edit before the cursor
-        let _ = handle.confirm_sync().await;
+        // Skip sync + presence when about to execute — execute_and_wait already syncs.
+        if !will_execute {
+            let _ = handle.confirm_sync().await;
 
-        // Cursor at end of new source
-        let peer_label = server.get_peer_label().await;
-        let (end_line, end_col) = crate::presence::offset_to_line_col(src, src.len());
-        crate::presence::emit_cursor(handle, cell_id, end_line, end_col, &peer_label).await;
+            let peer_label = server.get_peer_label().await;
+            let (end_line, end_col) = crate::presence::offset_to_line_col(src, src.len());
+            crate::presence::emit_cursor(handle, cell_id, end_line, end_col, &peer_label).await;
+        }
     }
     if let Some(ct) = cell_type {
         handle
@@ -225,8 +232,9 @@ pub async fn set_cell(
             .map_err(|e| McpError::internal_error(format!("Failed to set cell type: {e}"), None))?;
     }
 
-    let current_type = handle.get_cell_type(cell_id).unwrap_or_default();
-    if and_run && current_type == "code" {
+    // Re-check type after potential cell_type change above
+    let will_execute = and_run && handle.get_cell_type(cell_id).unwrap_or_default() == "code";
+    if will_execute {
         let result = execution::execute_and_wait(
             handle,
             cell_id,

@@ -4,6 +4,7 @@
 //! tools that use `and_run`. It polls the daemon's RuntimeStateDoc to track
 //! execution status and collects outputs from the CRDT once complete.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use notebook_protocol::protocol::NotebookRequest;
@@ -64,11 +65,28 @@ pub async fn execute_and_wait(
     // RuntimeStateDoc can lag behind the ExecuteCell request, so the cell
     // may not appear in the queue on the first poll. Without this guard
     // we'd immediately declare "done" before execution even starts.
+    //
+    // However, fast executions can complete before the first poll. To handle
+    // this, we snapshot existing execution IDs and check for new completed
+    // entries after a grace period.
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
     let mut final_status = "running".to_string();
     let mut success = false;
     let mut seen_in_queue = false;
+
+    // Snapshot execution IDs for this cell before polling, so we can detect
+    // new entries that appeared after our ExecuteCell request.
+    let prior_exec_ids: HashSet<String> = handle
+        .get_runtime_state()
+        .map(|s| {
+            s.executions
+                .iter()
+                .filter(|(_, e)| e.cell_id == cell_id)
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
 
     loop {
         if start.elapsed() >= timeout {
@@ -104,6 +122,24 @@ pub async fn execute_and_wait(
                     success = true;
                 }
                 break;
+            }
+
+            // Fast-execution fallback: if the cell executed before we ever saw it
+            // in the queue, seen_in_queue stays false and the above check never
+            // triggers. After a grace period, look for a *new* execution entry
+            // (one that wasn't present before we sent ExecuteCell).
+            if !seen_in_queue && start.elapsed() >= Duration::from_millis(500) {
+                if let Some((_, entry)) = state
+                    .executions
+                    .iter()
+                    .find(|(id, e)| e.cell_id == cell_id && !prior_exec_ids.contains(id.as_str()))
+                {
+                    if entry.status != "running" {
+                        final_status = entry.status.clone();
+                        success = entry.success.unwrap_or(false);
+                        break;
+                    }
+                }
             }
         }
     }
