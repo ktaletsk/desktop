@@ -473,6 +473,7 @@ impl RoomKernel {
         let room_presence_tx = self.presence_tx.clone();
         let room_state_doc = self.state_doc.clone();
         let room_state_changed_tx = self.state_changed_tx.clone();
+        let room_comm_state = self.comm_state.clone();
 
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
@@ -531,6 +532,8 @@ impl RoomKernel {
                                 &room_broadcast_tx,
                             )
                             .await;
+                        // Clear comm state — all widgets become invalid when kernel dies
+                        room_comm_state.clear().await;
                         if let Some(es) = env_source {
                             crate::notebook_sync_server::update_kernel_presence(
                                 &room_presence,
@@ -1645,22 +1648,15 @@ impl RoomKernel {
                                         comm_state
                                             .on_comm_update(&msg.comm_id.0, state_delta)
                                             .await;
-
-                                        // Dual-write merged state to RuntimeStateDoc.
-                                        // Read merged state back from CommState (it already
-                                        // applied the delta).
-                                        let all_comms = comm_state.get_all().await;
-                                        if let Some(snapshot) =
-                                            all_comms.iter().find(|c| c.comm_id == msg.comm_id.0)
-                                        {
-                                            let merged_json =
-                                                serde_json::to_string(&snapshot.state)
-                                                    .unwrap_or_default();
-                                            let mut sd = state_doc_for_iopub.write().await;
-                                            if sd.update_comm_state(&msg.comm_id.0, &merged_json) {
-                                                let _ = state_changed_for_iopub.send(());
-                                            }
-                                        }
+                                        // Note: we intentionally do NOT dual-write to
+                                        // RuntimeStateDoc on every comm_msg update.
+                                        // High-frequency widgets (sliders) generate dozens
+                                        // of updates per second, and each CRDT write +
+                                        // sync notification overwhelms the pipeline.
+                                        // Phase D will add coalesced writes (16ms window).
+                                        // For now, the CRDT has the initial state from
+                                        // comm_open, and real-time updates flow via
+                                        // broadcasts.
                                     }
                                 }
 
