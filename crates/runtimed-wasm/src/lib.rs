@@ -12,7 +12,7 @@ use automerge::Prop;
 use notebook_doc::diff::{diff_cells, CellChangeset};
 use notebook_doc::pool_state::{PoolDoc, PoolState};
 use notebook_doc::presence;
-use notebook_doc::runtime_state::{RuntimeState, RuntimeStateDoc};
+use notebook_doc::runtime_state::{diff_execution_outputs, RuntimeState, RuntimeStateDoc};
 use notebook_doc::{CellSnapshot, NotebookDoc};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -376,8 +376,20 @@ impl NotebookHandle {
     }
 
     /// Get all cells as a JSON string (for bulk materialization).
+    ///
+    /// Populates each cell's outputs from the RuntimeStateDoc via
+    /// the cell's execution_id, since NotebookDoc.get_cells() returns
+    /// empty outputs (outputs moved to RuntimeStateDoc in #1343).
     pub fn get_cells_json(&self) -> String {
-        let cells = self.doc.get_cells();
+        let mut cells = self.doc.get_cells();
+        for cell in &mut cells {
+            if let Some(eid) = self.doc.get_execution_id(&cell.id) {
+                let outputs = self.state_doc.get_outputs(&eid);
+                if !outputs.is_empty() {
+                    cell.outputs = outputs;
+                }
+            }
+        }
         serde_json::to_string(&cells).unwrap_or_else(|_| "[]".to_string())
     }
 
@@ -1262,29 +1274,11 @@ impl NotebookHandle {
                 // changes (stream append, display update, error).
                 let output_changed_cells = if changed {
                     let current_state = state.as_ref().unwrap();
-                    let mut changed_cells = Vec::new();
-
-                    for (eid, exec) in &current_state.executions {
-                        let prev = self.prev_execution_outputs.get(eid);
-                        let outputs_changed = match prev {
-                            None => !exec.outputs.is_empty(),
-                            Some(prev) => prev != &exec.outputs,
-                        };
-                        if outputs_changed {
-                            changed_cells.push(exec.cell_id.clone());
-                        }
-                    }
-                    // Removed executions (trimmed) don't need notification —
-                    // the cell either has a newer execution or was deleted.
-
-                    // Update snapshot from inline execution outputs
-                    self.prev_execution_outputs = current_state
-                        .executions
-                        .iter()
-                        .filter(|(_, e)| !e.outputs.is_empty())
-                        .map(|(eid, e)| (eid.clone(), e.outputs.clone()))
-                        .collect();
-
+                    let (changed_cells, new_snapshot) = diff_execution_outputs(
+                        &self.prev_execution_outputs,
+                        &current_state.executions,
+                    );
+                    self.prev_execution_outputs = new_snapshot;
                     changed_cells
                 } else {
                     Vec::new()

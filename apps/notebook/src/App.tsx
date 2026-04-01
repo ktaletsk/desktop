@@ -2,14 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IsolationTest } from "@/components/isolated";
 import { MediaProvider } from "@/components/outputs/media-provider";
 import {
@@ -320,7 +313,6 @@ function AppContent() {
   }, [sendCommMessage]);
 
   // Split queue state into executing (currently running) and queued (waiting).
-  // Previously these were merged into one Set — now differentiated for UI.
   const executingCellIds = new Set(
     queueState.executing ? [queueState.executing.cell_id] : [],
   );
@@ -330,22 +322,16 @@ function AppContent() {
   // These are module-level setters, not React state — they feed
   // useSyncExternalStore hooks in cell components so renderCell
   // doesn't need these as dependencies.
-  // Wrapped in useLayoutEffect to avoid triggering subscriber re-renders
-  // during this component's render (React forbids cross-component setState
-  // during render).
-  useLayoutEffect(() => {
-    storeSetFocusedCellId(focusedCellId);
-    storeSetExecutingCellIds(executingCellIds);
-    storeSetQueuedCellIds(queuedCellIds);
-    storeSetSearchQuery(globalFind.query);
-    storeSetSearchCurrentMatch(globalFind.currentMatch);
-  }, [
-    focusedCellId,
-    executingCellIds,
-    queuedCellIds,
-    globalFind.query,
-    globalFind.currentMatch,
-  ]);
+  //
+  // Called during render (not in useLayoutEffect) so the store is
+  // current by the time child components render. The setters have
+  // equality guards that skip emit() when values haven't changed,
+  // preventing the cross-component setState cascade that React flags.
+  storeSetFocusedCellId(focusedCellId);
+  storeSetExecutingCellIds(executingCellIds);
+  storeSetQueuedCellIds(queuedCellIds);
+  storeSetSearchQuery(globalFind.query);
+  storeSetSearchCurrentMatch(globalFind.currentMatch);
 
   // When kernel is running and we know the env source, use it to determine panel type.
   // This handles: both-deps (backend picks based on preference), pixi (auto-detected, no metadata).
