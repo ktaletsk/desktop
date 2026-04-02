@@ -32,7 +32,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use uuid::Uuid;
 
 use crate::blob_store::BlobStore;
-use crate::comm_state::CommState;
 use crate::notebook_doc::NotebookDoc;
 use crate::output_store::{self, DEFAULT_INLINE_THRESHOLD};
 use crate::protocol::{CompletionItem, HistoryEntry, NotebookBroadcast, QueueEntry};
@@ -416,9 +415,7 @@ pub struct RoomKernel {
     changed_tx: broadcast::Sender<()>,
     /// Blob store for output manifests
     blob_store: Arc<BlobStore>,
-    /// Comm state for widget synchronization across windows
-    comm_state: Arc<CommState>,
-    /// Monotonic counter for comm insertion order (dual-write to RuntimeStateDoc).
+    /// Monotonic counter for comm insertion order (written to RuntimeStateDoc).
     comm_seq: Arc<AtomicU64>,
     /// Pending history requests: msg_id → response channel
     pending_history: Arc<StdMutex<HashMap<String, oneshot::Sender<Vec<HistoryEntry>>>>>,
@@ -455,6 +452,12 @@ pub enum QueueCommand {
     /// The kernel process died (iopub connection lost).
     /// Unblocks the execution queue and notifies the frontend.
     KernelDied,
+    /// Send a comm_msg(update) to the kernel via the shell channel.
+    /// Used by the IOPub task to sync Output widget captured outputs back.
+    SendCommUpdate {
+        comm_id: String,
+        state: serde_json::Value,
+    },
 }
 
 /// Prepend a directory to the PATH environment variable.
@@ -505,7 +508,6 @@ impl RoomKernel {
         persist_tx: watch::Sender<Option<Vec<u8>>>,
         changed_tx: broadcast::Sender<()>,
         blob_store: Arc<BlobStore>,
-        comm_state: Arc<CommState>,
         state_doc: Arc<RwLock<RuntimeStateDoc>>,
         state_changed_tx: broadcast::Sender<()>,
         presence: Arc<RwLock<PresenceState>>,
@@ -541,7 +543,6 @@ impl RoomKernel {
             persist_tx,
             changed_tx,
             blob_store,
-            comm_state,
             comm_seq: Arc::new(AtomicU64::new(0)),
             pending_history: Arc::new(StdMutex::new(HashMap::new())),
             pending_completions: Arc::new(StdMutex::new(HashMap::new())),
@@ -570,7 +571,6 @@ impl RoomKernel {
         let room_presence_tx = self.presence_tx.clone();
         let room_state_doc = self.state_doc.clone();
         let room_state_changed_tx = self.state_changed_tx.clone();
-        let room_comm_state = self.comm_state.clone();
 
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
@@ -619,6 +619,17 @@ impl RoomKernel {
                         )
                         .await;
                     }
+                    QueueCommand::SendCommUpdate { comm_id, state } => {
+                        let mut guard = kernel_arc.lock().await;
+                        if let Some(ref mut k) = *guard {
+                            if let Err(e) = k.send_comm_update(&comm_id, state).await {
+                                warn!(
+                                    "[notebook-sync] Failed to send comm update to kernel: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
                     QueueCommand::KernelDied => {
                         warn!("[notebook-sync] Kernel died, unblocking execution queue");
                         let env_source =
@@ -629,8 +640,7 @@ impl RoomKernel {
                                 &room_broadcast_tx,
                             )
                             .await;
-                        // Clear comm state — all widgets become invalid when kernel dies
-                        room_comm_state.clear().await;
+                        // CRDT comms are already cleared by apply_kernel_died_to_state_doc
                         if let Some(es) = env_source {
                             crate::notebook_sync_server::update_kernel_presence(
                                 &room_presence,
@@ -1047,7 +1057,6 @@ impl RoomKernel {
         let persist_tx = self.persist_tx.clone();
         let changed_tx = self.changed_tx.clone();
         let blob_store = self.blob_store.clone();
-        let comm_state = self.comm_state.clone();
         let comm_seq = self.comm_seq.clone();
         let stream_terminals = self.stream_terminals.clone();
         let state_doc_for_iopub = self.state_doc.clone();
@@ -1059,6 +1068,12 @@ impl RoomKernel {
             // On the next append_comm_output for these widgets, clear first.
             let mut pending_clear_widgets: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+
+            // Capture routing cache: msg_id → comm_id.
+            // Output widgets set capture_msg_id in the CRDT; this cache
+            // provides O(1) lookup on the hot IOPub path without async CRDT reads.
+            let mut capture_cache: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             loop {
                 match iopub.read().await {
@@ -1181,7 +1196,7 @@ impl RoomKernel {
                                     .map(|h| h.msg_id.as_str())
                                     .unwrap_or("");
                                 if let Some(widget_comm_id) =
-                                    comm_state.get_capture_widget(parent_msg_id).await
+                                    capture_cache.get(parent_msg_id).cloned()
                                 {
                                     // Route to Output widget via comm_msg with method="custom"
                                     let stream_name = match stream.name {
@@ -1216,11 +1231,49 @@ impl RoomKernel {
                                             if sd.append_comm_output(&widget_comm_id, &hash) {
                                                 let _ = state_changed_for_iopub.send(());
                                             }
+
+                                            // Read the full outputs list and sync to kernel
+                                            if let Some(entry) = sd.get_comm(&widget_comm_id) {
+                                                let output_hashes = entry.outputs.clone();
+                                                drop(sd); // Release lock before async work
+
+                                                // Resolve manifest hashes to nbformat JSON
+                                                let mut resolved_outputs = Vec::new();
+                                                for h in &output_hashes {
+                                                    if let Ok(Some(manifest_bytes)) =
+                                                        blob_store.get(h).await
+                                                    {
+                                                        if let Ok(manifest_str) =
+                                                            String::from_utf8(manifest_bytes)
+                                                        {
+                                                            if let Ok(resolved) =
+                                                                output_store::resolve_manifest(
+                                                                    &manifest_str,
+                                                                    &blob_store,
+                                                                )
+                                                                .await
+                                                            {
+                                                                resolved_outputs.push(resolved);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // Send comm_msg(update, state: {outputs}) to kernel
+                                                let _ = iopub_cmd_tx
+                                                    .send(QueueCommand::SendCommUpdate {
+                                                        comm_id: widget_comm_id.clone(),
+                                                        state: serde_json::json!({
+                                                            "outputs": resolved_outputs,
+                                                        }),
+                                                    })
+                                                    .await;
+                                            }
                                         }
                                     }
 
-                                    // Broadcast for real-time UI (frontend accumulates
-                                    // and echoes back to kernel for out.outputs sync)
+                                    // Broadcast for real-time UI — the frontend still needs
+                                    // to display captured outputs in the Output widget.
                                     let content = serde_json::json!({
                                         "comm_id": widget_comm_id,
                                         "data": {
@@ -1373,7 +1426,7 @@ impl RoomKernel {
                                     .map(|h| h.msg_id.as_str())
                                     .unwrap_or("");
                                 if let Some(widget_comm_id) =
-                                    comm_state.get_capture_widget(parent_msg_id).await
+                                    capture_cache.get(parent_msg_id).cloned()
                                 {
                                     if let Some(nbformat_value) =
                                         message_content_to_nbformat(&message.content)
@@ -1401,9 +1454,37 @@ impl RoomKernel {
                                                 if sd.append_comm_output(&widget_comm_id, &hash) {
                                                     let _ = state_changed_for_iopub.send(());
                                                 }
+
+                                                // Read full outputs and sync to kernel
+                                                if let Some(entry) = sd.get_comm(&widget_comm_id) {
+                                                    let output_hashes = entry.outputs.clone();
+                                                    drop(sd);
+                                                    let mut resolved_outputs = Vec::new();
+                                                    for h in &output_hashes {
+                                                        if let Ok(Some(mb)) =
+                                                            blob_store.get(h).await
+                                                        {
+                                                            if let Ok(ms) = String::from_utf8(mb) {
+                                                                if let Ok(r) =
+                                                                    output_store::resolve_manifest(
+                                                                        &ms,
+                                                                        &blob_store,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    resolved_outputs.push(r);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    let _ = iopub_cmd_tx.send(QueueCommand::SendCommUpdate {
+                                                        comm_id: widget_comm_id.clone(),
+                                                        state: serde_json::json!({ "outputs": resolved_outputs }),
+                                                    }).await;
+                                                }
                                             }
                                         }
-                                        // Broadcast for real-time UI + kernel echo
+                                        // Broadcast for real-time UI
                                         let content = serde_json::json!({
                                             "comm_id": widget_comm_id,
                                             "data": {
@@ -1580,7 +1661,7 @@ impl RoomKernel {
                                     .map(|h| h.msg_id.as_str())
                                     .unwrap_or("");
                                 if let Some(widget_comm_id) =
-                                    comm_state.get_capture_widget(parent_msg_id).await
+                                    capture_cache.get(parent_msg_id).cloned()
                                 {
                                     if let Some(nbformat_value) =
                                         message_content_to_nbformat(&message.content)
@@ -1608,9 +1689,37 @@ impl RoomKernel {
                                                 if sd.append_comm_output(&widget_comm_id, &hash) {
                                                     let _ = state_changed_for_iopub.send(());
                                                 }
+
+                                                // Read full outputs and sync to kernel
+                                                if let Some(entry) = sd.get_comm(&widget_comm_id) {
+                                                    let output_hashes = entry.outputs.clone();
+                                                    drop(sd);
+                                                    let mut resolved_outputs = Vec::new();
+                                                    for h in &output_hashes {
+                                                        if let Ok(Some(mb)) =
+                                                            blob_store.get(h).await
+                                                        {
+                                                            if let Ok(ms) = String::from_utf8(mb) {
+                                                                if let Ok(r) =
+                                                                    output_store::resolve_manifest(
+                                                                        &ms,
+                                                                        &blob_store,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    resolved_outputs.push(r);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    let _ = iopub_cmd_tx.send(QueueCommand::SendCommUpdate {
+                                                        comm_id: widget_comm_id.clone(),
+                                                        state: serde_json::json!({ "outputs": resolved_outputs }),
+                                                    }).await;
+                                                }
                                             }
                                         }
-                                        // Broadcast for real-time UI + kernel echo
+                                        // Broadcast for real-time UI
                                         let content = serde_json::json!({
                                             "comm_id": widget_comm_id,
                                             "data": {
@@ -1724,7 +1833,7 @@ impl RoomKernel {
                                     .map(|h| h.msg_id.as_str())
                                     .unwrap_or("");
                                 if let Some(widget_comm_id) =
-                                    comm_state.get_capture_widget(parent_msg_id).await
+                                    capture_cache.get(parent_msg_id).cloned()
                                 {
                                     // Clear captured outputs in CRDT.
                                     // wait=false: clear immediately.
@@ -1776,29 +1885,24 @@ impl RoomKernel {
                                     "[comm_open] comm_id={} target={}",
                                     open.comm_id.0, open.target_name
                                 );
-                                comm_state
-                                    .on_comm_open(
-                                        &open.comm_id.0,
-                                        &open.target_name,
-                                        &data,
-                                        buffers.clone(),
-                                    )
-                                    .await;
+                                // Store binary buffers in blob store, replacing them with
+                                // {"$blob": "<hash>"} sentinels. The sentinel-carrying state
+                                // is used for both the CRDT write and the broadcast — raw
+                                // buffers are never sent to the frontend (avoids DataCloneError
+                                // when postMessage-ing to the widget iframe).
+                                let empty_obj = serde_json::json!({});
+                                let state = data.get("state").unwrap_or(&empty_obj);
+                                let buffer_paths = extract_buffer_paths(&data);
+                                let (state_with_blobs, _used_paths) = store_widget_buffers(
+                                    state,
+                                    &buffer_paths,
+                                    &buffers,
+                                    &blob_store,
+                                )
+                                .await;
 
-                                // Dual-write to RuntimeStateDoc (native Automerge map).
-                                // If the message has binary buffers, store them in the blob
-                                // store and replace with {"$blob": "<hash>"} sentinels.
+                                // Write to RuntimeStateDoc (native Automerge map)
                                 {
-                                    let empty_obj = serde_json::json!({});
-                                    let state = data.get("state").unwrap_or(&empty_obj);
-                                    let buffer_paths = extract_buffer_paths(&data);
-                                    let (state_with_blobs, _used_paths) = store_widget_buffers(
-                                        state,
-                                        &buffer_paths,
-                                        &buffers,
-                                        &blob_store,
-                                    )
-                                    .await;
                                     let model_module = state_with_blobs
                                         .get("_model_module")
                                         .and_then(|v| v.as_str())
@@ -1817,13 +1921,41 @@ impl RoomKernel {
                                         &state_with_blobs,
                                         seq,
                                     );
+
+                                    // If this is an OutputModel with msg_id set, register capture
+                                    if model_name == "OutputModel" {
+                                        if let Some(msg_id) = state_with_blobs
+                                            .get("msg_id")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            sd.set_comm_capture_msg_id(&open.comm_id.0, msg_id);
+                                            capture_cache
+                                                .insert(msg_id.to_string(), open.comm_id.0.clone());
+                                        }
+                                    }
+
                                     let _ = state_changed_for_iopub.send(());
                                 }
 
+                                // Broadcast with sentinel state — no raw buffers.
+                                // Frontend resolves sentinels to blob HTTP URLs.
+                                let broadcast_content = {
+                                    let mut c = content.clone();
+                                    if let Some(obj) = c.get_mut("data") {
+                                        if let Some(obj) = obj.as_object_mut() {
+                                            obj.insert(
+                                                "state".to_string(),
+                                                state_with_blobs.clone(),
+                                            );
+                                        }
+                                    }
+                                    c
+                                };
                                 let _ = broadcast_tx.send(NotebookBroadcast::Comm {
                                     msg_type: message.header.msg_type.clone(),
-                                    content,
-                                    buffers,
+                                    content: broadcast_content,
+                                    buffers: vec![],
                                 });
                             }
 
@@ -1843,25 +1975,80 @@ impl RoomKernel {
                                 debug!("[comm_msg] comm_id={} method={:?}", msg.comm_id.0, method);
                                 if method == Some("update") {
                                     if let Some(state_delta) = data.get("state") {
-                                        comm_state
-                                            .on_comm_update(&msg.comm_id.0, state_delta)
-                                            .await;
-                                        // Note: we intentionally do NOT dual-write to
-                                        // RuntimeStateDoc on every comm_msg update.
+                                        // If this update changes msg_id on an Output widget,
+                                        // update capture routing in CRDT + cache.
+                                        if let Some(new_msg_id) =
+                                            state_delta.get("msg_id").and_then(|v| v.as_str())
+                                        {
+                                            // Remove old capture for this comm_id
+                                            capture_cache.retain(|_, cid| cid != &msg.comm_id.0);
+
+                                            // Set new capture if non-empty (single-depth only)
+                                            if !new_msg_id.is_empty() {
+                                                if let Some(existing) =
+                                                    capture_cache.get(new_msg_id)
+                                                {
+                                                    warn!(
+                                                        "[comm_msg] Nested capture: {} overrides {} for msg_id={}",
+                                                        msg.comm_id.0, existing, new_msg_id
+                                                    );
+                                                }
+                                                capture_cache.insert(
+                                                    new_msg_id.to_string(),
+                                                    msg.comm_id.0.clone(),
+                                                );
+                                            }
+
+                                            // Write to CRDT
+                                            let mut sd = state_doc_for_iopub.write().await;
+                                            sd.set_comm_capture_msg_id(&msg.comm_id.0, new_msg_id);
+                                            let _ = state_changed_for_iopub.send(());
+                                        }
+
+                                        // Note: we intentionally do NOT dual-write the full
+                                        // state to RuntimeStateDoc on every comm_msg update.
                                         // High-frequency widgets (sliders) generate dozens
                                         // of updates per second, and each CRDT write +
                                         // sync notification overwhelms the pipeline.
-                                        // Phase D will add coalesced writes (16ms window).
-                                        // For now, the CRDT has the initial state from
-                                        // comm_open, and real-time updates flow via
-                                        // broadcasts.
+                                        // The CRDT has the initial state from comm_open,
+                                        // and real-time updates flow via broadcasts.
                                     }
                                 }
 
+                                // For state updates with binary buffers, store as blob sentinels
+                                // (same pattern as comm_open — avoids DataCloneError).
+                                // For non-state comm_msg (custom messages), preserve raw buffers
+                                // so widgets that depend on binary custom payloads still work.
+                                let (broadcast_content, broadcast_buffers) = if !buffers.is_empty()
+                                    && method == Some("update")
+                                {
+                                    let buffer_paths = extract_buffer_paths(&data);
+                                    if let Some(state_delta) = data.get("state") {
+                                        let (state_with_blobs, _) = store_widget_buffers(
+                                            state_delta,
+                                            &buffer_paths,
+                                            &buffers,
+                                            &blob_store,
+                                        )
+                                        .await;
+                                        let mut c = content.clone();
+                                        if let Some(obj) = c.get_mut("data") {
+                                            if let Some(obj) = obj.as_object_mut() {
+                                                obj.insert("state".to_string(), state_with_blobs);
+                                            }
+                                        }
+                                        (c, vec![])
+                                    } else {
+                                        (content.clone(), buffers.clone())
+                                    }
+                                } else {
+                                    (content.clone(), buffers.clone())
+                                };
+
                                 let _ = broadcast_tx.send(NotebookBroadcast::Comm {
                                     msg_type: message.header.msg_type.clone(),
-                                    content,
-                                    buffers,
+                                    content: broadcast_content,
+                                    buffers: broadcast_buffers,
                                 });
                             }
 
@@ -1875,8 +2062,8 @@ impl RoomKernel {
                                 let content =
                                     serde_json::to_value(&message.content).unwrap_or_default();
 
-                                // Remove from comm state
-                                comm_state.on_comm_close(&close.comm_id.0).await;
+                                // Remove from capture cache
+                                capture_cache.retain(|_, cid| cid != &close.comm_id.0);
 
                                 // Dual-write removal to RuntimeStateDoc
                                 {
@@ -2378,6 +2565,39 @@ impl RoomKernel {
             msg_id, cell.cell_id, cell.execution_id
         );
 
+        Ok(())
+    }
+
+    /// Send a comm_msg(update) to the kernel via the shell channel.
+    ///
+    /// Used to sync Output widget captured outputs directly to the kernel
+    /// without a frontend round-trip.
+    pub async fn send_comm_update(
+        &mut self,
+        comm_id: &str,
+        state: serde_json::Value,
+    ) -> Result<()> {
+        let shell = self
+            .shell_writer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("shell_writer not available"))?;
+
+        let comm_msg = jupyter_protocol::CommMsg {
+            comm_id: jupyter_protocol::CommId(comm_id.to_string()),
+            data: {
+                let mut map = serde_json::Map::new();
+                map.insert("method".to_string(), serde_json::json!("update"));
+                map.insert("state".to_string(), state);
+                map.insert("buffer_paths".to_string(), serde_json::json!([]));
+                map
+            },
+        };
+        let message: jupyter_protocol::JupyterMessage = comm_msg.into();
+        shell.send(message).await?;
+        debug!(
+            "[kernel-manager] Sent comm_msg(update) to kernel: comm_id={}",
+            comm_id
+        );
         Ok(())
     }
 
@@ -2893,7 +3113,6 @@ mod tests {
         let (persist_tx, _persist_rx) = watch::channel::<Option<Vec<u8>>>(None);
         let doc = Arc::new(RwLock::new(NotebookDoc::new("test-notebook")));
         let blob_store = Arc::new(BlobStore::new(tmp.path().join("blobs")));
-        let comm_state = Arc::new(CommState::new());
         let state_doc = Arc::new(RwLock::new(RuntimeStateDoc::new()));
         let (state_changed_tx, _state_changed_rx) = broadcast::channel(16);
         let presence = Arc::new(RwLock::new(PresenceState::new()));
@@ -2904,7 +3123,6 @@ mod tests {
             persist_tx,
             changed_tx,
             blob_store,
-            comm_state,
             state_doc,
             state_changed_tx,
             presence,
