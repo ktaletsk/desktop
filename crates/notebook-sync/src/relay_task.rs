@@ -186,13 +186,14 @@ async fn send_request_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         .map_err(SyncError::Io)?;
 
     // Determine timeout based on request type.
-    // Completions get a short timeout — they should be fast or not at all,
-    // and a long wait blocks the entire relay (no other commands can be
-    // processed while we wait for the response frame).
+    // Completions use 7s — the daemon's kernel-level timeout is 5s, so the
+    // daemon always responds within ~5s. The extra 2s margin ensures the
+    // relay never independently times out during normal operation (only on
+    // daemon crash/hang). A long wait blocks the entire relay.
     let timeout_secs = match request {
         notebook_protocol::protocol::NotebookRequest::LaunchKernel { .. } => 300,
         notebook_protocol::protocol::NotebookRequest::SyncEnvironment { .. } => 300,
-        notebook_protocol::protocol::NotebookRequest::Complete { .. } => 5,
+        notebook_protocol::protocol::NotebookRequest::Complete { .. } => 7,
         _ => 30,
     };
 
@@ -209,6 +210,14 @@ async fn send_request_impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 "[relay] Request timed out after {}s: {:?}",
                 timeout_secs, request
             );
+            // NOTE: We intentionally do NOT drain stale response frames here.
+            // `recv_typed_frame` uses `read_exact` internally, which is not
+            // cancellation-safe — wrapping it in `tokio::time::timeout` could
+            // cancel mid-frame and corrupt the stream. The relay timeout (7s)
+            // exceeds the daemon's kernel-level timeout (5s), so the daemon
+            // always responds before the relay gives up. Any stale Response
+            // frames that reach the select loop are harmlessly discarded by
+            // `pipe_frame`.
             Err(SyncError::Timeout)
         }
     }
