@@ -17,6 +17,7 @@ import {
   type KernelStatus,
 } from "../lib/kernel-status";
 import { logger } from "../lib/logger";
+import { isManifestHash } from "../lib/manifest-resolution";
 import { subscribeBroadcast } from "../lib/notebook-frame-bus";
 import {
   type CommDocEntry,
@@ -35,6 +36,96 @@ import type {
   JupyterOutput,
 } from "../types";
 import { resolveOutputString } from "./useManifestResolver";
+
+/**
+ * If an OutputModel's `state.outputs` contains manifest hash strings, resolve
+ * them asynchronously to JupyterOutput objects and deliver a follow-up
+ * comm_msg(update) with the resolved outputs. This mirrors how cell outputs
+ * are resolved from the CRDT.
+ *
+ * Only triggers for OutputModel widgets (`_model_name === "OutputModel"`).
+ * Other widgets may have an `outputs` field with different semantics.
+ *
+ * Uses a generation counter per comm_id to discard stale async completions
+ * when a newer CRDT update arrives before the old fetch finishes.
+ */
+const _outputResolveGen = new Map<string, number>();
+
+function resolveCommOutputHashes(
+  commId: string,
+  state: Record<string, unknown>,
+  callbacksRef: {
+    readonly current: { onCommMessage?: (msg: JupyterMessage) => void };
+  },
+): void {
+  // Only resolve for OutputModel widgets
+  if (state._model_name !== "OutputModel") return;
+
+  const outputs = state.outputs;
+  if (!Array.isArray(outputs) || outputs.length === 0) {
+    // Bump generation so any in-flight fetch is discarded
+    _outputResolveGen.set(commId, (_outputResolveGen.get(commId) ?? 0) + 1);
+    return;
+  }
+
+  // Verify all entries are manifest hashes (64-char hex strings).
+  // If not, this is unexpected — log and skip.
+  const allHashes = outputs.every(
+    (o) => typeof o === "string" && isManifestHash(o),
+  );
+  if (!allHashes) {
+    if (outputs.some((o) => typeof o !== "string")) {
+      // Already resolved objects — skip silently
+      return;
+    }
+    logger.warn(
+      `[comm-sync] OutputModel ${commId}: state.outputs contains unexpected format, skipping resolution`,
+    );
+    return;
+  }
+
+  const blobPort = getBlobPort();
+  if (blobPort === null) return; // Will retry on next CRDT update
+
+  // Bump generation — any older in-flight fetch will check and bail
+  const gen = (_outputResolveGen.get(commId) ?? 0) + 1;
+  _outputResolveGen.set(commId, gen);
+
+  void (async () => {
+    const resolved = await Promise.all(
+      (outputs as string[]).map((h) => resolveOutputString(h, blobPort)),
+    );
+
+    // Discard if a newer CRDT update superseded us
+    if (_outputResolveGen.get(commId) !== gen) return;
+
+    const resolvedOutputs = resolved.filter(
+      (o): o is JupyterOutput => o !== null,
+    );
+    const cb = callbacksRef.current?.onCommMessage;
+    if (cb) {
+      cb({
+        header: {
+          msg_id: crypto.randomUUID(),
+          msg_type: "comm_msg",
+          session: "",
+          username: "kernel",
+          date: new Date().toISOString(),
+          version: "5.3",
+        },
+        metadata: {},
+        content: {
+          comm_id: commId,
+          data: {
+            method: "update",
+            state: { outputs: resolvedOutputs },
+          },
+        },
+        buffers: [],
+      });
+    }
+  })();
+}
 
 /** Kernel status from daemon */
 export type DaemonKernelStatus = KernelStatus;
@@ -526,6 +617,11 @@ export function useDaemonKernel({
       onCommMessage(msg);
       nextComms[commId] = entry;
       nextJson[commId] = JSON.stringify(entry.state);
+
+      // Resolve Output widget manifest hashes in state.outputs to JupyterOutput objects.
+      // The daemon writes manifest hashes (same format as execution outputs);
+      // we resolve them here so the iframe receives ready-to-render outputs.
+      resolveCommOutputHashes(commId, entry.state, callbacksRef);
     }
 
     // State changes — synthesize comm_msg(update)
@@ -560,6 +656,9 @@ export function useDaemonKernel({
             buffers: [],
           };
           onCommMessage(msg);
+
+          // Resolve Output widget manifest hashes in state.outputs
+          resolveCommOutputHashes(commId, entry.state, callbacksRef);
         }
       }
     }
