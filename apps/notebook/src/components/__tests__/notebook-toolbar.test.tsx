@@ -345,4 +345,80 @@ describe("NotebookToolbar", () => {
       expect(screen.queryByText(/Deno not available/)).not.toBeInTheDocument();
     });
   });
+
+  describe("pixi ipykernel prompt", () => {
+    it("shows pixi prompt when runtime=python, status=error, envSource=pixi:, startingPhase=missing_ipykernel", () => {
+      render(
+        <NotebookToolbar
+          {...baseProps}
+          runtime="python"
+          kernelStatus={KERNEL_STATUS.ERROR}
+          envSource="pixi:toml"
+          startingPhase="missing_ipykernel"
+        />,
+      );
+      expect(
+        screen.getByText(/ipykernel not found in pixi.toml/),
+      ).toBeInTheDocument();
+    });
+
+    it("does not show pixi prompt for generic pixi error (no missing_ipykernel phase)", () => {
+      render(
+        <NotebookToolbar
+          {...baseProps}
+          runtime="python"
+          kernelStatus={KERNEL_STATUS.ERROR}
+          envSource="pixi:toml"
+        />,
+      );
+      expect(
+        screen.queryByText(/ipykernel not found in pixi.toml/),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not show pixi prompt when runtime is deno", () => {
+      render(
+        <NotebookToolbar
+          {...baseProps}
+          runtime="deno"
+          kernelStatus={KERNEL_STATUS.ERROR}
+          envSource="pixi:toml"
+          startingPhase="missing_ipykernel"
+        />,
+      );
+      expect(
+        screen.queryByText(/ipykernel not found in pixi.toml/),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not show pixi prompt when kernel is not in error", () => {
+      render(
+        <NotebookToolbar
+          {...baseProps}
+          runtime="python"
+          kernelStatus={KERNEL_STATUS.IDLE}
+          envSource="pixi:toml"
+          startingPhase="missing_ipykernel"
+        />,
+      );
+      expect(
+        screen.queryByText(/ipykernel not found in pixi.toml/),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not show pixi prompt when envSource is not pixi", () => {
+      render(
+        <NotebookToolbar
+          {...baseProps}
+          runtime="python"
+          kernelStatus={KERNEL_STATUS.ERROR}
+          envSource="uv:prewarmed"
+          startingPhase="missing_ipykernel"
+        />,
+      );
+      expect(
+        screen.queryByText(/ipykernel not found in pixi.toml/),
+      ).not.toBeInTheDocument();
+    });
+  });
 });
