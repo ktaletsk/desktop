@@ -153,7 +153,15 @@ pub fn install_cli(app: &tauri::AppHandle) -> Result<(), String> {
 
     try_install_direct(&bundled_runt, &runt_dest, &nb_dest)?;
 
-    log::info!("[cli_install] CLI installed to {}", dir.display());
+    log::info!(
+        "[cli_install] CLI installed: {} -> {}",
+        runt_dest.display(),
+        bundled_runt.display()
+    );
+
+    // Warn if legacy /usr/local/bin entries shadow ~/.local/bin
+    #[cfg(unix)]
+    warn_legacy_cli_shadow();
 
     // Ensure the user's shell RC has ~/.local/bin on PATH
     if let Err(e) = ensure_shell_path(&dir) {
@@ -161,6 +169,37 @@ pub fn install_cli(app: &tauri::AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Warn if legacy /usr/local/bin has stale CLI copies that shadow ~/.local/bin.
+///
+/// Symlinks are fine — they track the app bundle. Only regular files (stale
+/// copies from old installs) are a problem since they don't update.
+#[cfg(unix)]
+fn warn_legacy_cli_shadow() {
+    let legacy = PathBuf::from(LEGACY_INSTALL_DIR);
+    let stale: Vec<String> = [cli_command_name(), cli_notebook_alias_name()]
+        .iter()
+        .filter_map(|name| {
+            let path = legacy.join(name);
+            // Symlinks are fine — they resolve to the current app bundle.
+            // Only warn about regular files (stale copies).
+            if path.exists() && !path.is_symlink() {
+                Some(path.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !stale.is_empty() {
+        log::warn!(
+            "[cli_install] Stale CLI copies in /usr/local/bin shadow ~/.local/bin: {}. \
+             Remove with: sudo rm {}",
+            stale.join(", "),
+            stale.join(" ")
+        );
+    }
 }
 
 /// Try to install directly without admin privileges
