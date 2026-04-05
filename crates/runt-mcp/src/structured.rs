@@ -7,6 +7,25 @@
 use runtimed_client::resolved_output::{DataValue, Output, ResolvedCell};
 use serde_json::{json, Value};
 
+/// Check if a MIME type is a visualization spec (Plotly, Vega-Lite, Vega).
+fn is_viz_mime(mime: &str) -> bool {
+    mime == "application/vnd.plotly.v1+json"
+        || (mime.starts_with("application/vnd.vegalite.v")
+            && (mime.ends_with("+json") || mime.ends_with(".json")))
+        || (mime.starts_with("application/vnd.vega.v")
+            && !mime.starts_with("application/vnd.vegalite.")
+            && (mime.ends_with("+json") || mime.ends_with(".json")))
+}
+
+/// Return a blob URL for the given MIME type, or None to skip the entry.
+fn blob_url_or_skip(output: &Output, mime: &str) -> Option<Value> {
+    output
+        .blob_urls
+        .as_ref()
+        .and_then(|urls| urls.get(mime))
+        .map(|url| Value::String(url.clone()))
+}
+
 /// Build the structuredContent JSON for a resolved cell.
 pub fn cell_structured_content(cell: &ResolvedCell, status: &str) -> Value {
     json!({
@@ -42,28 +61,50 @@ fn output_to_structured(output: &Output) -> Value {
             let mut data = serde_json::Map::new();
 
             if let Some(ref output_data) = output.data {
+                // Check if the output has a raster image that the MCP app can
+                // render directly (png/jpeg/gif/webp via blob URL). When true,
+                // we can safely skip text/html (which is often a massive base64
+                // data URI for audio, or redundant chart HTML that duplicates
+                // the image).
+                let has_renderable_image = output_data.keys().any(|m| {
+                    matches!(
+                        m.as_str(),
+                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                    )
+                });
+
                 for (mime, value) in output_data {
                     // Skip text/llm+plain — it's for LLM consumption, not the widget
                     if mime == "text/llm+plain" {
                         continue;
                     }
+
+                    // Skip text/html when the MCP app can render a raster image
+                    // instead. This avoids sending large base64 data URIs (audio
+                    // HTML embeds) or redundant chart HTML alongside the image.
+                    if mime == "text/html" && has_renderable_image {
+                        continue;
+                    }
+
+                    // Skip viz JSON specs — the MCP app doesn't render them, and
+                    // they're large (tens of KB). The app uses text/html or image
+                    // fallbacks for display.
+                    if is_viz_mime(mime) {
+                        continue;
+                    }
+
                     let json_value = match value {
-                        DataValue::Text(s) => Value::String(s.clone()),
                         DataValue::Binary(_) => {
                             // For binary data, use blob URL if available
-                            if let Some(ref urls) = output.blob_urls {
-                                if let Some(url) = urls.get(mime) {
-                                    Value::String(url.clone())
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                continue;
-                            }
+                            blob_url_or_skip(output, mime)
                         }
-                        DataValue::Json(v) => v.clone(),
+                        DataValue::Json(v) => Some(v.clone()),
+                        DataValue::Text(s) => Some(Value::String(s.clone())),
                     };
-                    data.insert(mime.clone(), json_value);
+
+                    if let Some(jv) = json_value {
+                        data.insert(mime.clone(), jv);
+                    }
                 }
             }
 
