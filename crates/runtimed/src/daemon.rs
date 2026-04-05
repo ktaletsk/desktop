@@ -381,6 +381,16 @@ impl Daemon {
         &self.config.socket_path
     }
 
+    /// Get the default Python environment type from settings.
+    pub async fn default_python_env(&self) -> crate::settings_doc::PythonEnvType {
+        self.settings.read().await.get_all().default_python_env
+    }
+
+    /// Get the default pixi packages from settings.
+    pub async fn default_pixi_packages(&self) -> Vec<String> {
+        self.settings.read().await.get_all().pixi.default_packages
+    }
+
     /// Create a new daemon with the given configuration.
     ///
     /// Returns an error if another daemon is already running.
