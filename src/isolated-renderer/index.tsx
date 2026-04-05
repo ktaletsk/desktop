@@ -44,9 +44,7 @@ import { JsonOutput } from "@/components/outputs/json-output";
 import { GeoJsonOutput } from "@/components/outputs/geojson-output";
 import { PdfOutput } from "@/components/outputs/pdf-output";
 import { PlotlyOutput } from "@/components/outputs/plotly-output";
-import { VegaOutput } from "@/components/outputs/vega-output";
 import { VideoOutput } from "@/components/outputs/video-output";
-import { isVegaMimeType } from "@/components/outputs/vega-mime";
 import { SvgOutput } from "@/components/outputs/svg-output";
 import { WidgetView } from "@/components/widgets/widget-view";
 // Import widget support
@@ -71,6 +69,22 @@ interface RendererProps {
 }
 
 const rendererRegistry = new Map<string, ComponentType<RendererProps>>();
+const rendererPatterns: Array<{
+  test: (mime: string) => boolean;
+  component: ComponentType<RendererProps>;
+}> = [];
+
+/** Look up a renderer by exact match first, then pattern matchers. */
+function getRenderer(
+  mimeType: string,
+): ComponentType<RendererProps> | undefined {
+  const exact = rendererRegistry.get(mimeType);
+  if (exact) return exact;
+  for (const entry of rendererPatterns) {
+    if (entry.test(mimeType)) return entry.component;
+  }
+  return undefined;
+}
 
 /**
  * Load and install a renderer plugin.
@@ -100,6 +114,10 @@ function installRendererPlugin(code: string, css?: string) {
           mimeTypes: string[],
           component: ComponentType<RendererProps>,
         ) => void;
+        registerPattern: (
+          test: (mime: string) => boolean,
+          component: ComponentType<RendererProps>,
+        ) => void;
       }) => void)
     | undefined;
 
@@ -115,6 +133,9 @@ function installRendererPlugin(code: string, css?: string) {
       for (const mt of mimeTypes) {
         rendererRegistry.set(mt, component);
       }
+    },
+    registerPattern(test, component) {
+      rendererPatterns.push({ test, component });
     },
   });
 
@@ -397,8 +418,8 @@ function OutputRenderer({ payload }: { payload: RenderPayload }) {
   // Route to appropriate component based on MIME type
   // (Direct rendering without MediaRouter's lazy loading)
 
-  // Check renderer plugin registry first (e.g., markdown, future: plotly, vega)
-  const RegisteredRenderer = rendererRegistry.get(mimeType);
+  // Check renderer plugin registry first (exact match, then pattern matchers)
+  const RegisteredRenderer = getRenderer(mimeType);
   if (RegisteredRenderer) {
     return (
       <RegisteredRenderer data={data} metadata={metadata} mimeType={mimeType} />
@@ -472,13 +493,6 @@ function OutputRenderer({ payload }: { payload: RenderPayload }) {
     const geojsonData =
       typeof content === "string" ? JSON.parse(content) : content;
     return <GeoJsonOutput data={geojsonData} />;
-  }
-
-  // Vega / Vega-Lite (any version, both +json and .json suffixes)
-  if (isVegaMimeType(mimeType)) {
-    const vegaData =
-      typeof content === "string" ? JSON.parse(content) : content;
-    return <VegaOutput data={vegaData} />;
   }
 
   // JSON
