@@ -78,8 +78,12 @@ use std::path::Path;
 pub struct StreamOutputState {
     /// Index in the cell's outputs list
     pub index: usize,
-    /// Manifest hash we last wrote at this index
-    pub manifest_hash: String,
+    /// Identifier for the ContentRef at this position: the blob hash if the
+    /// content was stored in the blob store (`text.blob`), or the inline
+    /// string itself if it was inlined (`text.inline`). Used by
+    /// `upsert_stream_output` to validate the cached position before
+    /// performing an in-place update.
+    pub blob_hash: String,
 }
 
 /// Snapshot of a single cell's state, suitable for serialization.
@@ -94,8 +98,8 @@ pub struct CellSnapshot {
     pub source: String,
     /// JSON-encoded execution count: a number string like "5" or "null"
     pub execution_count: String,
-    /// JSON-encoded Jupyter output objects (will become manifest hashes in Phase 5)
-    pub outputs: Vec<String>,
+    /// Inline output manifests (structured JSON with ContentRef blob/inline refs)
+    pub outputs: Vec<serde_json::Value>,
     /// Cell metadata (arbitrary JSON object, preserves unknown keys)
     #[serde(default = "default_empty_object")]
     pub metadata: serde_json::Value,
@@ -716,7 +720,7 @@ impl NotebookDoc {
 
             let outputs_id = self.doc.put_object(&cell_obj, "outputs", ObjType::List)?;
             for (j, output) in cell.outputs.iter().enumerate() {
-                self.doc.insert(&outputs_id, j, output.as_str())?;
+                insert_json_at_index(&mut self.doc, &outputs_id, j, output)?;
             }
 
             if cell.metadata != serde_json::Value::Object(serde_json::Map::new()) {
@@ -2264,7 +2268,7 @@ pub fn get_cells_from_doc(doc: &AutoCommit) -> Vec<CellSnapshot> {
                 Some((automerge::Value::Object(ObjType::List), list_id)) => {
                     let len = doc.length(&list_id);
                     (0..len)
-                        .map(|j| read_str(doc, &list_id, j).unwrap_or_default())
+                        .filter_map(|j| read_json_value(doc, &list_id, j))
                         .collect()
                 }
                 _ => vec![],
