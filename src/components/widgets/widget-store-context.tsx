@@ -70,6 +70,8 @@ interface WidgetStoreProviderProps {
   children: ReactNode;
   /** Function to send messages back to the kernel (for widget interactions) */
   sendMessage?: SendMessage;
+  /** Optional update manager for debounced CRDT writes + echo suppression. */
+  updateManager?: import("./widget-update-manager").WidgetUpdateManager;
 }
 
 /**
@@ -81,6 +83,7 @@ interface WidgetStoreProviderProps {
 export function WidgetStoreProvider({
   children,
   sendMessage = () => {},
+  updateManager,
 }: WidgetStoreProviderProps) {
   // Create store once and keep it stable across renders
   const storeRef = useRef<WidgetStore | null>(null);
@@ -93,13 +96,14 @@ export function WidgetStoreProvider({
   const { handleMessage, sendUpdate, sendCustom, closeComm } = useCommRouter({
     sendMessage,
     store,
+    updateManager,
   });
 
   // Manage link subscriptions (jslink/jsdlink) at the store level.
   // Headless widgets like LinkModel have _view_name: null and won't be
   // in any container's children, so they need store-level subscriptions.
-  // Pass sendUpdate so linked values sync back to the Python kernel.
-  useEffect(() => createLinkManager(store, sendUpdate), [store, sendUpdate]);
+  // Links use store.updateModel directly (client-side only, no CRDT write).
+  useEffect(() => createLinkManager(store), [store]);
   useEffect(() => createCanvasManagerRouter(store), [store]);
 
   const value = useMemo(
