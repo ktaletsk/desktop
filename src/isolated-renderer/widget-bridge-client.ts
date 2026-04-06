@@ -36,24 +36,33 @@ const BLOB_URL_RE = /^https?:\/\/127\.0\.0\.1:\d+\/blob\/[a-f0-9]+$/;
 
 /**
  * Resolve blob URLs in state at buffer_paths positions to ArrayBuffers.
- * Returns resolved buffers; also replaces the URL strings in state with
- * the ArrayBuffers (via applyBufferPaths).
+ *
+ * Only converts blob URLs to DataView/ArrayBuffer at explicitly listed
+ * `bufferPaths` positions (binary widget data like NumPy arrays).
+ * When `bufferPaths` is absent or empty, returns [] — blob URL strings
+ * (e.g. `_esm`, `_css`) stay as strings so `loadESM`/CSS injection
+ * can load them natively.
  */
 async function resolveBlobUrls(
   state: Record<string, unknown>,
   bufferPaths?: string[][],
 ): Promise<ArrayBuffer[]> {
   if (!bufferPaths || bufferPaths.length === 0) return [];
+  return resolveAtPaths(state, bufferPaths);
+}
 
+/** Resolve blob URLs at known paths to ArrayBuffers. */
+async function resolveAtPaths(
+  state: Record<string, unknown>,
+  paths: string[][],
+): Promise<ArrayBuffer[]> {
   const resolved = await Promise.all(
-    bufferPaths.map(async (path) => {
-      // Navigate to the value at this path
+    paths.map(async (path) => {
       let current: unknown = state;
       for (const segment of path) {
         if (typeof current !== "object" || current === null) return null;
         current = (current as Record<string, unknown>)[segment];
       }
-      // If it's a blob URL string, fetch it
       if (typeof current === "string" && BLOB_URL_RE.test(current)) {
         try {
           const resp = await fetch(current);
@@ -73,7 +82,6 @@ async function resolveBlobUrls(
       return null;
     }),
   );
-
   return resolved.filter((b): b is ArrayBuffer => b !== null);
 }
 

@@ -29,7 +29,6 @@ use wasm_bindgen::prelude::*;
 /// Using `serialize_maps_as_objects(true)` ensures all maps become plain
 /// JS Objects, matching what `JSON.parse()` would produce. The returned
 /// `JsValue` can be any JS type (object, array, scalar) depending on input.
-
 fn serialize_to_js<T: Serialize>(value: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
     let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
     value.serialize(&serializer)
@@ -266,6 +265,68 @@ impl From<(usize, CellSnapshot)> for JsCell {
             metadata: snap.metadata,
             resolved_assets: snap.resolved_assets,
         }
+    }
+}
+
+// ── Comm state ContentRef resolution ─────────────────────────────────
+
+/// Recursively walk a JSON value, resolving ContentRef objects in place.
+///
+/// - `{"inline": V}` → unwrap to `V`
+/// - `{"blob": H, "size": N, ...}` → plain URL string, path recorded in `buffer_paths`
+/// - Arrays/objects → recurse
+/// - Primitives → pass through
+fn walk_and_resolve_comm_state(
+    val: &serde_json::Value,
+    port: u16,
+    current_path: &mut Vec<String>,
+    buffer_paths: &mut Vec<Vec<String>>,
+) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(obj) => {
+            // Check for inline ContentRef: {"inline": ...}
+            if let Some(inner) = obj.get("inline") {
+                return inner.clone();
+            }
+
+            // Check for blob ContentRef: {"blob": string, "size": number}
+            if let (Some(serde_json::Value::String(hash)), Some(serde_json::Value::Number(_))) =
+                (obj.get("blob"), obj.get("size"))
+            {
+                buffer_paths.push(current_path.clone());
+                return serde_json::Value::String(format!(
+                    "http://127.0.0.1:{}/blob/{}",
+                    port, hash
+                ));
+            }
+
+            // Regular object — recurse into values
+            let mut resolved = serde_json::Map::with_capacity(obj.len());
+            for (key, child) in obj {
+                current_path.push(key.clone());
+                resolved.insert(
+                    key.clone(),
+                    walk_and_resolve_comm_state(child, port, current_path, buffer_paths),
+                );
+                current_path.pop();
+            }
+            serde_json::Value::Object(resolved)
+        }
+        serde_json::Value::Array(arr) => {
+            let resolved: Vec<serde_json::Value> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, child)| {
+                    current_path.push(i.to_string());
+                    let r = walk_and_resolve_comm_state(child, port, current_path, buffer_paths);
+                    current_path.pop();
+                    r
+                })
+                .collect();
+            serde_json::Value::Array(resolved)
+        }
+        // Primitives pass through unchanged
+        _ => val.clone(),
     }
 }
 
@@ -1211,6 +1272,38 @@ impl NotebookHandle {
     pub fn get_runtime_state(&self) -> JsValue {
         let state = self.state_doc.read_state();
         serialize_to_js(&state).unwrap_or(JsValue::UNDEFINED)
+    }
+
+    /// Resolve ContentRef values in a comm's state for frontend consumption.
+    ///
+    /// Walks the state **recursively**, resolving ContentRef objects:
+    /// - `{"blob": hash, "size": N, ...}` → plain URL string
+    /// - `{"inline": value}` → unwrapped inner value
+    /// - Plain values → passed through unchanged
+    ///
+    /// Returns `{ state, buffer_paths }` where `buffer_paths` records the
+    /// JSON paths of blob refs that were resolved to URLs (so the iframe
+    /// knows which values to fetch as ArrayBuffers).
+    ///
+    /// Returns undefined if blob_port is not set or comm doesn't exist.
+    pub fn resolve_comm_state(&self, comm_id: &str) -> JsValue {
+        let Some(port) = self.blob_port else {
+            return JsValue::UNDEFINED;
+        };
+        let state = self.state_doc.read_state();
+        let Some(entry) = state.comms.get(comm_id) else {
+            return JsValue::UNDEFINED;
+        };
+
+        let mut buffer_paths: Vec<Vec<String>> = Vec::new();
+        let resolved =
+            walk_and_resolve_comm_state(&entry.state, port, &mut Vec::new(), &mut buffer_paths);
+
+        serialize_to_js(&serde_json::json!({
+            "state": resolved,
+            "buffer_paths": buffer_paths,
+        }))
+        .unwrap_or(JsValue::UNDEFINED)
     }
 
     /// Reset the sync state. Call this when reconnecting to a new daemon session.
