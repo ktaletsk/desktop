@@ -8,6 +8,121 @@ use crate::stats::{
     compute_stats, detect_trend, extract_numbers_positional, extract_title, fmt_num,
 };
 
+/// Extract a numeric array from a Plotly trace field.
+///
+/// Handles both plain JSON arrays `[1, 2, 3]` and Plotly 6 binary encoding
+/// `{"dtype": "f8", "bdata": "base64..."}`. For bdata, returns the plain
+/// array only if small enough; otherwise returns `None` (callers should
+/// use [`bdata_element_count`] to get just the count).
+fn extract_trace_array(value: &Value) -> Option<Vec<Value>> {
+    // Plain array — always return
+    if let Some(arr) = value.as_array() {
+        return Some(arr.clone());
+    }
+    // Plotly 6 bdata format — only decode if small (≤1000 elements)
+    if let Some(obj) = value.as_object() {
+        if let (Some(dtype), Some(bdata)) = (
+            obj.get("dtype").and_then(|v| v.as_str()),
+            obj.get("bdata").and_then(|v| v.as_str()),
+        ) {
+            let count = bdata_element_count(dtype, bdata);
+            if count.is_some_and(|n| n <= 1000) {
+                return decode_bdata(dtype, bdata);
+            }
+        }
+    }
+    None
+}
+
+/// Get the element count from a Plotly trace field without decoding.
+///
+/// Works for both plain arrays and bdata. Returns `None` if the value
+/// is neither an array nor valid bdata.
+fn trace_element_count(value: &Value) -> Option<usize> {
+    if let Some(arr) = value.as_array() {
+        return Some(arr.len());
+    }
+    if let Some(obj) = value.as_object() {
+        if let (Some(dtype), Some(bdata)) = (
+            obj.get("dtype").and_then(|v| v.as_str()),
+            obj.get("bdata").and_then(|v| v.as_str()),
+        ) {
+            return bdata_element_count(dtype, bdata);
+        }
+    }
+    None
+}
+
+/// Compute element count from bdata without decoding the payload.
+fn bdata_element_count(dtype: &str, bdata: &str) -> Option<usize> {
+    use base64::Engine;
+    let byte_len = base64::engine::general_purpose::STANDARD
+        .decode(bdata)
+        .ok()?
+        .len();
+    let width = dtype_width(dtype)?;
+    if byte_len % width != 0 {
+        return None;
+    }
+    Some(byte_len / width)
+}
+
+/// Byte width per element for a Plotly dtype string.
+fn dtype_width(dtype: &str) -> Option<usize> {
+    match dtype {
+        "f8" => Some(8),
+        "f4" | "i4" | "u4" => Some(4),
+        "i2" | "u2" => Some(2),
+        "i1" | "u1" => Some(1),
+        _ => None,
+    }
+}
+
+/// Decode Plotly 6 binary data (base64-encoded typed arrays).
+///
+/// Returns `None` for unknown dtypes or malformed payloads (length not
+/// an exact multiple of the dtype width).
+fn decode_bdata(dtype: &str, bdata: &str) -> Option<Vec<Value>> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(bdata)
+        .ok()?;
+
+    // Helper: decode fixed-width numeric chunks. Returns None if the byte
+    // length isn't an exact multiple of `width` (malformed payload).
+    macro_rules! decode_chunks {
+        ($width:expr, $convert:expr) => {{
+            if bytes.len() % $width != 0 {
+                return None;
+            }
+            let nums: Vec<Value> = bytes
+                .chunks_exact($width)
+                .filter_map(|chunk| {
+                    let arr = chunk.try_into().ok()?;
+                    Some($convert(arr))
+                })
+                .collect();
+            Some(nums)
+        }};
+    }
+
+    match dtype {
+        "f8" => decode_chunks!(8, |a: [u8; 8]| serde_json::json!(f64::from_le_bytes(a))),
+        "f4" => {
+            decode_chunks!(4, |a: [u8; 4]| serde_json::json!(
+                f32::from_le_bytes(a) as f64
+            ))
+        }
+        "i4" => decode_chunks!(4, |a: [u8; 4]| serde_json::json!(i32::from_le_bytes(a))),
+        "i2" => decode_chunks!(2, |a: [u8; 2]| serde_json::json!(i16::from_le_bytes(a))),
+        "u2" => decode_chunks!(2, |a: [u8; 2]| serde_json::json!(u16::from_le_bytes(a))),
+        "u4" => decode_chunks!(4, |a: [u8; 4]| serde_json::json!(u32::from_le_bytes(a))),
+        "i1" => Some(bytes.iter().map(|&b| serde_json::json!(b as i8)).collect()),
+        "u1" => Some(bytes.iter().map(|&b| serde_json::json!(b)).collect()),
+        _ => None,
+    }
+}
+
 /// Summarize a Plotly spec into an LLM-friendly text representation.
 pub fn summarize(spec: &Value) -> String {
     let mut lines = Vec::new();
@@ -158,8 +273,8 @@ fn summarize_trace(trace: &Value, trace_type: &str) -> String {
 
 /// Summarize a bar trace.
 fn summarize_bar(trace: &Value) -> String {
-    let x_arr = trace.get("x").and_then(|v| v.as_array());
-    let y_arr = trace.get("y").and_then(|v| v.as_array());
+    let x_arr = trace.get("x").and_then(extract_trace_array);
+    let y_arr = trace.get("y").and_then(extract_trace_array);
 
     let (labels_arr, values_arr) = match (x_arr, y_arr) {
         (Some(x), Some(y)) => {
@@ -178,11 +293,18 @@ fn summarize_bar(trace: &Value) -> String {
                 }
             }
         }
-        _ => return "no data".to_string(),
+        _ => {
+            let x_n = trace.get("x").and_then(trace_element_count);
+            let y_n = trace.get("y").and_then(trace_element_count);
+            if let Some(n) = x_n.or(y_n) {
+                return format!("n={} points", n);
+            }
+            return "no data".to_string();
+        }
     };
 
     // Use positional extraction to maintain index alignment with labels
-    let values_pos = extract_numbers_positional(values_arr);
+    let values_pos = extract_numbers_positional(&values_arr);
 
     // Pair labels with values, skipping entries where either is missing
     let pairs: Vec<(&str, f64)> = labels_arr
@@ -220,16 +342,25 @@ fn summarize_bar(trace: &Value) -> String {
 
 /// Summarize a pie trace.
 fn summarize_pie(trace: &Value) -> String {
-    let labels_arr = trace.get("labels").and_then(|v| v.as_array());
-    let values_arr = trace.get("values").and_then(|v| v.as_array());
+    let labels_arr = trace.get("labels").and_then(extract_trace_array);
+    let values_arr = trace.get("values").and_then(extract_trace_array);
 
     let (labels_arr, values_arr) = match (labels_arr, values_arr) {
         (Some(l), Some(v)) => (l, v),
-        _ => return "no data".to_string(),
+        _ => {
+            let n = trace
+                .get("labels")
+                .and_then(trace_element_count)
+                .or_else(|| trace.get("values").and_then(trace_element_count));
+            if let Some(n) = n {
+                return format!("n={} slices", n);
+            }
+            return "no data".to_string();
+        }
     };
 
     // Use positional extraction to maintain index alignment with labels
-    let values_pos = extract_numbers_positional(values_arr);
+    let values_pos = extract_numbers_positional(&values_arr);
 
     // Pair labels with values, skipping entries where either is missing
     let pairs: Vec<(&str, f64)> = labels_arr
@@ -260,11 +391,11 @@ fn summarize_pie(trace: &Value) -> String {
 }
 
 /// Classify the x-axis of a scatter trace.
-enum XAxis<'a> {
+enum XAxis {
     /// String labels (dates, categories)
-    Strings(&'a [Value]),
+    Strings(Vec<Value>),
     /// Numeric values
-    Numeric(&'a [Value]),
+    Numeric(Vec<Value>),
     /// No x-axis provided
     None,
 }
@@ -274,15 +405,21 @@ enum XAxis<'a> {
 /// Handles both numeric and string x-axes (e.g., dates like "2024-01").
 /// Uses positional extraction for y-values to maintain alignment with x.
 fn summarize_scatter(trace: &Value) -> String {
-    let y_arr = match trace.get("y").and_then(|v| v.as_array()) {
+    let y_arr = match trace.get("y").and_then(extract_trace_array) {
         Some(arr) => arr,
-        None => return "no data".to_string(),
+        None => {
+            // Large bdata — report count without full decode
+            if let Some(n) = trace.get("y").and_then(trace_element_count) {
+                return format!("n={} points", n);
+            }
+            return "no data".to_string();
+        }
     };
 
     // Use positional extraction to preserve alignment with x-axis
-    let y_pos = extract_numbers_positional(y_arr);
+    let y_pos = extract_numbers_positional(&y_arr);
 
-    let x_axis = match trace.get("x").and_then(|v| v.as_array()) {
+    let x_axis = match trace.get("x").and_then(extract_trace_array) {
         Some(arr) if arr.first().is_some_and(|v| v.is_string()) => XAxis::Strings(arr),
         Some(arr) => XAxis::Numeric(arr),
         None => XAxis::None,
@@ -386,6 +523,8 @@ fn summarize_heatmap(trace: &Value) -> String {
         .get("y")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect());
+    // Note: heatmap z is a 2D array (array of arrays), and x/y are label arrays.
+    // bdata encoding doesn't apply to 2D z or label arrays, so we keep .as_array() here.
 
     if rows <= 6 && cols <= 6 {
         // Full labeled matrix
@@ -436,19 +575,28 @@ fn summarize_heatmap(trace: &Value) -> String {
 
 /// Summarize a choropleth trace.
 fn summarize_choropleth(trace: &Value) -> String {
-    let locations = trace.get("locations").and_then(|v| v.as_array());
+    let locations = trace.get("locations").and_then(extract_trace_array);
     let z_arr = trace
         .get("z")
-        .and_then(|v| v.as_array())
-        .or_else(|| trace.get("values").and_then(|v| v.as_array()));
+        .and_then(extract_trace_array)
+        .or_else(|| trace.get("values").and_then(extract_trace_array));
 
     let (locations, z_arr) = match (locations, z_arr) {
         (Some(l), Some(z)) => (l, z),
-        _ => return "no data".to_string(),
+        _ => {
+            let n = trace
+                .get("locations")
+                .and_then(trace_element_count)
+                .or_else(|| trace.get("z").and_then(trace_element_count));
+            if let Some(n) = n {
+                return format!("n={} regions", n);
+            }
+            return "no data".to_string();
+        }
     };
 
     // Use positional extraction to maintain alignment with location names
-    let z_pos = extract_numbers_positional(z_arr);
+    let z_pos = extract_numbers_positional(&z_arr);
 
     // Pair locations with z-values, skipping entries where either is missing
     let pairs: Vec<(&str, f64)> = locations
@@ -505,10 +653,10 @@ fn summarize_choropleth(trace: &Value) -> String {
 
 /// Generic fallback for unknown trace types.
 fn summarize_generic(trace: &Value, trace_type: &str) -> String {
-    // Try to determine data size from common fields
+    // Try to determine data size from common fields (cheap count, no decode)
     let n = ["x", "y", "z", "values", "labels", "locations"]
         .iter()
-        .filter_map(|key| trace.get(key)?.as_array().map(|a| a.len()))
+        .filter_map(|key| trace.get(key).and_then(trace_element_count))
         .max();
 
     match n {
@@ -518,6 +666,7 @@ fn summarize_generic(trace: &Value, trace_type: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -908,6 +1057,133 @@ mod tests {
         assert!(
             !result.contains("CAN=60"),
             "CAN should not get MEX's value: {}",
+            result
+        );
+    }
+
+    // ── Plotly 6 bdata tests ──
+
+    #[test]
+    fn test_decode_bdata_f8() {
+        // Encode [1.0, 2.0, 3.0] as little-endian f64 → base64
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        for &v in &[1.0_f64, 2.0, 3.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let result = decode_bdata("f8", &encoded);
+        assert!(result.is_some(), "should decode f8 bdata");
+        let arr = result.expect("already checked");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_f64(), Some(1.0));
+        assert_eq!(arr[1].as_f64(), Some(2.0));
+        assert_eq!(arr[2].as_f64(), Some(3.0));
+    }
+
+    #[test]
+    fn test_decode_bdata_i4() {
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        for &v in &[10_i32, -20, 30] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let result = decode_bdata("i4", &encoded);
+        assert!(result.is_some(), "should decode i4 bdata");
+        let arr = result.expect("already checked");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_i64(), Some(10));
+        assert_eq!(arr[1].as_i64(), Some(-20));
+        assert_eq!(arr[2].as_i64(), Some(30));
+    }
+
+    #[test]
+    fn test_decode_bdata_unknown_dtype() {
+        assert!(decode_bdata("zz", "AAAA").is_none());
+    }
+
+    #[test]
+    fn test_extract_trace_array_plain() {
+        let val = json!([1, 2, 3]);
+        let result = extract_trace_array(&val);
+        assert!(result.is_some());
+        assert_eq!(result.expect("checked").len(), 3);
+    }
+
+    #[test]
+    fn test_extract_trace_array_bdata() {
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        for &v in &[5.0_f64, 10.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let val = json!({"dtype": "f8", "bdata": encoded});
+        let result = extract_trace_array(&val);
+        assert!(result.is_some(), "should decode bdata object");
+        let arr = result.expect("checked");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_f64(), Some(5.0));
+        assert_eq!(arr[1].as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn test_scatter_with_bdata_y() {
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        for &v in &[2.0_f64, 4.0, 6.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let spec = json!({
+            "data": [{
+                "type": "scatter",
+                "x": [1, 2, 3],
+                "y": {"dtype": "f8", "bdata": encoded}
+            }],
+            "layout": {"title": "bdata scatter"}
+        });
+        let result = summarize(&spec);
+        assert!(
+            !result.contains("no data"),
+            "bdata y should not be 'no data': {}",
+            result
+        );
+        assert!(result.contains("(1, 2)"), "should have (1,2): {}", result);
+        assert!(result.contains("(3, 6)"), "should have (3,6): {}", result);
+    }
+
+    #[test]
+    fn test_bar_with_bdata_values() {
+        use base64::Engine;
+        let mut bytes = Vec::new();
+        for &v in &[21.41_f64, 20.44] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let spec = json!({
+            "data": [{
+                "type": "bar",
+                "x": ["Sun", "Sat"],
+                "y": {"dtype": "f8", "bdata": encoded}
+            }],
+            "layout": {"title": "bdata bar"}
+        });
+        let result = summarize(&spec);
+        assert!(
+            result.contains("Sun: 21.41"),
+            "should have Sun value: {}",
+            result
+        );
+        assert!(
+            result.contains("Sat: 20.44"),
+            "should have Sat value: {}",
             result
         );
     }

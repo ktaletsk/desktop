@@ -121,7 +121,19 @@ fn manifest_output_to_structured(manifest: &Value, blob_base_url: &Option<String
                     if mime == "text/html" && has_renderable_image {
                         continue;
                     }
-                    if is_viz_mime(mime) {
+                    if is_viz_mime(mime) || mime == "application/geo+json" {
+                        // Viz specs: include blob URL (for renderer) but skip
+                        // inline data (too large). Inline specs get synthesized
+                        // into text/llm+plain below.
+                        let meta = output_resolver::content_ref_meta(content_ref);
+                        if let Some(hash) = meta.blob_hash {
+                            if let Some(base) = blob_base_url.as_ref() {
+                                data.insert(
+                                    mime.clone(),
+                                    Value::String(format!("{}/blob/{}", base, hash)),
+                                );
+                            }
+                        }
                         continue;
                     }
 
@@ -141,6 +153,29 @@ fn manifest_output_to_structured(manifest: &Value, blob_base_url: &Option<String
 
                     if let Some(jv) = json_value {
                         data.insert(mime.clone(), jv);
+                    }
+                }
+            }
+
+            // Synthesize text/llm+plain from viz specs that were skipped
+            if data.is_empty() || !data.contains_key("text/llm+plain") {
+                if let Some(data_map) = manifest.get("data").and_then(|v| v.as_object()) {
+                    for (mime, content_ref) in data_map {
+                        if is_viz_mime(mime) || mime == "application/geo+json" {
+                            // Only try inline content (no blob fetches)
+                            if let Some(inline) = content_ref.get("inline").and_then(|v| v.as_str())
+                            {
+                                if let Ok(spec) = serde_json::from_str::<Value>(inline) {
+                                    if let Some(summary) = repr_llm::summarize_viz(mime, &spec) {
+                                        data.insert(
+                                            "text/llm+plain".to_string(),
+                                            Value::String(summary),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

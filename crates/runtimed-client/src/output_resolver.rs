@@ -81,6 +81,14 @@ pub fn has_synthesizable_mime(data_map: &serde_json::Map<String, Value>) -> bool
     })
 }
 
+/// Check if a single MIME string is a synthesizable viz type.
+fn has_synthesizable_mime_str(mime: &str) -> bool {
+    SYNTHESIS_EXACT.contains(&mime)
+        || SYNTHESIS_PREFIXES
+            .iter()
+            .any(|prefix| mime.starts_with(prefix))
+}
+
 /// Extract metadata from a ContentRef Value without resolving the content.
 ///
 /// Works with both `{"inline": "..."}` and `{"blob": "hash", "size": N}` shapes.
@@ -716,12 +724,17 @@ fn synthesize_llm_plain_for_viz(output_data: &mut HashMap<String, DataValue>) {
     if output_data.contains_key("text/llm+plain") {
         return;
     }
-    let viz_summary = output_data.iter().find_map(|(mime, dv)| {
-        if let DataValue::Json(ref spec) = dv {
-            repr_llm::summarize_viz(mime, spec)
-        } else {
-            None
+    let viz_summary = output_data.iter().find_map(|(mime, dv)| match dv {
+        DataValue::Json(ref spec) => repr_llm::summarize_viz(mime, spec),
+        DataValue::Text(ref text) if has_synthesizable_mime_str(mime) => {
+            // Try parsing Text values as JSON for viz MIME types only.
+            // Skip non-viz MIMEs to avoid unnecessary parse attempts on
+            // large text/plain or text/html values.
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|spec| repr_llm::summarize_viz(mime, &spec))
         }
+        _ => None,
     });
     if let Some(summary) = viz_summary {
         let mut parts: Vec<String> = Vec::new();
