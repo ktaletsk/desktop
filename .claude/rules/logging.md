@@ -8,7 +8,21 @@ paths:
 
 ## Rust Logging
 
-Use the `log` crate with `env_logger`. Import log macros at the top of your file:
+### runtimed daemon
+
+Use the `tracing` crate. Import log macros at the top of your file:
+
+```rust
+use tracing::{debug, info, warn, error};
+```
+
+The daemon uses `tracing-subscriber` with layered subscribers (stderr + file).
+Dependencies that use the `log` crate are automatically bridged into tracing
+via `tracing-log` (set up by `.init()`).
+
+### Tauri app (notebook crate)
+
+The notebook app still uses `log` with `tauri-plugin-log`:
 
 ```rust
 use log::{debug, info, warn, error};
@@ -48,7 +62,7 @@ Use consistent prefixes for filtering:
 
 ### Log File Rotation
 
-Daemon logs rotate on startup — each daemon session gets a clean log file. Previous logs are preserved as `runtimed.log.prev`. This makes `runt daemon logs -f` show only the current session.
+Daemon logs rotate on startup — each daemon session gets a clean log file. Previous logs are preserved as `runtimed.log.1`. This makes `runt daemon logs -f` show only the current session.
 
 ### Enabling Debug Logs
 
