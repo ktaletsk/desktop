@@ -16,12 +16,25 @@ const _: () = {
         PLOTLY.len() > 1024,
         "plotly.js appears to be a Git LFS pointer — run `git lfs pull`"
     );
+    const MARKDOWN: &[u8] = include_bytes!("../../runt-mcp/assets/plugins/markdown.js");
+    assert!(
+        MARKDOWN.len() > 1024,
+        "markdown.js appears to be a Git LFS pointer — run `git lfs pull`"
+    );
 };
 
 /// Look up an embedded renderer plugin asset by filename.
 /// Returns (bytes, content_type) or None.
 pub fn get(name: &str) -> Option<(&'static [u8], &'static str)> {
     match name {
+        "markdown.js" => Some((
+            include_bytes!("../../runt-mcp/assets/plugins/markdown.js"),
+            "application/javascript; charset=utf-8",
+        )),
+        "markdown.css" => Some((
+            include_bytes!("../../runt-mcp/assets/plugins/markdown.css"),
+            "text/css; charset=utf-8",
+        )),
         "plotly.js" => Some((
             include_bytes!("../../runt-mcp/assets/plugins/plotly.js"),
             "application/javascript; charset=utf-8",
