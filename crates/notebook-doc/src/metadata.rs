@@ -665,13 +665,50 @@ impl Default for RuntMetadata {
 /// assert_eq!(extract_package_name("pandas>=2.0"), "pandas");
 /// assert_eq!(extract_package_name("requests[security]"), "requests");
 /// assert_eq!(extract_package_name("NumPy"), "numpy");
+/// assert_eq!(extract_package_name("conda-forge::numpy>=1.24"), "numpy");
 /// ```
 pub fn extract_package_name(spec: &str) -> String {
-    spec.trim()
-        .split(&['>', '<', '=', '!', '~', '[', ';', '@', ' '][..])
+    let spec = spec.trim();
+    // Strip conda channel qualifier (e.g. "conda-forge::numpy" -> "numpy")
+    let spec = spec.rsplit_once("::").map_or(spec, |(_, name)| name);
+    spec.split(&['>', '<', '=', '!', '~', '[', ';', '@', ' '][..])
         .next()
         .unwrap_or(spec)
         .to_lowercase()
+}
+
+/// Validate that a string is a plausible package specifier (PEP 508 or conda matchspec).
+///
+/// Uses [`extract_package_name`] to extract the base name, then checks that it is
+/// non-empty and contains only valid characters (alphanumeric, hyphens, underscores, dots).
+/// This does **not** fully validate PEP 508 — that is uv/conda's job at install time.
+/// The purpose is to catch obvious garbage like mangled JSON fragments (`["pandas"`,
+/// `"numpy"]`) early, before they silently corrupt settings.
+///
+/// # Examples
+///
+/// ```
+/// use notebook_doc::metadata::validate_package_specifier;
+/// assert!(validate_package_specifier("pandas>=2.0").is_ok());
+/// assert!(validate_package_specifier("requests[security]").is_ok());
+/// assert!(validate_package_specifier("[\"pandas\"").is_err());
+/// assert!(validate_package_specifier("").is_err());
+/// ```
+pub fn validate_package_specifier(spec: &str) -> Result<(), String> {
+    let name = extract_package_name(spec);
+    if name.is_empty() {
+        return Err("package specifier cannot be empty".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "invalid package name '{name}' (extracted from '{spec}'). \
+             Package names may only contain letters, digits, hyphens, underscores, and dots"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -911,6 +948,47 @@ mod tests {
     #[test]
     fn test_extract_package_name_whitespace() {
         assert_eq!(extract_package_name("  pandas  >=2.0"), "pandas");
+    }
+
+    #[test]
+    fn test_extract_package_name_conda_channel_qualifier() {
+        assert_eq!(extract_package_name("conda-forge::numpy"), "numpy");
+        assert_eq!(extract_package_name("conda-forge::numpy>=1.24"), "numpy");
+        assert_eq!(extract_package_name("defaults::scipy"), "scipy");
+    }
+
+    // ── validate_package_specifier ─────────────────────────────
+
+    #[test]
+    fn test_validate_package_specifier_valid() {
+        assert!(validate_package_specifier("pandas").is_ok());
+        assert!(validate_package_specifier("pandas>=2.0").is_ok());
+        assert!(validate_package_specifier("numpy==1.24.0").is_ok());
+        assert!(validate_package_specifier("requests[security]").is_ok());
+        assert!(validate_package_specifier("django~=4.2").is_ok());
+        assert!(validate_package_specifier("pywin32 ; sys_platform == 'win32'").is_ok());
+        assert!(validate_package_specifier("mypackage@https://example.com/pkg.tar.gz").is_ok());
+        assert!(validate_package_specifier("my-package").is_ok());
+        assert!(validate_package_specifier("my_package").is_ok());
+        assert!(validate_package_specifier("zope.interface").is_ok());
+        // Conda channel-qualified matchspecs
+        assert!(validate_package_specifier("conda-forge::numpy").is_ok());
+        assert!(validate_package_specifier("conda-forge::numpy>=1.24").is_ok());
+        assert!(validate_package_specifier("defaults::scipy").is_ok());
+    }
+
+    #[test]
+    fn test_validate_package_specifier_empty() {
+        assert!(validate_package_specifier("").is_err());
+        assert!(validate_package_specifier("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_specifier_mangled_json() {
+        // These are the artifacts produced by the old comma-split bug
+        assert!(validate_package_specifier("[\"pandas\"").is_err());
+        assert!(validate_package_specifier("\"numpy\"").is_err());
+        assert!(validate_package_specifier("\"seaborn\"]").is_err());
     }
 
     // ── detect_runtime ───────────────────────────────────────────
