@@ -46,6 +46,7 @@ use crate::notebook_metadata::NotebookMetadataSnapshot;
 use crate::protocol::{
     EnvSyncDiff, NotebookBroadcast, NotebookRequest, NotebookResponse, QueueEntry,
 };
+use notebook_doc::diff::diff_metadata_touched;
 use notebook_doc::presence::{self, PresenceState};
 use notebook_doc::runtime_state::{QueueEntry as DocQueueEntry, RuntimeStateDoc};
 
@@ -2382,8 +2383,10 @@ where
 
                                 // Complete all document mutations inside the lock, encode the
                                 // reply, then release the lock before performing async I/O.
-                                let (persist_bytes, reply_encoded) = {
+                                let (persist_bytes, reply_encoded, metadata_changed) = {
                                     let mut doc = room.doc.write().await;
+
+                                    let heads_before = doc.get_heads();
 
                                     // Guard receive_sync_message against automerge panics
                                     let recv_result = catch_automerge_panic("doc-receive-sync", || {
@@ -2402,6 +2405,13 @@ where
                                             continue;
                                         }
                                     }
+
+                                    let heads_after = doc.get_heads();
+                                    let metadata_changed = diff_metadata_touched(
+                                        doc.doc_mut(),
+                                        &heads_before,
+                                        &heads_after,
+                                    );
 
                                     let bytes = doc.save();
 
@@ -2422,7 +2432,7 @@ where
                                         }
                                     };
 
-                                    (bytes, encoded)
+                                    (bytes, encoded, metadata_changed)
                                 };
 
                                 // Send reply outside the lock so other peers can
@@ -2440,7 +2450,9 @@ where
                                 let _ = room.persist_tx.send(Some(persist_bytes));
 
                                 // Check if metadata changed and kernel is running - broadcast sync state
-                                check_and_broadcast_sync_state(room).await;
+                                if metadata_changed {
+                                    check_and_broadcast_sync_state(room).await;
+                                }
 
                                 // Re-verify trust from doc metadata (detects trust approval)
                                 check_and_update_trust_state(room).await;
@@ -6203,7 +6215,7 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
         || launched.conda_deps.is_some()
         || launched.deno_config.is_some();
 
-    let (packages_to_install, env_type) = if is_tracking {
+    let (packages_to_install, env_kind) = if is_tracking {
         // Kernel launched with inline deps — compute drift
         let diff = compute_env_sync_diff(&launched, &current_metadata);
         let Some(diff) = diff else {
@@ -6217,17 +6229,22 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
                 needs_restart: true,
             };
         }
-        let env_type = if launched.uv_deps.is_some() {
-            "uv"
+        let env_kind = if launched.uv_deps.is_some() {
+            notebook_protocol::protocol::EnvKind::Uv {
+                packages: diff.added.clone(),
+            }
         } else if launched.conda_deps.is_some() {
-            "conda"
+            notebook_protocol::protocol::EnvKind::Conda {
+                packages: diff.added.clone(),
+                channels: get_inline_conda_channels(&current_metadata),
+            }
         } else {
             return NotebookResponse::SyncEnvironmentFailed {
                 error: "Hot-sync only supported for UV and Conda environments".to_string(),
                 needs_restart: true,
             };
         };
-        (diff.added, env_type)
+        (diff.added, env_kind)
     } else {
         // Prewarmed kernel — check if user added inline deps
         let inline = check_inline_deps(&current_metadata);
@@ -6239,7 +6256,10 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
                         synced_packages: vec![],
                     };
                 }
-                (added, "uv")
+                let env_kind = notebook_protocol::protocol::EnvKind::Uv {
+                    packages: added.clone(),
+                };
+                (added, env_kind)
             }
             Some("conda:inline") => {
                 let added = get_inline_conda_deps(&current_metadata).unwrap_or_default();
@@ -6248,7 +6268,11 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
                         synced_packages: vec![],
                     };
                 }
-                (added, "conda")
+                let env_kind = notebook_protocol::protocol::EnvKind::Conda {
+                    packages: added.clone(),
+                    channels: get_inline_conda_channels(&current_metadata),
+                };
+                (added, env_kind)
             }
             _ => {
                 return NotebookResponse::SyncEnvironmentFailed {
@@ -6265,29 +6289,9 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
         };
     }
 
-    if env_type != "uv" && env_type != "conda" {
-        return NotebookResponse::SyncEnvironmentFailed {
-            error: "Hot-sync only supported for UV and Conda environments. Deno requires restart."
-                .to_string(),
-            needs_restart: true,
-        };
-    }
-
-    // Get conda channels if this is a conda environment
-    let channels = if env_type == "conda" {
-        Some(get_inline_conda_channels(&current_metadata))
-    } else {
-        None
-    };
-
-    // Store env_type for use in success handler
-    let sync_env_type = env_type;
-
     // Send SyncEnvironment to the runtime agent
-    let sync_request = notebook_protocol::protocol::RuntimeAgentRequest::SyncEnvironment {
-        packages: packages_to_install.clone(),
-        channels,
-    };
+    let sync_request =
+        notebook_protocol::protocol::RuntimeAgentRequest::SyncEnvironment(env_kind.clone());
 
     // Notify frontend that sync is starting
     let _ = room
@@ -6310,28 +6314,30 @@ async fn handle_sync_environment(room: &NotebookRoom) -> NotebookResponse {
             {
                 let mut lc = room.runtime_agent_launched_config.write().await;
                 if let Some(ref mut config) = *lc {
-                    // Update the correct deps field based on environment type
-                    if sync_env_type == "uv" {
-                        // Promote prewarmed to uv:inline baseline if needed
-                        if config.uv_deps.is_none() {
-                            config.uv_deps = Some(vec![]);
-                        }
-                        if let Some(ref mut deps) = config.uv_deps {
-                            for pkg in &synced_packages {
-                                if !deps.contains(pkg) {
-                                    deps.push(pkg.clone());
+                    match &env_kind {
+                        notebook_protocol::protocol::EnvKind::Uv { .. } => {
+                            // Promote prewarmed to uv:inline baseline if needed
+                            if config.uv_deps.is_none() {
+                                config.uv_deps = Some(vec![]);
+                            }
+                            if let Some(ref mut deps) = config.uv_deps {
+                                for pkg in &synced_packages {
+                                    if !deps.contains(pkg) {
+                                        deps.push(pkg.clone());
+                                    }
                                 }
                             }
                         }
-                    } else if sync_env_type == "conda" {
-                        // Promote prewarmed to conda:inline baseline if needed
-                        if config.conda_deps.is_none() {
-                            config.conda_deps = Some(vec![]);
-                        }
-                        if let Some(ref mut deps) = config.conda_deps {
-                            for pkg in &synced_packages {
-                                if !deps.contains(pkg) {
-                                    deps.push(pkg.clone());
+                        notebook_protocol::protocol::EnvKind::Conda { .. } => {
+                            // Promote prewarmed to conda:inline baseline if needed
+                            if config.conda_deps.is_none() {
+                                config.conda_deps = Some(vec![]);
+                            }
+                            if let Some(ref mut deps) = config.conda_deps {
+                                for pkg in &synced_packages {
+                                    if !deps.contains(pkg) {
+                                        deps.push(pkg.clone());
+                                    }
                                 }
                             }
                         }
