@@ -102,6 +102,29 @@ struct FailureState {
     failed_package: Option<String>,
     /// Error classification for the frontend banner.
     error_kind: Option<String>,
+    /// Whether the last failure was a network error (for shorter backoff).
+    is_network_failure: bool,
+}
+
+/// Classify whether an error message indicates a network failure.
+///
+/// Network failures get shorter backoff since kernel-env's offline-first
+/// path may succeed without network access. We use specific substrings
+/// rather than broad terms to avoid false positives (e.g., a local socket
+/// "connection" or a subprocess "timeout" is not a network failure).
+fn is_network_error(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection timed out")
+        || lower.contains("request timed out")
+        || lower.contains("connect timed out")
+        || lower.contains("dns")
+        || lower.contains("network is unreachable")
+        || lower.contains("network unreachable")
+        || lower.contains("failed to fetch")
+        || lower.contains("could not resolve")
+        || lower.contains("no cached repodata")
 }
 
 /// Result of parsing a package installation error.
@@ -347,9 +370,12 @@ impl Pool {
         self.failure_state.last_failure = Some(Instant::now());
 
         if let Some(err) = error {
+            self.failure_state.is_network_failure = is_network_error(&err.error_message);
             self.failure_state.last_error = Some(err.error_message);
             self.failure_state.failed_package = err.failed_package;
             self.failure_state.error_kind = Some(err.error_kind);
+        } else {
+            self.failure_state.is_network_failure = false;
         }
     }
 
@@ -361,23 +387,39 @@ impl Pool {
     /// Calculate backoff delay based on consecutive failures.
     ///
     /// Returns Duration::ZERO if no failures, otherwise exponential backoff:
-    /// 30s, 60s, 120s, 240s, max 300s (5 min).
+    /// - Network failures: 10s, 20s, 40s, max 60s (shorter — offline-first may succeed)
+    /// - Other failures: 30s, 60s, 120s, 240s, max 300s (5 min)
     fn backoff_delay(&self) -> std::time::Duration {
         if self.failure_state.consecutive_failures == 0 {
             return std::time::Duration::ZERO;
         }
 
-        // Exponential backoff: 30s * 2^(failures-1), capped at 300s
-        let base_secs = 30u64;
-        let exponent = self
-            .failure_state
-            .consecutive_failures
-            .saturating_sub(1)
-            .min(4);
-        let multiplier = 2u64.pow(exponent);
-        let delay_secs = (base_secs * multiplier).min(300);
+        if self.failure_state.is_network_failure {
+            // Network failures get shorter backoff: 10s base, 60s cap.
+            // kernel-env's offline-first path may succeed without network.
+            let base = std::time::Duration::from_secs(10);
+            let max = std::time::Duration::from_secs(60);
+            let delay = base
+                * 2u32.saturating_pow(
+                    self.failure_state
+                        .consecutive_failures
+                        .saturating_sub(1)
+                        .min(4),
+                );
+            std::cmp::min(delay, max)
+        } else {
+            // Exponential backoff: 30s * 2^(failures-1), capped at 300s
+            let base_secs = 30u64;
+            let exponent = self
+                .failure_state
+                .consecutive_failures
+                .saturating_sub(1)
+                .min(4);
+            let multiplier = 2u64.pow(exponent);
+            let delay_secs = (base_secs * multiplier).min(300);
 
-        std::time::Duration::from_secs(delay_secs)
+            std::time::Duration::from_secs(delay_secs)
+        }
     }
 
     /// Check if enough time has passed since last failure to retry.
@@ -2727,6 +2769,7 @@ impl Daemon {
                         pool.failure_state.consecutive_failures,
                         pool.backoff_delay().as_secs(),
                         pool.failure_state.failed_package.clone(),
+                        pool.failure_state.is_network_failure,
                     ))
                 } else {
                     None
@@ -2745,9 +2788,15 @@ impl Daemon {
                     for _ in 0..deficit {
                         self.create_uv_env().await;
                     }
-                } else if let Some((failures, backoff_secs, failed_pkg)) = backoff_info {
+                } else if let Some((failures, backoff_secs, failed_pkg, is_network)) = backoff_info
+                {
                     // In backoff period - log why we're waiting
-                    if let Some(pkg) = failed_pkg {
+                    if is_network {
+                        warn!(
+                            "[runtimed] UV pool warming offline — network unavailable, will retry in {}s",
+                            backoff_secs
+                        );
+                    } else if let Some(pkg) = failed_pkg {
                         warn!(
                             "[runtimed] UV pool in backoff: {} consecutive failures installing '{}', \
                              waiting {}s before retry. Check uv.default_packages in settings.",
@@ -2815,6 +2864,7 @@ impl Daemon {
                         pool.failure_state.consecutive_failures,
                         pool.backoff_delay().as_secs(),
                         pool.failure_state.last_error.clone(),
+                        pool.failure_state.is_network_failure,
                     ))
                 } else {
                     None
@@ -2841,9 +2891,15 @@ impl Daemon {
                         }
                         self.create_conda_env().await;
                     }
-                } else if let Some((failures, backoff_secs, last_error)) = backoff_info {
+                } else if let Some((failures, backoff_secs, last_error, is_network)) = backoff_info
+                {
                     // In backoff period - log why we're waiting
-                    if let Some(err) = last_error {
+                    if is_network {
+                        warn!(
+                            "[runtimed] Conda pool warming offline — network unavailable, will retry in {}s",
+                            backoff_secs
+                        );
+                    } else if let Some(err) = last_error {
                         warn!(
                             "[runtimed] Conda pool in backoff: {} consecutive failures ({}), \
                              waiting {}s before retry. Check conda.default_packages in settings.",
@@ -2913,6 +2969,7 @@ impl Daemon {
                         pool.failure_state.consecutive_failures,
                         pool.backoff_delay().as_secs(),
                         pool.failure_state.last_error.clone(),
+                        pool.failure_state.is_network_failure,
                     ))
                 } else {
                     None
@@ -2937,8 +2994,14 @@ impl Daemon {
                         }
                         self.create_pixi_env().await;
                     }
-                } else if let Some((failures, backoff_secs, last_error)) = backoff_info {
-                    if let Some(err) = last_error {
+                } else if let Some((failures, backoff_secs, last_error, is_network)) = backoff_info
+                {
+                    if is_network {
+                        warn!(
+                            "[runtimed] Pixi pool warming offline — network unavailable, will retry in {}s",
+                            backoff_secs
+                        );
+                    } else if let Some(err) = last_error {
                         warn!(
                             "[runtimed] Pixi pool in backoff: {} consecutive failures ({}), \
                              waiting {}s before retry. Check pixi.default_packages in settings.",
@@ -4507,5 +4570,78 @@ mod tests {
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains("esm_hash"));
         assert!(hashes.contains("data_blob"));
+    }
+
+    // =========================================================================
+    // Network failure detection tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_network_error_classification() {
+        // Network errors
+        assert!(is_network_error("connection refused"));
+        assert!(is_network_error("connection reset by peer"));
+        assert!(is_network_error("connection timed out"));
+        assert!(is_network_error("request timed out"));
+        assert!(is_network_error("connect timed out"));
+        assert!(is_network_error("DNS resolution failed"));
+        assert!(is_network_error("Failed to fetch repodata"));
+        assert!(is_network_error("No cached repodata available"));
+        assert!(is_network_error("network is unreachable"));
+        assert!(is_network_error("could not resolve host"));
+
+        // NOT network errors — these should use normal backoff
+        assert!(!is_network_error("package pandas not found"));
+        assert!(!is_network_error("invalid version specifier"));
+        assert!(!is_network_error("Failed to solve dependencies"));
+        assert!(!is_network_error("connection pool exhausted")); // not a network error
+        assert!(!is_network_error("subprocess timed out")); // not a network error
+    }
+
+    #[test]
+    fn test_pool_network_backoff_shorter() {
+        let mut pool = Pool::new(3, 3600);
+        pool.failure_state.consecutive_failures = 1;
+        pool.failure_state.is_network_failure = true;
+        let network_delay = pool.backoff_delay();
+
+        pool.failure_state.is_network_failure = false;
+        let normal_delay = pool.backoff_delay();
+
+        assert!(
+            network_delay < normal_delay,
+            "network backoff {:?} should be shorter than normal {:?}",
+            network_delay,
+            normal_delay
+        );
+    }
+
+    #[test]
+    fn test_pool_non_network_backoff_unchanged() {
+        let mut pool = Pool::new(3, 3600);
+        pool.failure_state.consecutive_failures = 3;
+        pool.failure_state.is_network_failure = false;
+        let delay = pool.backoff_delay();
+        // 30s * 2^2 = 120s
+        assert_eq!(delay.as_secs(), 120);
+    }
+
+    #[test]
+    fn test_pool_network_backoff_progression() {
+        let mut pool = Pool::new(3, 3600);
+        pool.failure_state.is_network_failure = true;
+
+        // 10s base, doubling, capped at 60s
+        let expected = [10, 20, 40, 60, 60];
+        for (i, &expected_secs) in expected.iter().enumerate() {
+            pool.failure_state.consecutive_failures = (i + 1) as u32;
+            assert_eq!(
+                pool.backoff_delay().as_secs(),
+                expected_secs,
+                "network backoff at {} failures should be {}s",
+                i + 1,
+                expected_secs
+            );
+        }
     }
 }
