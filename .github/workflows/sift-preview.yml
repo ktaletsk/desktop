@@ -41,16 +41,15 @@ jobs:
       - name: Build nteract-predicate WASM
         run: wasm-pack build crates/nteract-predicate --target web --release
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          run-install: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
-
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Install dependencies
-        run: pnpm install
+          cache: pnpm
+      - run: pnpm install
 
       - name: Generate demo data
         working-directory: packages/sift
@@ -58,7 +57,10 @@ jobs:
 
       - name: Build sift demo
         working-directory: packages/sift
-        run: npx vite build
+        run: vp build
+
+      - name: Install Wrangler
+        run: pnpm add -w wrangler@3.90.0
 
       - name: Deploy to Cloudflare Pages
         id: deploy
@@ -67,6 +69,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy packages/sift/dist --project-name=sift --branch=${{ github.head_ref || github.ref_name }}
+          packageManager: pnpm
 
       - name: Comment preview URL on PR
         if: github.event_name == 'pull_request'

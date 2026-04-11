@@ -1,5 +1,5 @@
 import { cleanup, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { PlotlyOutput } from "../plotly-output";
 
 // Polyfill ResizeObserver for jsdom
@@ -20,14 +20,16 @@ const mockPlotly = {
 };
 
 beforeEach(() => {
-  // biome-ignore lint/suspicious/noExplicitAny: test mock
   (window as any).Plotly = mockPlotly;
 });
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
-  // biome-ignore lint/suspicious/noExplicitAny: test cleanup
+  mockPlotly.newPlot.mockClear();
+  mockPlotly.relayout.mockClear();
+  mockPlotly.purge.mockClear();
+  mockPlotly.Plots.resize.mockClear();
   delete (window as any).Plotly;
 });
 
@@ -51,9 +53,7 @@ describe("PlotlyOutput", () => {
   });
 
   it("renders nothing when data is empty", () => {
-    const { container } = render(
-      <PlotlyOutput data={{ data: [] }} />,
-    );
+    const { container } = render(<PlotlyOutput data={{ data: [] }} />);
     // Component renders the container div but Plotly.newPlot is not called
     // because useEffect sees data.data is empty array (truthy), but newPlot
     // should still be called for an empty array — plotly handles it.
@@ -62,10 +62,7 @@ describe("PlotlyOutput", () => {
   });
 
   it("returns null when data prop has no data array", () => {
-    const { container } = render(
-      // biome-ignore lint/suspicious/noExplicitAny: testing edge case
-      <PlotlyOutput data={null as any} />,
-    );
+    const { container } = render(<PlotlyOutput data={null as any} />);
     expect(container.firstChild).toBeNull();
   });
 

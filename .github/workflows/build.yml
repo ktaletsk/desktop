@@ -46,7 +46,7 @@ jobs:
               - "package-lock.json"
               - "pnpm-lock.yaml"
               - "pnpm-workspace.yaml"
-              - "biome.json"
+              - "vite.config.ts"
               - "components.json"
               - "tailwind.config.js"
               - "tsconfig.json"
@@ -66,19 +66,18 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --check
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: "20"
+          run-install: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: pnpm
+      - run: pnpm install
 
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Install JS dependencies
-        run: pnpm install
-
-      - name: Check Biome (format + lint + imports)
-        run: npx @biomejs/biome check apps/notebook/src/ e2e/ packages/sift/src/
+      - name: Check (format + lint)
+        run: vp check
 
       - name: Check MCP App renderer plugins are up to date
         run: |
@@ -173,27 +172,15 @@ jobs:
         with:
           lfs: true
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: "20"
-
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Set pnpm store directory
-        run: pnpm config set store-dir ~/.pnpm-store
-
-      - name: Cache pnpm store
-        uses: actions/cache@v5
+          run-install: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
         with:
-          path: ~/.pnpm-store
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            pnpm-store-${{ runner.os }}-
-
-      - name: Install JS dependencies
-        run: pnpm install
+          node-version: "22"
+          cache: pnpm
+      - run: pnpm install
 
       - name: Build UIs
         run: |
@@ -217,36 +204,24 @@ jobs:
         with:
           lfs: true
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: "20"
-
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Set pnpm store directory
-        run: pnpm config set store-dir ~/.pnpm-store
-
-      - name: Cache pnpm store
-        uses: actions/cache@v5
+          run-install: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
         with:
-          path: ~/.pnpm-store
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            pnpm-store-${{ runner.os }}-
-
-      - name: Install JS dependencies
-        run: pnpm install
+          node-version: "22"
+          cache: pnpm
+      - run: pnpm install
 
       - name: Run JS tests
-        run: pnpm test:run
+        run: vp test run
 
       - name: Run sift tests
         run: pnpm --filter @nteract/sift test
 
       - name: Run JS benchmarks
-        run: pnpm vitest bench --run apps/notebook/src/lib/__tests__/
+        run: vp test bench --run apps/notebook/src/lib/__tests__/
 
   build-linux:
     name: Linux (release artifacts)

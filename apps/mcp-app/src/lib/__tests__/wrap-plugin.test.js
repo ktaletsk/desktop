@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vite-plus/test";
 import { wrapForMcpApp } from "../wrap-plugin.js";
 
 /** Minimal mock of window.__nteract for testing */
@@ -31,7 +31,6 @@ function createMockNteract() {
 /** Execute wrapped plugin code using Node's vm module.
  * @returns The execution context for inspecting global state
  */
-// biome-ignore lint/security/noGlobalEval: vm.runInContext is the correct way to test dynamic code in Node
 function execWrapped(code, nteractApi) {
   const context = vm.createContext({ window: { __nteract: nteractApi } });
   vm.runInContext(code, context);

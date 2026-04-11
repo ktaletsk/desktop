@@ -19,11 +19,7 @@ interface AudioOutputProps {
  * Renders an audio player for notebook outputs.
  * Handles blob URLs from the blob store, data URLs, and base64-encoded audio.
  */
-export function AudioOutput({
-  data,
-  mediaType = "audio/wav",
-  className = "",
-}: AudioOutputProps) {
+export function AudioOutput({ data, mediaType = "audio/wav", className = "" }: AudioOutputProps) {
   if (!data) return null;
 
   const src =
@@ -36,7 +32,6 @@ export function AudioOutput({
 
   return (
     <div data-slot="audio-output" className={cn("py-2", className)}>
-      {/* biome-ignore lint/a11y/useMediaCaption: kernel audio outputs don't include captions */}
       <audio src={src} controls preload="metadata" />
     </div>
   );

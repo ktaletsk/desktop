@@ -91,38 +91,15 @@ jobs:
         with:
           shared-key: pr-binary-${{ inputs.target_os }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: "20"
-
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Set pnpm store directory (Unix)
-        if: runner.os != 'Windows'
-        run: pnpm config set store-dir ~/.pnpm-store
-
-      - name: Cache pnpm store (Unix)
-        if: runner.os != 'Windows'
-        uses: actions/cache@v5
+          run-install: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
         with:
-          path: ~/.pnpm-store
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            pnpm-store-${{ runner.os }}-
-
-      - name: Cache pnpm store (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v5
-        with:
-          path: ~\AppData\Local\pnpm\store
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            pnpm-store-${{ runner.os }}-
-
-      - name: Install JS dependencies
-        run: pnpm install
+          node-version: "22"
+          cache: pnpm
+      - run: pnpm install
 
       - name: Build frontend
         run: pnpm build

@@ -47,7 +47,6 @@ export function useCellKeyboardNavigation({
   // Memoize keybindings - they're stable because they read from refs.
   // The keybindings close over refs, not the callbacks directly, so we only
   // need to recreate when the presence of optional callbacks changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: callbacks accessed via refs
   return useMemo(
     () => [
       {
@@ -55,9 +54,7 @@ export function useCellKeyboardNavigation({
         run: (view) => {
           const { from } = view.state.selection.main;
           if (from === 0) {
-            logger.debug(
-              `[cell-nav] ArrowUp at top of cell ${cellIdRef.current?.slice(0, 8)}`,
-            );
+            logger.debug(`[cell-nav] ArrowUp at top of cell ${cellIdRef.current?.slice(0, 8)}`);
             onFocusPreviousRef.current("end");
             return true;
           }
