@@ -72,11 +72,9 @@ pub struct JupyterKernel {
     connection_file: Option<PathBuf>,
     /// Shell writer for sending execute requests.
     shell_writer: Option<runtimelib::DealerSendConnection>,
-    /// Process group ID for cleanup (Unix only).
+    /// Kernel process PID for signal-based cleanup (Unix only).
     #[cfg(unix)]
-    process_group_id: Option<i32>,
-    /// Kernel ID for the process registry (orphan reaping).
-    kernel_id: Option<String>,
+    kernel_pid: Option<i32>,
     /// Handle to the iopub listener task.
     iopub_task: Option<JoinHandle<()>>,
     /// Handle to the shell reader task.
@@ -415,9 +413,6 @@ impl KernelConnection for JupyterKernel {
             cmd.env(key, value);
         }
 
-        #[cfg(unix)]
-        cmd.process_group(0);
-
         let mut process = cmd.kill_on_drop(true).spawn()?;
         drop(listeners);
 
@@ -439,11 +434,7 @@ impl KernelConnection for JupyterKernel {
         }
 
         #[cfg(unix)]
-        let process_group_id = process.id().map(|pid| pid as i32);
-        #[cfg(unix)]
-        if let Some(pgid) = process_group_id {
-            crate::kernel_pids::register_kernel(&kernel_id, pgid);
-        }
+        let kernel_pid = process.id().map(|pid| pid as i32);
 
         info!(
             "[jupyter-kernel] Spawned kernel process (pid={:?}, kernel_id={})",
@@ -1796,8 +1787,7 @@ impl KernelConnection for JupyterKernel {
             connection_file: Some(connection_file_path),
             shell_writer: Some(shell_writer),
             #[cfg(unix)]
-            process_group_id,
-            kernel_id: Some(kernel_id.clone()),
+            kernel_pid,
             iopub_task: Some(iopub_task),
             shell_reader_task: Some(shell_reader_task),
             process_watcher_task: Some(process_watcher_task),
@@ -1912,33 +1902,31 @@ impl KernelConnection for JupyterKernel {
         }
 
         #[cfg(unix)]
-        if let Some(pgid) = self.process_group_id.take() {
-            use nix::sys::signal::{killpg, Signal};
+        if let Some(pid) = self.kernel_pid.take() {
+            use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
 
             // Wait up to 2s for the kernel to exit after shutdown_request
-            if !wait_for_process_group_exit(pgid, std::time::Duration::from_secs(2)).await {
-                // SIGTERM: politely ask the process group to terminate
+            if !wait_for_pid_exit(pid, std::time::Duration::from_secs(2)).await {
                 info!(
-                    "[jupyter-kernel] Kernel didn't exit after shutdown_request, sending SIGTERM to pgid {}",
-                    pgid
+                    "[jupyter-kernel] Kernel didn't exit after shutdown_request, sending SIGTERM to pid {}",
+                    pid
                 );
-                let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+                let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
 
                 // Wait up to 3s for SIGTERM
-                if !wait_for_process_group_exit(pgid, std::time::Duration::from_secs(3)).await {
-                    // SIGKILL: force kill as last resort
+                if !wait_for_pid_exit(pid, std::time::Duration::from_secs(3)).await {
                     info!(
-                        "[jupyter-kernel] Kernel didn't respond to SIGTERM, sending SIGKILL to pgid {}",
-                        pgid
+                        "[jupyter-kernel] Kernel didn't respond to SIGTERM, sending SIGKILL to pid {}",
+                        pid
                     );
-                    if let Err(e) = killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+                    if let Err(e) = kill(Pid::from_raw(pid), Signal::SIGKILL) {
                         match e {
                             nix::errno::Errno::ESRCH => {}
                             other => {
                                 debug!(
-                                    "[jupyter-kernel] Failed to SIGKILL process group {}: {}",
-                                    pgid, other
+                                    "[jupyter-kernel] Failed to SIGKILL kernel pid {}: {}",
+                                    pid, other
                                 );
                             }
                         }
@@ -1951,10 +1939,6 @@ impl KernelConnection for JupyterKernel {
         {
             // On non-Unix platforms, kill the child process directly
             // (process groups aren't available)
-        }
-
-        if let Some(kid) = self.kernel_id.take() {
-            crate::kernel_pids::unregister_kernel(&kid);
         }
 
         if let Some(ref path) = self.connection_file {
@@ -2219,17 +2203,12 @@ impl Drop for JupyterKernel {
             task.abort();
         }
 
-        // Kill process group on Unix
+        // Kill kernel process on Unix
         #[cfg(unix)]
-        if let Some(pgid) = self.process_group_id.take() {
-            use nix::sys::signal::{killpg, Signal};
+        if let Some(pid) = self.kernel_pid.take() {
+            use nix::sys::signal::{kill, Signal};
             use nix::unistd::Pid;
-            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-        }
-
-        // Unregister from process registry
-        if let Some(kid) = self.kernel_id.take() {
-            crate::kernel_pids::unregister_kernel(&kid);
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
         }
 
         // Clean up connection file
@@ -2241,15 +2220,15 @@ impl Drop for JupyterKernel {
     }
 }
 
-/// Prepend a directory to the PATH environment variable.
+/// Wait for a process to exit by polling `kill(pid, 0)`.
 #[cfg(unix)]
-async fn wait_for_process_group_exit(pgid: i32, timeout: std::time::Duration) -> bool {
-    use nix::sys::signal::killpg;
+async fn wait_for_pid_exit(pid: i32, timeout: std::time::Duration) -> bool {
+    use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match killpg(Pid::from_raw(pgid), None) {
+        match kill(Pid::from_raw(pid), None) {
             Err(nix::errno::Errno::ESRCH) => return true,
             Err(_) => return true,
             Ok(()) => {
