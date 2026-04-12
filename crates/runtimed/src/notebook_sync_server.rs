@@ -2125,6 +2125,45 @@ where
                     );
                 }
 
+                // Clean up the environment directory on eviction. Both pool envs
+                // (runtimed-uv-*, etc.) and content-addressed envs (16-char hex)
+                // are orphaned once the room is gone — pool envs were removed from
+                // the pool's VecDeque on take() and have been mutated with the
+                // notebook's deps, so they cannot be returned. Delete eagerly to
+                // prevent disk pressure during sustained workloads.
+                //
+                // Use pool_env_root() to normalise pixi paths — their venv_path
+                // is nested (e.g. .pixi/envs/default) but we need to delete the
+                // top-level runtimed-pixi-* directory.
+                {
+                    let env_path = room_for_eviction
+                        .runtime_agent_env_path
+                        .read()
+                        .await
+                        .clone();
+                    if let Some(ref path) = env_path {
+                        let root = crate::pool_env_root(path);
+                        let cache_dir = crate::default_cache_dir();
+                        if !crate::is_within_cache_dir(&root, &cache_dir) {
+                            warn!(
+                                "[notebook-sync] Refusing to delete env {:?} on eviction (not within cache dir)",
+                                root
+                            );
+                        } else if root.exists() {
+                            info!(
+                                "[notebook-sync] Cleaning up env {:?} on room eviction",
+                                root
+                            );
+                            if let Err(e) = tokio::fs::remove_dir_all(&root).await {
+                                warn!(
+                                    "[notebook-sync] Failed to clean up env {:?} on eviction: {}",
+                                    root, e
+                                );
+                            }
+                        }
+                    }
+                }
+
                 info!(
                     "[notebook-sync] Evicted room {} (idle timeout)",
                     notebook_id_for_eviction
@@ -3259,6 +3298,18 @@ async fn try_uv_pool_for_inline_deps(
                         "[notebook-sync] Failed to install delta into UV pool env: {}, falling back",
                         e
                     );
+                    // Clean up the taken pool env — it's out of the pool's
+                    // tracking and would otherwise leak on disk.
+                    let root = crate::pool_env_root(&env.venv_path);
+                    let cache_dir = crate::default_cache_dir();
+                    if crate::is_within_cache_dir(&root, &cache_dir) {
+                        if let Err(e) = tokio::fs::remove_dir_all(&root).await {
+                            warn!(
+                                "[notebook-sync] Failed to clean up UV pool env {:?}: {}",
+                                root, e
+                            );
+                        }
+                    }
                     Err(())
                 }
             }
@@ -3266,6 +3317,16 @@ async fn try_uv_pool_for_inline_deps(
         crate::inline_env::PoolDepRelation::Independent => {
             // Shouldn't reach here (pre-check above), but handle gracefully
             debug!("[notebook-sync] UV pool env doesn't match inline deps, falling back");
+            let root = crate::pool_env_root(&env.venv_path);
+            let cache_dir = crate::default_cache_dir();
+            if crate::is_within_cache_dir(&root, &cache_dir) {
+                if let Err(e) = tokio::fs::remove_dir_all(&root).await {
+                    warn!(
+                        "[notebook-sync] Failed to clean up UV pool env {:?}: {}",
+                        root, e
+                    );
+                }
+            }
             Err(())
         }
     }
@@ -3352,12 +3413,32 @@ async fn try_conda_pool_for_inline_deps(
                         "[notebook-sync] Failed to install delta into Conda pool env: {}, falling back",
                         e
                     );
+                    let root = crate::pool_env_root(&env.venv_path);
+                    let cache_dir = crate::default_cache_dir();
+                    if crate::is_within_cache_dir(&root, &cache_dir) {
+                        if let Err(e) = tokio::fs::remove_dir_all(&root).await {
+                            warn!(
+                                "[notebook-sync] Failed to clean up Conda pool env {:?}: {}",
+                                root, e
+                            );
+                        }
+                    }
                     Err(())
                 }
             }
         }
         crate::inline_env::PoolDepRelation::Independent => {
             debug!("[notebook-sync] Conda pool env doesn't match inline deps, falling back");
+            let root = crate::pool_env_root(&env.venv_path);
+            let cache_dir = crate::default_cache_dir();
+            if crate::is_within_cache_dir(&root, &cache_dir) {
+                if let Err(e) = tokio::fs::remove_dir_all(&root).await {
+                    warn!(
+                        "[notebook-sync] Failed to clean up Conda pool env {:?}: {}",
+                        root, e
+                    );
+                }
+            }
             Err(())
         }
     }
@@ -3992,6 +4073,15 @@ async fn auto_launch_kernel(
         (pooled_env, None)
     };
 
+    // Register the env path for GC protection immediately after pool.take(),
+    // BEFORE any async work (agent spawn, connect timeout, delta install).
+    // Without this, there's a race window where GC sees the taken env as an
+    // orphan and deletes it while we're still setting up the kernel.
+    if let Some(ref env) = pooled_env {
+        let mut ep = room.runtime_agent_env_path.write().await;
+        *ep = Some(env.venv_path.clone());
+    }
+
     // Build LaunchedEnvConfig to track what config the kernel was launched with
     let venv_path = pooled_env.as_ref().map(|e| e.venv_path.clone());
     let python_path = pooled_env.as_ref().map(|e| e.python_path.clone());
@@ -4101,11 +4191,7 @@ async fn auto_launch_kernel(
                     Ok(notebook_protocol::protocol::RuntimeAgentResponse::KernelLaunched {
                         env_source: es,
                     }) => {
-                        // Store env path for GC protection
-                        if let Some(ref env) = pooled_env {
-                            let mut ep = room.runtime_agent_env_path.write().await;
-                            *ep = Some(env.venv_path.clone());
-                        }
+                        // env path already registered for GC protection above (before spawn)
 
                         // Store launched config for env sync drift detection
                         {
@@ -5113,6 +5199,13 @@ async fn handle_notebook_request(
             } else {
                 (pooled_env, None)
             };
+
+            // Register the env path for GC protection immediately after pool.take(),
+            // BEFORE any async work (agent spawn, connect timeout, delta install).
+            if let Some(ref env) = pooled_env {
+                let mut ep = room.runtime_agent_env_path.write().await;
+                *ep = Some(env.venv_path.clone());
+            }
 
             // Build LaunchedEnvConfig to track what config the kernel was launched with
             let venv_path = pooled_env.as_ref().map(|e| e.venv_path.clone());
