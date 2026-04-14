@@ -534,6 +534,13 @@ impl KernelConnection for JupyterKernel {
             let mut capture_cache: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
+            // Local comm_id -> target_name map, populated on comm_open and
+            // removed on comm_close. Used by the dx comm filter in CommMsg
+            // and CommClose arms so we can route without a CRDT read on the
+            // hot path.
+            let mut comm_targets: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
             let comm_coalesce_tx = comm_coalesce_tx_for_iopub;
 
             loop {
@@ -828,12 +835,27 @@ impl KernelConnection for JupyterKernel {
                                     .as_ref()
                                     .map(|h| h.msg_id.as_str())
                                     .unwrap_or("");
+
+                                // Dx blob-ref buffer preflight: if the kernel emitted a
+                                // display_data carrying raw bytes as trailing ZMQ
+                                // buffer frames plus a BLOB_REF_MIME entry, write each
+                                // referenced buffer to the blob store before the
+                                // manifest is built.
+                                let iopub_buffers: Vec<Vec<u8>> =
+                                    message.buffers.iter().map(|b| b.to_vec()).collect();
+
                                 if let Some(widget_comm_id) =
                                     capture_cache.get(parent_msg_id).cloned()
                                 {
                                     if let Some(nbformat_value) =
                                         message_content_to_nbformat(&message.content)
                                     {
+                                        crate::output_store::preflight_ref_buffers(
+                                            &nbformat_value,
+                                            &iopub_buffers,
+                                            &blob_store,
+                                        )
+                                        .await;
                                         if let Ok(manifest) = crate::output_store::create_manifest(
                                             &nbformat_value,
                                             &blob_store,
@@ -917,6 +939,12 @@ impl KernelConnection for JupyterKernel {
                                     if let Some(nbformat_value) =
                                         message_content_to_nbformat(&message.content)
                                     {
+                                        crate::output_store::preflight_ref_buffers(
+                                            &nbformat_value,
+                                            &iopub_buffers,
+                                            &blob_store,
+                                        )
+                                        .await;
                                         let manifest_json = match output_store::create_manifest(
                                             &nbformat_value,
                                             &blob_store,
@@ -1236,6 +1264,25 @@ impl KernelConnection for JupyterKernel {
                             }
 
                             JupyterMessageContent::CommOpen(open) => {
+                                // Record the comm_id -> target_name mapping early so
+                                // subsequent CommMsg / CommClose arms can route without
+                                // reading the CRDT.
+                                comm_targets
+                                    .insert(open.comm_id.0.clone(), open.target_name.clone());
+
+                                // Short-circuit reserved nteract.dx.* comms: they carry
+                                // kernel-side protocol traffic (dx blob uploads, future
+                                // dx.query / dx.stream) that must NOT land in
+                                // RuntimeStateDoc::comms. The payload is handled in the
+                                // CommMsg arm below.
+                                if crate::dx_blob_comm::is_dx_target(&open.target_name) {
+                                    debug!(
+                                        "[dx] comm_open comm_id={} target={} (not persisted)",
+                                        open.comm_id.0, open.target_name
+                                    );
+                                    continue;
+                                }
+
                                 let buffers: Vec<Vec<u8>> =
                                     message.buffers.iter().map(|b| b.to_vec()).collect();
 
@@ -1341,6 +1388,23 @@ impl KernelConnection for JupyterKernel {
                                 let data = serde_json::to_value(&msg.data).unwrap_or_default();
                                 let method = data.get("method").and_then(|m| m.as_str());
 
+                                // dx-namespace comms short-circuit before any widget
+                                // state handling. v1 has no live handler — all reserved
+                                // nteract.dx.* targets drop with a warn log carrying the
+                                // raw target name for observability (future kernels
+                                // opening reserved targets we haven't implemented yet).
+                                if let Some(target) = comm_targets.get(&msg.comm_id.0).cloned() {
+                                    if let Some(crate::dx_blob_comm::DxTarget::Unknown(raw)) =
+                                        crate::dx_blob_comm::classify_dx_target(&target)
+                                    {
+                                        warn!(
+                                            "[dx] comm_msg on reserved target {} (dropped; filtered from RuntimeStateDoc)",
+                                            raw
+                                        );
+                                        continue;
+                                    }
+                                }
+
                                 let comm_msg_start = std::time::Instant::now();
                                 debug!("[comm_msg] comm_id={} method={:?}", msg.comm_id.0, method);
                                 if method == Some("update") {
@@ -1415,6 +1479,16 @@ impl KernelConnection for JupyterKernel {
                                         "[iopub-timing] message type={} took {:?} total",
                                         msg_type, iopub_elapsed
                                     );
+                                }
+
+                                // Drop the comm_id -> target_name mapping. If this was
+                                // a dx-namespace comm, skip the RuntimeStateDoc write.
+                                let was_dx_target = comm_targets
+                                    .remove(&close.comm_id.0)
+                                    .map(|t| crate::dx_blob_comm::is_dx_target(&t))
+                                    .unwrap_or(false);
+                                if was_dx_target {
+                                    continue;
                                 }
 
                                 capture_cache.retain(|_, cid| cid != &close.comm_id.0);

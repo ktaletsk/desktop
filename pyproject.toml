@@ -6,8 +6,10 @@ requires-python = ">=3.10"
 dependencies = [
     "nteract",
     "gremlin ; sys_platform == 'darwin'",
+    "dx",
     "pandas",
     "polars",
+    "pyarrow>=14",
 ]
 
 [build-system]
@@ -18,12 +20,13 @@ build-backend = "setuptools.build_meta"
 packages = []
 
 [tool.uv.workspace]
-members = ["python/runtimed", "python/nteract", "python/gremlin", "python/prewarm"]
+members = ["python/runtimed", "python/nteract", "python/gremlin", "python/prewarm", "python/dx"]
 
 [tool.uv.sources]
 runtimed = { workspace = true }
 nteract = { workspace = true }
 gremlin = { workspace = true }
+dx = { workspace = true }
 
 [tool.ruff]
 line-length = 100
@@ -74,6 +77,11 @@ extra-paths = [
     "python/nteract/src",
     "python/gremlin/src",
     "python/prewarm/src",
+    "python/dx/src",
+    # Integration tests sit side-by-side under tests/ and share fixtures
+    # via direct import (sys.path injection at runtime). Add the dir so
+    # ty can resolve the cross-file fixture imports.
+    "python/runtimed/tests",
 ]
 
 [tool.ty.rules]

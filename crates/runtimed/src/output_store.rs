@@ -140,6 +140,12 @@ impl ContentRef {
         })
     }
 
+    /// Build a [`ContentRef::Blob`] from a hash already present in the
+    /// blob store (e.g. just written by [`preflight_ref_buffers`]).
+    pub fn from_hash(hash: String, size: u64) -> Self {
+        ContentRef::Blob { blob: hash, size }
+    }
+
     /// Resolve a ContentRef that holds binary content, returning base64.
     ///
     /// For inline content, returns the string as-is (it's already base64
@@ -361,6 +367,76 @@ pub async fn create_manifest(
     Ok(manifest)
 }
 
+/// Write ref-MIME buffers to the blob store before the manifest is built.
+///
+/// When a `display_data` / `execute_result` carries
+/// [`BLOB_REF_MIME`](notebook_doc::mime::BLOB_REF_MIME) + trailing ZMQ
+/// `buffers` frames, each blob-ref entry's `buffer_index` points into
+/// the `buffers` list. We hash + store those bytes so the subsequent
+/// [`create_manifest`] call resolves the ref against an existing blob.
+///
+/// Missing `buffer_index` defaults to 0. Out-of-range indices, missing
+/// `hash` / `content_type`, computed-vs-declared hash mismatches, and
+/// blob-store errors all log a `warn!` and skip the entry —
+/// [`create_manifest`] then drops the ref because [`BlobStore::exists`]
+/// fails on the declared hash.
+///
+/// Call from the IOPub task before [`create_manifest`].
+pub async fn preflight_ref_buffers(
+    nbformat: &serde_json::Value,
+    buffers: &[Vec<u8>],
+    blob_store: &BlobStore,
+) {
+    if buffers.is_empty() {
+        return;
+    }
+    let Some(data) = nbformat.get("data").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (mime, body) in data {
+        if mime != notebook_doc::mime::BLOB_REF_MIME {
+            continue;
+        }
+        let declared_hash = body.get("hash").and_then(|v| v.as_str()).unwrap_or("");
+        let target_ct = body
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let buf_idx = body
+            .get("buffer_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        if target_ct.is_empty() || declared_hash.is_empty() {
+            tracing::warn!(
+                "[dx] blob-ref MIME missing hash or content_type (skipping buffer preflight)"
+            );
+            continue;
+        }
+        let Some(buf) = buffers.get(buf_idx) else {
+            tracing::warn!(
+                "[dx] blob-ref buffer_index {} out of range ({} buffers); skipping",
+                buf_idx,
+                buffers.len()
+            );
+            continue;
+        };
+        match blob_store.put(buf, target_ct).await {
+            Ok(computed) => {
+                if computed != declared_hash {
+                    tracing::warn!(
+                        "[dx] blob-ref hash mismatch: declared={} computed={} — ContentRef will drop",
+                        declared_hash,
+                        computed
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!("[dx] blob-ref buffer put failed: {}", err);
+            }
+        }
+    }
+}
+
 /// Get the display_id from an OutputManifest, if present.
 ///
 /// Used by UpdateDisplayData to find the output to update.
@@ -563,6 +639,36 @@ async fn convert_data_bundle(
 
     if let Some(Value::Object(map)) = data {
         for (mime_type, value) in map {
+            // dx blob-ref MIME: the kernel already uploaded the bytes via
+            // the nteract.dx.blob comm. Compose a ContentRef under the
+            // wrapped content_type without a new BlobStore::put call. The
+            // blob-ref MIME itself is NOT emitted as a manifest entry — it
+            // is a transport detail, not display content.
+            if mime_type == notebook_doc::mime::BLOB_REF_MIME {
+                let hash = value.get("hash").and_then(|v| v.as_str());
+                let target_ct = value.get("content_type").and_then(|v| v.as_str());
+                let size = value.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                match (hash, target_ct) {
+                    (Some(h), Some(ct)) => {
+                        if blob_store.exists(h) {
+                            result
+                                .insert(ct.to_string(), ContentRef::from_hash(h.to_string(), size));
+                        } else {
+                            tracing::warn!(
+                                "[dx] blob-ref MIME references missing blob hash={} (dropping)",
+                                h
+                            );
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "[dx] blob-ref MIME missing hash or content_type (dropping)"
+                        );
+                    }
+                }
+                continue;
+            }
+
             let content_ref = if is_binary_mime(mime_type) {
                 // Binary MIME type: base64-decode → store raw bytes in blob.
                 // Jupyter sends image data as base64 strings on the wire.
@@ -674,6 +780,137 @@ mod tests {
 
     fn test_store(dir: &TempDir) -> BlobStore {
         BlobStore::new(dir.path().join("blobs"))
+    }
+
+    #[tokio::test]
+    async fn dx_ref_mime_composes_content_ref_under_target_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = test_store(&dir);
+
+        // Pre-populate: simulate the kernel's dx upload having already stored
+        // the blob via the nteract.dx.blob comm handler.
+        let raw = b"PAR1-fake-parquet-body";
+        let hash = blob_store
+            .put(raw, "application/vnd.apache.parquet")
+            .await
+            .unwrap();
+
+        let output = serde_json::json!({
+            "output_type": "display_data",
+            "data": {
+                notebook_doc::mime::BLOB_REF_MIME: {
+                    "hash": hash,
+                    "content_type": "application/vnd.apache.parquet",
+                    "size": raw.len(),
+                    "query": null,
+                },
+                "text/llm+plain": "DataFrame (pandas): 3 rows × 2 columns"
+            },
+        });
+
+        let manifest = create_manifest(&output, &blob_store, 1024).await.unwrap();
+        let data = match manifest {
+            OutputManifest::DisplayData { data, .. } => data,
+            other => panic!("expected DisplayData, got {other:?}"),
+        };
+
+        assert!(!data.contains_key(notebook_doc::mime::BLOB_REF_MIME));
+        assert!(data.contains_key("application/vnd.apache.parquet"));
+        assert!(data.contains_key("text/llm+plain"));
+
+        match data.get("application/vnd.apache.parquet").unwrap() {
+            ContentRef::Blob { blob, size } => {
+                assert_eq!(blob, &hash);
+                assert_eq!(*size, raw.len() as u64);
+            }
+            other => panic!("expected blob ref, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_ref_buffers_writes_blob_when_present() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = test_store(&dir);
+
+        let raw = b"PAR1-fake-parquet-body";
+        let declared_hash = hex::encode(sha2::Sha256::digest(raw));
+
+        let nbformat = serde_json::json!({
+            "output_type": "display_data",
+            "data": {
+                notebook_doc::mime::BLOB_REF_MIME: {
+                    "hash": declared_hash.clone(),
+                    "content_type": "application/vnd.apache.parquet",
+                    "size": raw.len(),
+                    "buffer_index": 0,
+                },
+                "text/llm+plain": "DataFrame (pandas): 3 rows × 2 columns"
+            },
+        });
+
+        preflight_ref_buffers(&nbformat, &[raw.to_vec()], &blob_store).await;
+        assert!(blob_store.exists(&declared_hash));
+
+        // And the subsequent create_manifest composes a ContentRef from it.
+        let manifest = create_manifest(&nbformat, &blob_store, 1024).await.unwrap();
+        let data = match manifest {
+            OutputManifest::DisplayData { data, .. } => data,
+            other => panic!("expected DisplayData, got {other:?}"),
+        };
+        match data.get("application/vnd.apache.parquet").unwrap() {
+            ContentRef::Blob { blob, size } => {
+                assert_eq!(blob, &declared_hash);
+                assert_eq!(*size, raw.len() as u64);
+            }
+            other => panic!("expected blob ref, got {other:?}"),
+        }
+        assert!(!data.contains_key(notebook_doc::mime::BLOB_REF_MIME));
+    }
+
+    #[tokio::test]
+    async fn preflight_ref_buffers_with_no_buffers_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = test_store(&dir);
+
+        let nbformat = serde_json::json!({
+            "output_type": "display_data",
+            "data": {
+                notebook_doc::mime::BLOB_REF_MIME: {
+                    "hash": "abc",
+                    "content_type": "image/png",
+                    "size": 0,
+                    "buffer_index": 0,
+                },
+            },
+        });
+        preflight_ref_buffers(&nbformat, &[], &blob_store).await;
+        assert!(!blob_store.exists("abc"));
+    }
+
+    #[tokio::test]
+    async fn dx_ref_mime_with_missing_blob_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = test_store(&dir);
+
+        let output = serde_json::json!({
+            "output_type": "display_data",
+            "data": {
+                notebook_doc::mime::BLOB_REF_MIME: {
+                    "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "content_type": "image/png",
+                    "size": 0,
+                },
+            },
+        });
+
+        let manifest = create_manifest(&output, &blob_store, 1024).await.unwrap();
+        let data = match manifest {
+            OutputManifest::DisplayData { data, .. } => data,
+            other => panic!("expected DisplayData, got {other:?}"),
+        };
+
+        assert!(data.is_empty());
     }
 
     #[test]
