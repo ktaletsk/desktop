@@ -2399,10 +2399,15 @@ where
             Ok(encoded) => encoded,
             Err(e) => {
                 warn!("{}", e);
-                doc.rebuild_from_save();
                 peer_state = sync::State::new();
-                doc.generate_sync_message(&mut peer_state)
-                    .map(|msg| msg.encode())
+                if doc.rebuild_from_save() {
+                    doc.generate_sync_message(&mut peer_state)
+                        .map(|msg| msg.encode())
+                } else {
+                    // Cell-count guard prevented rebuild — skip sync message,
+                    // fresh peer_state will trigger full re-sync on next exchange
+                    None
+                }
             }
         }
     };
@@ -2570,10 +2575,13 @@ where
                                         Ok(encoded) => encoded,
                                         Err(e) => {
                                             warn!("{}", e);
-                                            doc.rebuild_from_save();
                                             peer_state = sync::State::new();
-                                            doc.generate_sync_message(&mut peer_state)
-                                                .map(|reply| reply.encode())
+                                            if doc.rebuild_from_save() {
+                                                doc.generate_sync_message(&mut peer_state)
+                                                    .map(|reply| reply.encode())
+                                            } else {
+                                                None
+                                            }
                                         }
                                     };
 
@@ -2912,10 +2920,13 @@ where
                         Ok(encoded) => encoded,
                         Err(e) => {
                             warn!("{}", e);
-                            doc.rebuild_from_save();
                             peer_state = sync::State::new();
-                            doc.generate_sync_message(&mut peer_state)
-                                .map(|msg| msg.encode())
+                            if doc.rebuild_from_save() {
+                                doc.generate_sync_message(&mut peer_state)
+                                    .map(|msg| msg.encode())
+                            } else {
+                                None
+                            }
                         }
                     }
                 };
