@@ -245,12 +245,13 @@ export type DaemonBroadcast =
       };
     }
   | {
-      event: "room_renamed";
-      new_notebook_id: string;
-    }
-  | {
       event: "notebook_autosaved";
       path: string;
+    }
+  | {
+      event: "path_changed";
+      /** New `.ipynb` path. `null` on an explicit "close file" rename (rare/future). */
+      path: string | null;
     };
 
 /** Response types from daemon notebook requests */

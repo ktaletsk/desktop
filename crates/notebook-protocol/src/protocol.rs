@@ -179,6 +179,26 @@ pub struct EnvSyncDiff {
 
 // ── Notebook protocol enums ─────────────────────────────────────────────────
 
+/// Structured error kinds returned in `NotebookResponse::SaveError`.
+///
+/// Note: `path` fields carry the serialized path string. Callers that build
+/// `PathAlreadyOpen` from a `PathBuf` should use `p.to_string_lossy().into_owned()`
+/// so non-UTF-8 paths degrade gracefully on the wire (Task 6.2 concern).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SaveErrorKind {
+    /// Another room is currently serving this path. The agent must close
+    /// the conflicting session (by UUID) before saving here.
+    PathAlreadyOpen {
+        /// UUID of the room that currently holds this path.
+        uuid: String,
+        /// The conflicting path (lossy-UTF-8 serialized from `PathBuf`).
+        path: String,
+    },
+    /// I/O or serialization failure. Message is human-readable.
+    Io { message: String },
+}
+
 /// Requests sent from notebook app to daemon for notebook operations.
 ///
 /// These are sent as JSON over the notebook sync connection alongside
@@ -254,11 +274,12 @@ pub enum NotebookRequest {
     /// and writes the result.
     ///
     /// If `path` is provided, saves to that path (with .ipynb appended if needed).
-    /// If `path` is None, saves to the room's notebook_path (original file location).
+    /// If `path` is None, saves to the room's current path; untitled rooms
+    /// (no path) return an error.
     SaveNotebook {
         /// If true, format code cells before saving (e.g., with ruff).
         format_cells: bool,
-        /// Optional target path. If None, uses the room's notebook_path.
+        /// Optional target path. If None, uses the room's current path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
@@ -369,12 +390,10 @@ pub enum NotebookResponse {
     NotebookSaved {
         /// The absolute path where the notebook was written.
         path: String,
-        /// If the notebook was ephemeral (UUID-keyed) and has been re-keyed to a
-        /// file-path room, this contains the new canonical notebook_id.
-        /// Clients should update their local notebook_id to this value.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        new_notebook_id: Option<String>,
     },
+
+    /// Save failed with a structured error.
+    SaveError { error: SaveErrorKind },
 
     /// Notebook cloned successfully to a new file.
     NotebookCloned {
@@ -536,15 +555,15 @@ pub enum NotebookBroadcast {
         diff: Option<EnvSyncDiff>,
     },
 
-    /// The room was re-keyed from an ephemeral UUID to a file-path ID.
+    /// Sent when the room's `.ipynb` path changes (untitled→saved, save-as rename).
     ///
-    /// Broadcast to all peers when an untitled notebook is saved so they can
-    /// update their local notebook_id. Without this, peers that disconnect
-    /// and reconnect would use the stale UUID and end up in a new empty room.
-    RoomRenamed {
-        /// The new canonical notebook_id (file path).
-        new_notebook_id: String,
-    },
+    /// Peers update local bookkeeping but do NOT reconnect — the UUID is stable.
+    /// `path` is `None` for an explicit "close file" rename (rare/future).
+    ///
+    /// Callers building this from a `PathBuf` should use
+    /// `p.to_string_lossy().into_owned()` so non-UTF-8 paths degrade gracefully
+    /// on the wire.
+    PathChanged { path: Option<String> },
 
     /// Notebook was autosaved to disk by the daemon.
     NotebookAutosaved { path: String },

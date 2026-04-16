@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use crate::blob_server;
 use crate::blob_store::BlobStore;
 use crate::connection::{self, Handshake};
-use crate::notebook_sync_server::NotebookRooms;
+use crate::notebook_sync_server::{NotebookRooms, PathIndex};
 use crate::protocol::{BlobRequest, BlobResponse, Request, Response};
 use crate::settings_doc::SettingsDoc;
 use crate::singleton::DaemonLock;
@@ -486,12 +486,6 @@ impl Pool {
     }
 }
 
-/// Entry in the redirect map for re-keyed ephemeral rooms.
-pub(crate) struct RedirectEntry {
-    pub(crate) new_notebook_id: String,
-    pub(crate) created_at: tokio::time::Instant,
-}
-
 /// The pool daemon state.
 pub struct Daemon {
     config: DaemonConfig,
@@ -523,6 +517,10 @@ pub struct Daemon {
     started_at: chrono::DateTime<chrono::Utc>,
     /// Per-notebook Automerge sync rooms.
     notebook_rooms: NotebookRooms,
+    /// Secondary index: canonical .ipynb path → room UUID.
+    /// Kept in sync with `notebook_rooms` by `get_or_create_room` (insert)
+    /// and the eviction loop (remove). Queried by `find_room_by_path`.
+    pub(crate) path_index: Arc<tokio::sync::Mutex<PathIndex>>,
     /// Set to `true` the first time any client causes a room to be
     /// acquired in `notebook_rooms` (via `get_or_create_room`). Used by
     /// the zero-room sweep-skip guard to distinguish "post-restart, no
@@ -536,9 +534,6 @@ pub struct Daemon {
     /// loop would miss short-lived sessions and pin the daemon back in
     /// the post-restart state forever.
     rooms_ever_seen: std::sync::atomic::AtomicBool,
-    /// Redirect map: old ephemeral UUID -> new canonical path after rekey.
-    /// Used so peers reconnecting with the old UUID find the re-keyed room.
-    pub(crate) redirect_map: std::sync::Mutex<HashMap<String, RedirectEntry>>,
 }
 
 /// Error returned when another daemon is already running.
@@ -624,8 +619,8 @@ impl Daemon {
             blob_port: Mutex::new(None),
             started_at: chrono::Utc::now(),
             notebook_rooms: Arc::new(Mutex::new(HashMap::new())),
+            path_index: Arc::new(tokio::sync::Mutex::new(PathIndex::new())),
             rooms_ever_seen: std::sync::atomic::AtomicBool::new(false),
-            redirect_map: std::sync::Mutex::new(HashMap::new()),
         }))
     }
 
@@ -843,14 +838,14 @@ impl Daemon {
             rooms.drain().collect::<Vec<_>>()
         };
 
-        for (notebook_id, room) in drained_rooms {
+        for (notebook_uuid, room) in drained_rooms {
             // Shut down runtime agent via RPC before dropping handle
             {
                 let has_runtime_agent = room.runtime_agent_request_tx.lock().await.is_some();
                 if has_runtime_agent {
                     info!(
                         "[runtimed] Shutting down runtime agent for notebook on exit: {}",
-                        notebook_id
+                        notebook_uuid
                     );
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
@@ -1408,15 +1403,53 @@ impl Daemon {
                     working_dir
                 );
                 let docs_dir = self.config.notebook_docs_dir.clone();
+                // For the legacy NotebookSync handshake:
+                // - UUID notebook_id → untitled room (path=None)
+                // - Path notebook_id → file-backed room (path=Some)
+                //
+                // When notebook_id is a path, canonicalize and consult path_index
+                // before minting a new UUID. Without this, each reconnect creates a
+                // fresh UUID and a duplicate room (two file watchers, two autosave
+                // debouncers, two writers on the same .ipynb — zombie rooms).
                 let room = {
-                    let mut rooms = self.notebook_rooms.lock().await;
+                    let (ns_uuid, ns_path) = if let Ok(parsed) = uuid::Uuid::parse_str(&notebook_id)
+                    {
+                        (parsed, None)
+                    } else {
+                        // notebook_id is a path — canonicalize and look up
+                        // existing room.
+                        let raw = PathBuf::from(&notebook_id);
+                        let canonical = match tokio::fs::canonicalize(&raw).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(
+                                        "[daemon] canonicalize({}) for NotebookSync handshake failed: {}, using raw path",
+                                        notebook_id, e
+                                    );
+                                raw
+                            }
+                        };
+                        match crate::notebook_sync_server::find_room_by_path(
+                            &self.notebook_rooms,
+                            &self.path_index,
+                            &canonical,
+                        )
+                        .await
+                        {
+                            Some(existing) => (existing.id, Some(canonical)),
+                            None => (uuid::Uuid::new_v4(), Some(canonical)),
+                        }
+                    };
                     crate::notebook_sync_server::get_or_create_room(
-                        &mut rooms,
-                        &notebook_id,
+                        &self.notebook_rooms,
+                        &self.path_index,
+                        ns_uuid,
+                        ns_path,
                         &docs_dir,
                         self.blob_store.clone(),
                         false, // NotebookSync handshake is always persistent
                     )
+                    .await
                 };
                 self.mark_rooms_ever_seen();
                 let (reader, writer) = tokio::io::split(stream);
@@ -1465,7 +1498,10 @@ impl Daemon {
                 );
                 let room = {
                     let rooms = self.notebook_rooms.lock().await;
-                    rooms.get(&notebook_id).cloned()
+                    // notebook_id from runtime agent is always a UUID string
+                    uuid::Uuid::parse_str(&notebook_id)
+                        .ok()
+                        .and_then(|uuid| rooms.get(&uuid).cloned())
                 };
                 match room {
                     Some(room) => {
@@ -1507,6 +1543,26 @@ impl Daemon {
 
         info!("[runtimed] OpenNotebook requested for {}", path);
 
+        // Diagnostic: flag suspicious path shapes. UUID-shaped paths (no slash,
+        // no extension, parses as a UUID) almost certainly indicate a bug
+        // upstream — someone is passing a notebook_id string as a path and
+        // the daemon would resolve it via current_dir.join(uuid), creating
+        // stray `{cwd}/{uuid}.ipynb` files.
+        {
+            let looks_uuid_shaped = !path.contains('/')
+                && !path.contains('\\')
+                && !path.ends_with(".ipynb")
+                && uuid::Uuid::parse_str(&path).is_ok();
+            if looks_uuid_shaped {
+                warn!(
+                    "[runtimed] OpenNotebook received bare-UUID path {:?} — \
+                     this usually means a caller passed a notebook_id as a path. \
+                     The daemon will resolve it against cwd, creating a stray file.",
+                    path
+                );
+            }
+        }
+
         // Helper to send error response to client
         async fn send_error_response<W: AsyncWrite + Unpin>(
             writer: &mut W,
@@ -1524,6 +1580,20 @@ impl Daemon {
             };
             send_json_frame(writer, &response).await?;
             Ok(())
+        }
+
+        if looks_like_untitled_notebook_path(&path) {
+            let (_reader, mut writer) = tokio::io::split(stream);
+            send_error_response(
+                &mut writer,
+                format!(
+                    "Refusing to open bare UUID '{}' as a file path. \
+                     Untitled notebooks must reconnect via notebook_id, not OpenNotebook path.",
+                    path
+                ),
+            )
+            .await?;
+            return Ok(());
         }
 
         // Check if file exists before canonicalizing (canonicalize fails for non-existent paths)
@@ -1623,40 +1693,33 @@ impl Daemon {
                 .to_string()
         };
 
-        // Check if this notebook_id was re-keyed (ephemeral -> saved).
-        let notebook_id = match self.redirect_map.lock() {
-            Ok(redirects) => {
-                if let Some(entry) = redirects.get(&notebook_id) {
-                    info!(
-                        "[runtimed] Redirecting open {} -> {} (re-keyed room)",
-                        notebook_id, entry.new_notebook_id
-                    );
-                    entry.new_notebook_id.clone()
-                } else {
-                    notebook_id
-                }
-            }
-            Err(_) => notebook_id,
-        };
-
         // Get or create room for this notebook.
-        // First check if an existing room (including UUID-keyed ephemeral rooms)
-        // already owns this path — prevents duplicate rooms and re-key collisions.
+        // First check if an existing room already owns this canonical path.
+        // The path_index gives O(1) lookup without scanning all rooms.
         let docs_dir = self.config.notebook_docs_dir.clone();
+        let canonical_path = PathBuf::from(&notebook_id);
         let room = {
-            let mut rooms = self.notebook_rooms.lock().await;
-            if let Some(existing) =
-                crate::notebook_sync_server::find_room_by_notebook_path(&rooms, &notebook_id)
+            if let Some(existing) = crate::notebook_sync_server::find_room_by_path(
+                &self.notebook_rooms,
+                &self.path_index,
+                &canonical_path,
+            )
+            .await
             {
                 existing
             } else {
+                let uuid = uuid::Uuid::new_v4();
+                let path = Some(canonical_path.clone());
                 crate::notebook_sync_server::get_or_create_room(
-                    &mut rooms,
-                    &notebook_id,
+                    &self.notebook_rooms,
+                    &self.path_index,
+                    uuid,
+                    path,
                     &docs_dir,
                     self.blob_store.clone(),
                     false, // OpenNotebook handshake is always persistent
                 )
+                .await
             }
         };
         self.mark_rooms_ever_seen();
@@ -1743,13 +1806,16 @@ impl Daemon {
             )
         };
 
-        // Send NotebookConnectionInfo response
+        // Send NotebookConnectionInfo response. The wire notebook_id is the
+        // room's UUID (stable across the life of the room); the local
+        // `notebook_id` variable in this handler is the canonical path string
+        // used for logging and file-watcher wiring below.
         let (reader, mut writer) = tokio::io::split(stream);
         let response = NotebookConnectionInfo {
             protocol: PROTOCOL_V2.to_string(),
             protocol_version: Some(PROTOCOL_VERSION),
             daemon_version: Some(crate::daemon_version().to_string()),
-            notebook_id: notebook_id.clone(),
+            notebook_id: room.id.to_string(),
             cell_count,
             needs_trust_approval,
             error: None,
@@ -1812,39 +1878,22 @@ impl Daemon {
 
         // Use provided notebook_id (session restore) or generate a new UUID
         let notebook_id = notebook_id_hint.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let ephemeral = ephemeral.unwrap_or(false);
 
-        // Check if this notebook_id was re-keyed (ephemeral -> saved).
-        // If so, redirect to the new canonical path so the peer joins the
-        // existing room instead of creating a new empty one.
-        // Check redirect map and resolve ephemeral flag together.
-        // If the UUID was re-keyed (saved), the room is now file-backed — force persistent.
-        let (notebook_id, ephemeral) = match self.redirect_map.lock() {
-            Ok(redirects) => {
-                if let Some(entry) = redirects.get(&notebook_id) {
-                    info!(
-                        "[runtimed] Redirecting {} -> {} (re-keyed room)",
-                        notebook_id, entry.new_notebook_id
-                    );
-                    (entry.new_notebook_id.clone(), false)
-                } else {
-                    (notebook_id, ephemeral.unwrap_or(false))
-                }
-            }
-            Err(_) => (notebook_id, ephemeral.unwrap_or(false)),
-        };
-
-        // Create room for this notebook
+        // Create room for this notebook. For CreateNotebook, the notebook_id is
+        // always a UUID (new room) or an existing UUID (session restore).
         let docs_dir = self.config.notebook_docs_dir.clone();
-        let room = {
-            let mut rooms = self.notebook_rooms.lock().await;
-            crate::notebook_sync_server::get_or_create_room(
-                &mut rooms,
-                &notebook_id,
-                &docs_dir,
-                self.blob_store.clone(),
-                ephemeral,
-            )
-        };
+        let uuid = uuid::Uuid::parse_str(&notebook_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+        let room = crate::notebook_sync_server::get_or_create_room(
+            &self.notebook_rooms,
+            &self.path_index,
+            uuid,
+            None, // CreateNotebook creates untitled rooms with no file path
+            &docs_dir,
+            self.blob_store.clone(),
+            ephemeral,
+        )
+        .await;
         self.mark_rooms_ever_seen();
 
         // Populate the room's doc with the empty notebook content — but only if the
@@ -1878,9 +1927,10 @@ impl Daemon {
 
         if let Some(e) = create_error {
             // Remove the room to prevent stale state (consistency with OpenNotebook)
+            // CreateNotebook rooms have no path, so no path_index cleanup needed.
             {
                 let mut rooms = self.notebook_rooms.lock().await;
-                rooms.remove(&notebook_id);
+                rooms.remove(&uuid);
                 info!(
                     "[runtimed] Removed room {} after create failure",
                     notebook_id
@@ -1903,13 +1953,15 @@ impl Daemon {
         }
 
         // Send NotebookConnectionInfo response
-        // New notebooks have no deps, so no trust approval needed
+        // New notebooks have no deps, so no trust approval needed.
+        // Always send the room's UUID on the wire, even when the caller
+        // provided a notebook_id_hint — room.id is the canonical source.
         let (reader, mut writer) = tokio::io::split(stream);
         let response = NotebookConnectionInfo {
             protocol: PROTOCOL_V2.to_string(),
             protocol_version: Some(PROTOCOL_VERSION),
             daemon_version: Some(crate::daemon_version().to_string()),
-            notebook_id: notebook_id.clone(),
+            notebook_id: room.id.to_string(),
             cell_count,
             needs_trust_approval: false,
             error: None,
@@ -2306,7 +2358,9 @@ impl Daemon {
                 // holding notebook_rooms across async calls.
                 let maybe_room = {
                     let rooms = self.notebook_rooms.lock().await;
-                    rooms.get(&notebook_id).cloned()
+                    uuid::Uuid::parse_str(&notebook_id)
+                        .ok()
+                        .and_then(|uuid| rooms.get(&uuid).cloned())
                 };
                 if let Some(room) = maybe_room {
                     let cells = {
@@ -2368,7 +2422,7 @@ impl Daemon {
                     let rooms = self.notebook_rooms.lock().await;
                     rooms
                         .iter()
-                        .map(|(id, room)| (id.clone(), room.clone()))
+                        .map(|(id, room)| (id.to_string(), room.clone()))
                         .collect()
                 };
                 let mut room_infos = Vec::new();
@@ -2405,8 +2459,17 @@ impl Daemon {
                 // teardown that follows.
                 let maybe_room = {
                     let mut rooms = self.notebook_rooms.lock().await;
-                    rooms.remove(&notebook_id)
+                    uuid::Uuid::parse_str(&notebook_id)
+                        .ok()
+                        .and_then(|uuid| rooms.remove(&uuid))
                 };
+                // Clean up path_index if the room had a path.
+                if let Some(ref room) = maybe_room {
+                    let path = room.path.read().await.clone();
+                    if let Some(p) = path {
+                        self.path_index.lock().await.remove(&p);
+                    }
+                }
                 if let Some(room) = maybe_room {
                     // Shut down runtime agent via RPC before dropping handle.
                     // RuntimeAgentHandle doesn't own the Child (it's in a background
@@ -2610,7 +2673,7 @@ impl Daemon {
                 let active_rooms = self.notebook_rooms.lock().await;
                 let active_hashes: std::collections::HashSet<String> = active_rooms
                     .keys()
-                    .map(|id| notebook_doc::notebook_doc_filename(id))
+                    .map(|id| notebook_doc::notebook_doc_filename(&id.to_string()))
                     .collect();
                 drop(active_rooms);
 
@@ -2658,7 +2721,10 @@ impl Daemon {
                 // it before any async state_doc reads (deadlock prevention).
                 let room_arcs: Vec<(String, _)> = {
                     let rooms = self.notebook_rooms.lock().await;
-                    rooms.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    rooms
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect()
                 };
 
                 // Zero-rooms sweep-skip: ambiguous only right after a daemon
@@ -4296,6 +4362,13 @@ impl Daemon {
     }
 }
 
+fn looks_like_untitled_notebook_path(path: &str) -> bool {
+    let candidate = Path::new(path);
+    candidate.components().count() == 1
+        && candidate.extension().is_none()
+        && uuid::Uuid::parse_str(path).is_ok()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -5286,5 +5359,18 @@ mod tests {
             blob_store.get(&hash).await.unwrap().is_some(),
             "unreferenced blob within grace should survive"
         );
+    }
+
+    #[test]
+    fn bare_uuid_path_is_rejected() {
+        assert!(looks_like_untitled_notebook_path(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(!looks_like_untitled_notebook_path(
+            "/tmp/550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(!looks_like_untitled_notebook_path(
+            "550e8400-e29b-41d4-a716-446655440000.ipynb"
+        ));
     }
 }

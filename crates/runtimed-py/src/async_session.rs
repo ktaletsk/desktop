@@ -32,9 +32,10 @@ use crate::session_core::{self, SessionState};
 pub struct AsyncSession {
     state: Arc<Mutex<SessionState>>,
     notebook_id: String,
-    /// Re-keyed notebook ID after saving an ephemeral room.
-    /// Stored outside `SessionState` (behind a lightweight `std::sync::Mutex`)
-    /// so the `notebook_id` getter never contends with the async `tokio::sync::Mutex`.
+    /// Overridden notebook ID (set when the Python layer needs to update the
+    /// displayed ID independently of `SessionState`). Stored behind a
+    /// lightweight `std::sync::Mutex` so the getter never contends with the
+    /// async `tokio::sync::Mutex`.
     notebook_id_override: Arc<std::sync::Mutex<Option<String>>>,
     peer_label: Option<String>,
 }
@@ -48,13 +49,6 @@ impl AsyncSession {
         peer_label: Option<String>,
     ) -> Self {
         let override_arc = Arc::new(std::sync::Mutex::new(None));
-        if let Some(ref rx) = state.broadcast_rx {
-            session_core::spawn_rekey_watcher(
-                rx,
-                Arc::clone(&override_arc),
-                &tokio::runtime::Handle::current(),
-            );
-        }
         Self {
             state: Arc::new(Mutex::new(state)),
             notebook_id,
@@ -125,11 +119,10 @@ impl AsyncSession {
 
 #[pymethods]
 impl AsyncSession {
-    /// The notebook ID for this session.
-    /// After saving an ephemeral notebook, this reflects the new file-path ID.
+    /// The notebook ID for this session (always a UUID).
     #[getter]
     fn notebook_id(&self) -> String {
-        // If save() re-keyed the room, return the new file-path ID.
+        // Return overridden ID if set; otherwise return the connect-time UUID.
         // This lock is a std::sync::Mutex (not tokio), so it never contends
         // with async SessionState operations.
         if let Some(ref id) = *self.notebook_id_override.lock().unwrap() {
@@ -213,7 +206,6 @@ impl AsyncSession {
     /// Connect to the daemon.
     fn connect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let override_arc = Arc::clone(&self.notebook_id_override);
         let effective_id = self
             .notebook_id_override
             .lock()
@@ -226,17 +218,6 @@ impl AsyncSession {
             {
                 let st = state.lock().await;
                 session_core::announce_presence(&st).await;
-            }
-            // Spawn background task to update notebook_id if a peer re-keys the room
-            {
-                let st = state.lock().await;
-                if let Some(ref rx) = st.broadcast_rx {
-                    session_core::spawn_rekey_watcher(
-                        rx,
-                        override_arc,
-                        &tokio::runtime::Handle::current(),
-                    );
-                }
             }
             Ok(())
         })
@@ -631,7 +612,6 @@ impl AsyncSession {
     #[pyo3(signature = (path=None))]
     fn save<'py>(&self, py: Python<'py>, path: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
         let state = Arc::clone(&self.state);
-        let override_arc = Arc::clone(&self.notebook_id_override);
         let effective_id = self
             .notebook_id_override
             .lock()
@@ -643,11 +623,6 @@ impl AsyncSession {
         future_into_py(py, async move {
             session_core::connect(&state, &effective_id).await?;
             let result = session_core::save(&state, path.as_deref()).await?;
-            // If the daemon re-keyed the room (ephemeral → file-path),
-            // store the new ID so the notebook_id getter reflects it.
-            if let Some(ref new_id) = result.new_notebook_id {
-                *override_arc.lock().unwrap() = Some(new_id.clone());
-            }
             Ok(result.path)
         })
     }

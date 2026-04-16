@@ -18,7 +18,7 @@ extern crate runtimed_client as runtimed;
 pub use runtimed::runtime::Runtime;
 
 use notebook_protocol::protocol::{
-    CompletionItem, HistoryEntry, NotebookRequest, NotebookResponse,
+    CompletionItem, HistoryEntry, NotebookRequest, NotebookResponse, SaveErrorKind,
 };
 use notebook_sync::RelayHandle;
 
@@ -568,11 +568,30 @@ async fn initialize_notebook_sync_open(
 ) -> Result<(), String> {
     let current_generation = sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
+    // Diagnostic: flag paths that look like a bare UUID with no extension,
+    // which trip daemon-side `cwd.join(path)` and create stray
+    // `{cwd}/{uuid}.ipynb` files.
+    let display_str = path.to_string_lossy();
+    let looks_uuid_shaped = !display_str.contains('/')
+        && !display_str.contains('\\')
+        && !display_str.ends_with(".ipynb")
+        && uuid::Uuid::parse_str(&display_str).is_ok();
+    if looks_uuid_shaped {
+        warn!(
+            "[notebook-sync] initialize_notebook_sync_open called with bare-UUID path {:?} \
+             (window={}) — this is the stray-ipynb-file bug upstream. Please capture this \
+             stack in the issue tracker.",
+            path.display(),
+            window.label(),
+        );
+    }
+
     let socket_path = runt_workspace::default_socket_path();
     info!(
-        "[notebook-sync] Opening notebook via daemon: {} ({})",
+        "[notebook-sync] Opening notebook via daemon: {} ({}) window={}",
         path.display(),
         socket_path.display(),
+        window.label(),
     );
 
     let (frame_tx, raw_frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -1791,6 +1810,47 @@ fn mark_notebook_clean(
     Ok(())
 }
 
+/// Sync the Tauri window's local path state and title with a `PathChanged`
+/// broadcast from the daemon. Called by the frontend when another peer (an
+/// MCP agent, a sibling window) saves or renames the notebook — without this,
+/// the Tauri window would hold a stale path and show a stale title.
+///
+/// Safe to call when the path is unchanged; behavior is idempotent.
+#[tauri::command]
+fn apply_path_changed(
+    path: Option<String>,
+    window: tauri::Window,
+    registry: tauri::State<'_, WindowNotebookRegistry>,
+) -> Result<(), String> {
+    info!(
+        "[path-changed] apply_path_changed invoked: path={:?} window={}",
+        path,
+        window.label()
+    );
+    let context_path = path_for_window(&window, registry.inner())?;
+    let new_path = path.as_deref().map(PathBuf::from);
+
+    if let Ok(mut p) = context_path.lock() {
+        info!(
+            "[path-changed] context.path mutation: {:?} -> {:?} (window={})",
+            *p,
+            new_path,
+            window.label()
+        );
+        *p = new_path.clone();
+    }
+
+    // Update window title to match the new path (or "Untitled" if cleared).
+    let title = new_path
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Untitled.ipynb");
+    let _ = window.set_title(title);
+
+    Ok(())
+}
+
 /// Format all code cells in the notebook and save.
 /// Formatting is best-effort - cells that fail to format are saved as-is.
 ///
@@ -1803,6 +1863,10 @@ async fn save_notebook(
     window: tauri::Window,
     registry: tauri::State<'_, WindowNotebookRegistry>,
 ) -> Result<(), String> {
+    info!(
+        "[save] save_notebook command invoked by window {}",
+        window.label()
+    );
     let path = path_for_window(&window, registry.inner())?;
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
     let dirty = dirty_for_window(&window, registry.inner())?;
@@ -1830,6 +1894,9 @@ async fn save_notebook(
         Ok(NotebookResponse::NotebookSaved { path, .. }) => {
             info!("[save] Notebook saved via daemon to: {}", path);
         }
+        Ok(NotebookResponse::SaveError { error }) => {
+            return Err(format_save_error(&error));
+        }
         Ok(NotebookResponse::Error { error }) => {
             return Err(format!("Daemon save failed: {}", error));
         }
@@ -1844,6 +1911,18 @@ async fn save_notebook(
     // Mark as clean
     dirty.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+/// Format a structured daemon `SaveErrorKind` as a user-facing message.
+fn format_save_error(error: &SaveErrorKind) -> String {
+    match error {
+        SaveErrorKind::PathAlreadyOpen { path, .. } => format!(
+            "Cannot save: {} is already open in another notebook window. \
+             Close that window first, or choose a different path.",
+            path
+        ),
+        SaveErrorKind::Io { message } => format!("Failed to save notebook: {}", message),
+    }
 }
 
 /// Save notebook to a specific path (Save As).
@@ -1861,6 +1940,11 @@ async fn save_notebook_as(
     window: tauri::Window,
     registry: tauri::State<'_, WindowNotebookRegistry>,
 ) -> Result<(), String> {
+    info!(
+        "[save] save_notebook_as command invoked by window {} with path {:?}",
+        window.label(),
+        path
+    );
     let notebook_sync = notebook_sync_for_window(&window, registry.inner())?;
     let context_path = path_for_window(&window, registry.inner())?;
     let dirty = dirty_for_window(&window, registry.inner())?;
@@ -1868,21 +1952,20 @@ async fn save_notebook_as(
     let sync_handle = notebook_sync.lock().await.clone();
     let handle = sync_handle.ok_or("Not connected to daemon")?;
 
-    // Save via daemon — daemon writes to disk and re-keys the room from
-    // UUID → canonical file path. The connection stays live, no reconnect needed.
-    let (saved_path, new_notebook_id) = match handle
+    // Save via daemon — daemon writes to disk. The UUID-keyed room is stable.
+    let saved_path = match handle
         .send_request(NotebookRequest::SaveNotebook {
             format_cells: true,
             path: Some(path),
         })
         .await
     {
-        Ok(NotebookResponse::NotebookSaved {
-            path: daemon_path,
-            new_notebook_id,
-        }) => {
+        Ok(NotebookResponse::NotebookSaved { path: daemon_path }) => {
             info!("[save-as] Notebook saved via daemon to: {}", daemon_path);
-            (PathBuf::from(daemon_path), new_notebook_id)
+            PathBuf::from(daemon_path)
+        }
+        Ok(NotebookResponse::SaveError { error }) => {
+            return Err(format_save_error(&error));
         }
         Ok(NotebookResponse::Error { error }) => {
             return Err(format!("Daemon save failed: {}", error));
@@ -1903,27 +1986,15 @@ async fn save_notebook_as(
     let _ = window.set_title(filename);
 
     if let Ok(mut p) = context_path.lock() {
+        info!(
+            "[save-as] context.path mutation: {:?} -> {:?} (window={})",
+            *p,
+            saved_path,
+            window.label()
+        );
         *p = Some(saved_path.clone());
     }
     dirty.store(false, Ordering::SeqCst);
-
-    if let Some(ref new_id) = new_notebook_id {
-        let notebook_id_arc = notebook_id_for_window(&window, registry.inner())?;
-        if let Ok(mut id) = notebook_id_arc.lock() {
-            info!("[save-as] Room re-keyed: {} -> {}", *id, new_id);
-            *id = new_id.clone();
-        }
-        drop(notebook_id_arc);
-
-        // Update the live relay handle's notebook_id so subsequent commands
-        // (e.g. user-triggered kernel restart) derive the correct file path
-        // instead of the stale UUID.
-        let guard = notebook_sync.lock().await;
-        if let Some(ref handle) = *guard {
-            handle.set_notebook_id(new_id.clone());
-        }
-        drop(guard);
-    }
 
     refresh_native_menu(window.app_handle(), registry.inner());
 
@@ -2222,6 +2293,12 @@ fn handle_open_url(
         if let Ok(context) = registry.get(&empty_label) {
             // Update path in context
             if let Ok(mut p) = context.path.lock() {
+                log::info!(
+                    "[file-open] context.path mutation (reuse empty window): {:?} -> {:?} (label={})",
+                    *p,
+                    path,
+                    empty_label
+                );
                 *p = Some(path.clone());
             }
 
@@ -4215,6 +4292,7 @@ pub fn run(
             // Notebook file operations
             has_notebook_path,
             mark_notebook_clean,
+            apply_path_changed,
             save_notebook,
             save_notebook_as,
             get_default_save_directory,
