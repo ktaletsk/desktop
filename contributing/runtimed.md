@@ -74,13 +74,15 @@ Execution is CRDT-driven — the coordinator writes execution entries (with sour
 |-----------|---------|----------|
 | Unix socket | IPC endpoint | `~/Library/Caches/<cache_namespace>/runtimed.sock` (macOS) / `~/.cache/<cache_namespace>/runtimed.sock` (Linux) |
 | Lock file | Singleton guarantee | `~/Library/Caches/<cache_namespace>/daemon.lock` (macOS) / `~/.cache/<cache_namespace>/daemon.lock` (Linux) |
-| Info file | Discovery (PID, endpoint) | `~/Library/Caches/<cache_namespace>/daemon.json` (macOS) / `~/.cache/<cache_namespace>/daemon.json` (Linux) |
+| Info file (legacy) | Pre-socket discovery fallback | `~/Library/Caches/<cache_namespace>/daemon.json` (macOS) / `~/.cache/<cache_namespace>/daemon.json` (Linux) |
 | Environments | Prewarmed venvs | `~/Library/Caches/<cache_namespace>/envs/` (macOS) / `~/.cache/<cache_namespace>/envs/` (Linux) |
 | Blob store | Content-addressed outputs | `~/Library/Caches/<cache_namespace>/blobs/` (macOS) / `~/.cache/<cache_namespace>/blobs/` (Linux) |
 | Notebook docs | Persisted Automerge docs | `~/Library/Caches/<cache_namespace>/notebook-docs/` (macOS) / `~/.cache/<cache_namespace>/notebook-docs/` (Linux) |
 | Snapshots | Pre-delete safety copies | `~/Library/Caches/<cache_namespace>/notebook-docs/snapshots/` (macOS) / `~/.cache/<cache_namespace>/notebook-docs/snapshots/` (Linux) |
 
 `<cache_namespace>` is `runt` for stable builds and `runt-nightly` for nightly builds. Source builds default to nightly unless `RUNT_BUILD_CHANNEL=stable`.
+
+**Daemon discovery is socket-first.** Clients connect to the socket and send a `GetDaemonInfo` request; the daemon answers from live state. The on-disk `daemon.json` exists only as a fallback for older daemons that don't recognise the request — it will be removed once every daemon in the wild speaks `GetDaemonInfo`. New code should not depend on `daemon.json`. See `crates/runtimed-client/src/singleton.rs::query_daemon_info`.
 
 ## Development Workflow
 
@@ -108,17 +110,15 @@ cargo run -p runt-cli -- daemon status --json | jq -r '.daemon_info.version'
 
 When iterating on daemon code, you often want to test changes in the notebook app without rebuilding the frontend.
 
-**With nteract-dev supervisor** (if you have `up` / `down` / `status` MCP tools — e.g. in Zed or Claude Code):
+**With nteract-dev** (if you have `up` / `down` / `status` MCP tools — e.g. in Zed or Claude Code):
 
-The supervisor manages the dev daemon for you. No env vars or extra terminals needed.
+`nteract-dev` manages the dev daemon for you. No env vars or extra terminals needed.
 
 - `up` — idempotent "bring the dev environment up". Ensures the daemon is running and the MCP child is healthy. Pass `vite=true` to also start Vite (health-probed), `rebuild=true` to rebuild the daemon binary + Python bindings first, `mode="debug"|"release"` to switch build mode.
 - `down` — stop the managed Vite dev server. Pass `daemon=true` to also stop the daemon.
 - `status` — read-only report (child, daemon, managed processes, build mode).
 - `logs` — tail the daemon log file.
 - `vite_logs` — tail the Vite dev server log file.
-
-The older `supervisor_*` names (`supervisor_restart`, `supervisor_rebuild`, `supervisor_start_vite`, `supervisor_stop`, `supervisor_set_mode`, `supervisor_status`, `supervisor_logs`, `supervisor_vite_logs`) still work as aliases.
 
 Then build and run the app normally:
 ```bash
@@ -127,7 +127,7 @@ cargo xtask build --rust-only     # Fast rebuild (reuses frontend assets)
 cargo xtask run                   # Run the bundled binary
 ```
 
-**Without supervisor** (manual two-terminal workflow):
+**Without nteract-dev** (manual two-terminal workflow):
 
 ```bash
 # Terminal 1: Run dev daemon (restart when you change daemon code)
@@ -439,8 +439,8 @@ python -c "import asyncio, runtimed; asyncio.run(runtimed.Client().ping())"
 
 ```bash
 # Check what's holding the lock
-cat ~/.cache/<cache_namespace>/daemon.json
 lsof ~/.cache/<cache_namespace>/daemon.lock
+./target/debug/runt daemon status --json   # asks the running daemon directly
 
 # If stale (crashed daemon), remove manually
 rm ~/.cache/<cache_namespace>/daemon.lock ~/.cache/<cache_namespace>/daemon.json
@@ -534,7 +534,7 @@ systemctl --user start runtimed.service
 | Installed binary | `~/Library/Application Support/<cache_namespace>/bin/<daemon_binary_basename>` |
 | Service config | `~/Library/LaunchAgents/<daemon_launchd_label>.plist` |
 | Socket | `~/Library/Caches/<cache_namespace>/runtimed.sock` |
-| Daemon info | `~/Library/Caches/<cache_namespace>/daemon.json` |
+| Daemon info (legacy fallback) | `~/Library/Caches/<cache_namespace>/daemon.json` |
 | Logs | `~/Library/Caches/<cache_namespace>/runtimed.log` |
 
 For stable, these expand to `runt`, `runtimed`, and `io.nteract.runtimed`. For nightly, they expand to `runt-nightly`, `runtimed-nightly`, and `io.nteract.runtimed.nightly`.
