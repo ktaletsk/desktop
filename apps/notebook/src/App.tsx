@@ -1,6 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { NotebookClient } from "runtimed";
@@ -57,7 +55,7 @@ import { KERNEL_STATUS } from "./lib/kernel-status";
 import { logger } from "./lib/logger";
 import { getNotebookCellsSnapshot } from "./lib/notebook-cells";
 import { useDetectRuntime } from "./lib/notebook-metadata";
-import { TauriTransport } from "./lib/tauri-transport";
+import { useNotebookHost } from "@nteract/notebook-host";
 import { startWindowFocusHandler } from "./lib/window-focus";
 import type { JupyterOutput } from "./types";
 
@@ -291,8 +289,11 @@ function AppContent() {
     // Daemon queue handles execution tracking via broadcasts
   }, []);
 
-  // NotebookClient for sending kernel commands via transport
-  const notebookClient = useMemo(() => new NotebookClient({ transport: new TauriTransport() }), []);
+  // NotebookClient for sending kernel commands via transport. The host's
+  // transport is the single instance shared with the SyncEngine in
+  // useAutomergeNotebook — no more separate connection per consumer.
+  const host = useNotebookHost();
+  const notebookClient = useMemo(() => new NotebookClient({ transport: host.transport }), [host]);
 
   // Daemon-owned kernel execution
   const {
@@ -820,15 +821,9 @@ function AppContent() {
     await restartAndRunAll();
   }, [restartAndRunAll]);
 
-  // Cmd+S to save (keyboard and native menu)
+  // Cmd+S keyboard shortcut. The native menu item is routed through
+  // host.commands.run("notebook.save") by the Tauri menu bridge.
   useEffect(() => {
-    const webview = getCurrentWebview();
-    // Listen for native menu save event
-    const unlistenPromise = webview.listen("menu:save", () => {
-      save();
-    });
-
-    // Keep keyboard shortcut as fallback
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "s") {
         e.preventDefault();
@@ -836,11 +831,7 @@ function AppContent() {
       }
     };
     window.addEventListener("keydown", handleKeyDown);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      unlistenPromise.then((unlisten) => unlisten());
-    };
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [save]);
 
   // Show asterisk in window title when notebook has unsaved changes.
@@ -878,15 +869,9 @@ function AppContent() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [globalFind.open]);
 
-  // Cmd+O to open (keyboard and native menu)
+  // Cmd+O keyboard shortcut. Menu item routes through
+  // host.commands.run("notebook.open") via the Tauri menu bridge.
   useEffect(() => {
-    const webview = getCurrentWebview();
-    // Listen for native menu open event
-    const unlistenPromise = webview.listen("menu:open", () => {
-      openNotebook();
-    });
-
-    // Keep keyboard shortcut as fallback
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "o") {
         e.preventDefault();
@@ -894,134 +879,80 @@ function AppContent() {
       }
     };
     window.addEventListener("keydown", handleKeyDown);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      unlistenPromise.then((unlisten) => unlisten());
-    };
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [openNotebook]);
 
-  // Clone notebook via native menu
+  // Route all notebook-level commands to their latest implementations via
+  // a single ref. The ref is updated every render; the host-level registration
+  // below runs only once per host, so a native menu event that lands during
+  // a state-driven re-render never finds the slot empty — the previous
+  // design re-registered every command on focusedCellId change, which
+  // opened a "no handler" window any menu click could fall into.
+  const commandHandlersRef = useRef({
+    save,
+    openNotebook,
+    cloneNotebook,
+    handleAddCell,
+    focusedCellId,
+    clearOutputs,
+    handleRunAllCells,
+    handleRestartAndRunAll,
+    checkForUpdate,
+  });
+  commandHandlersRef.current = {
+    save,
+    openNotebook,
+    cloneNotebook,
+    handleAddCell,
+    focusedCellId,
+    clearOutputs,
+    handleRunAllCells,
+    handleRestartAndRunAll,
+    checkForUpdate,
+  };
+
   useEffect(() => {
-    const webview = getCurrentWebview();
-    const unlistenPromise = webview.listen("menu:clone", () => {
-      cloneNotebook();
-    });
-
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [cloneNotebook]);
-
-  // Cell menu: Insert cell
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    const validCellTypes = ["code", "markdown", "raw"] as const;
-    const unlistenPromise = webview.listen<string>("menu:insert-cell", (event) => {
-      const payload = event.payload;
-      if (validCellTypes.includes(payload as (typeof validCellTypes)[number])) {
-        handleAddCell(payload as "code" | "markdown" | "raw", focusedCellId);
-      }
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, [handleAddCell, focusedCellId]);
-
-  // Cell menu: Clear Outputs (focused cell)
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    const unlistenPromise = webview.listen("menu:clear-outputs", async () => {
-      if (!focusedCellId) return;
-      const cell = getNotebookCellsSnapshot().find((c) => c.id === focusedCellId);
-      if (!cell || cell.cell_type !== "code") return;
-      await clearOutputs(focusedCellId);
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, [focusedCellId, clearOutputs]);
-
-  // Cell menu: Clear All Outputs
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    const unlistenPromise = webview.listen("menu:clear-all-outputs", async () => {
-      // Tell daemon to clear kernel output tracking for each cell
-      const codeCells = getNotebookCellsSnapshot().filter((c) => c.cell_type === "code");
-      await Promise.all(codeCells.map((cell) => clearOutputs(cell.id)));
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, [clearOutputs]);
-
-  // Kernel menu: Run All Cells
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    const unlistenPromise = webview.listen("menu:run-all", () => {
-      handleRunAllCells();
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [handleRunAllCells]);
-
-  // Kernel menu: Restart & Run All Cells
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    const unlistenPromise = webview.listen("menu:restart-and-run-all", () => {
-      handleRestartAndRunAll();
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [handleRestartAndRunAll]);
-
-  // Check for updates via native menu
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    const unlistenPromise = webview.listen("menu:check-for-updates", () => {
-      checkForUpdate();
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, [checkForUpdate]);
-
-  // Zoom controls via native menu
-  useEffect(() => {
-    const webview = getCurrentWebview();
-    let currentZoom = 1.0;
-
-    const handleZoomIn = () => {
-      currentZoom = Math.min(3.0, currentZoom + 0.1);
-      webview.setZoom(currentZoom);
-    };
-
-    const handleZoomOut = () => {
-      currentZoom = Math.max(0.5, currentZoom - 0.1);
-      webview.setZoom(currentZoom);
-    };
-
-    const handleZoomReset = () => {
-      currentZoom = 1.0;
-      webview.setZoom(1.0);
-    };
-
-    const unlistenIn = webview.listen("menu:zoom-in", handleZoomIn);
-    const unlistenOut = webview.listen("menu:zoom-out", handleZoomOut);
-    const unlistenReset = webview.listen("menu:zoom-reset", handleZoomReset);
-
-    return () => {
-      unlistenIn.then((u) => u());
-      unlistenOut.then((u) => u());
-      unlistenReset.then((u) => u());
-    };
-  }, []);
+    const disposables = [
+      host.commands.register("notebook.save", () => {
+        commandHandlersRef.current.save();
+      }),
+      host.commands.register("notebook.open", () => {
+        commandHandlersRef.current.openNotebook();
+      }),
+      host.commands.register("notebook.clone", () => {
+        commandHandlersRef.current.cloneNotebook();
+      }),
+      host.commands.register("notebook.insertCell", ({ type }) => {
+        const h = commandHandlersRef.current;
+        h.handleAddCell(type, h.focusedCellId);
+      }),
+      host.commands.register("notebook.clearOutputs", async () => {
+        const h = commandHandlersRef.current;
+        if (!h.focusedCellId) return;
+        const cell = getNotebookCellsSnapshot().find((c) => c.id === h.focusedCellId);
+        if (!cell || cell.cell_type !== "code") return;
+        await h.clearOutputs(h.focusedCellId);
+      }),
+      host.commands.register("notebook.clearAllOutputs", async () => {
+        const h = commandHandlersRef.current;
+        const codeCells = getNotebookCellsSnapshot().filter((c) => c.cell_type === "code");
+        await Promise.all(codeCells.map((cell) => h.clearOutputs(cell.id)));
+      }),
+      host.commands.register("notebook.runAll", () => {
+        commandHandlersRef.current.handleRunAllCells();
+      }),
+      host.commands.register("notebook.restartAndRunAll", () => {
+        commandHandlersRef.current.handleRestartAndRunAll();
+      }),
+      host.commands.register("updater.check", () => {
+        commandHandlersRef.current.checkForUpdate();
+      }),
+    ];
+    return () => disposables.forEach((d) => d());
+  }, [host]);
 
   // Listen for daemon startup progress events
   useEffect(() => {
-    const webview = getCurrentWebview();
     // Helper to cancel any pending ready timeout
     const cancelReadyTimeout = () => {
       if (readyTimeoutRef.current) {
@@ -1030,8 +961,8 @@ function AppContent() {
       }
     };
 
-    const unlistenProgress = listen<DaemonStatus>("daemon:progress", (event) => {
-      const status = event.payload;
+    const unlistenProgress = host.daemonEvents.onProgress((payload) => {
+      const status = payload as DaemonStatus;
 
       // Cancel any pending ready timeout before setting new status
       cancelReadyTimeout();
@@ -1048,7 +979,7 @@ function AppContent() {
     });
 
     // Listen for daemon disconnection (mid-session)
-    const unlistenDisconnect = webview.listen("daemon:disconnected", () => {
+    const unlistenDisconnect = host.daemonEvents.onDisconnected(() => {
       cancelReadyTimeout();
       setDaemonStatus({
         status: "failed",
@@ -1057,33 +988,29 @@ function AppContent() {
     });
 
     // Listen for daemon unavailable (startup failure, fires after sync timeout)
-    const unlistenUnavailable = listen<{
-      reason: string;
-      message: string;
-      guidance: string;
-    }>("daemon:unavailable", (event) => {
+    const unlistenUnavailable = host.daemonEvents.onUnavailable((payload) => {
       cancelReadyTimeout();
       setDaemonStatus({
         status: "failed",
-        error: `${event.payload.message} ${event.payload.guidance}`,
+        error: `${payload.message} ${payload.guidance}`,
       });
     });
 
     // Listen for daemon ready (reconnection success)
-    const unlistenReady = webview.listen<{ runtime?: string }>("daemon:ready", (event) => {
+    const unlistenReady = host.daemonEvents.onReady((payload) => {
       // Clear any status banner when daemon reconnects (failed, checking, etc.)
       cancelReadyTimeout();
       setDaemonStatus(null);
       // Set or clear the runtime hint — clearing prevents stale hints
       // when a window is reused to open a different notebook (Open path
       // sends runtime: null).
-      setRuntimeHint(event.payload?.runtime ?? null);
+      setRuntimeHint(payload?.runtime ?? null);
     });
 
     // Check daemon status on mount (in case events fired before React was ready)
     // Small delay to let initial events settle
     const checkTimeout = setTimeout(() => {
-      invoke<boolean>("is_daemon_connected").then((connected) => {
+      host.daemon.isConnected().then((connected) => {
         if (!connected) {
           setDaemonStatus((prev) => {
             // Only set if no status is already shown
@@ -1102,12 +1029,12 @@ function AppContent() {
     return () => {
       clearTimeout(checkTimeout);
       cancelReadyTimeout();
-      unlistenProgress.then((unlisten) => unlisten()).catch(() => {});
-      unlistenDisconnect.then((unlisten) => unlisten()).catch(() => {});
-      unlistenUnavailable.then((unlisten) => unlisten()).catch(() => {});
-      unlistenReady.then((unlisten) => unlisten()).catch(() => {});
+      unlistenProgress();
+      unlistenDisconnect();
+      unlistenUnavailable();
+      unlistenReady();
     };
-  }, []);
+  }, [host]);
 
   // Cmd+Shift+I to toggle isolation test panel (dev only)
   useEffect(() => {
@@ -1138,7 +1065,8 @@ function AppContent() {
           onDismiss={() => setDaemonStatus(null)}
           onRetry={() => {
             setDaemonStatus({ status: "checking" });
-            invoke("reconnect_to_daemon")
+            host.daemon
+              .reconnect()
               .then(() => {
                 // Success - daemon:ready event will clear the banner
               })
