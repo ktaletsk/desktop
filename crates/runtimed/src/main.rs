@@ -436,7 +436,7 @@ async fn run_daemon(
         use tokio::signal::unix::{signal, SignalKind};
         let shutdown_daemon = daemon.clone();
 
-        tokio::spawn(async move {
+        runtimed::task_supervisor::spawn_best_effort("signal-handler", async move {
             #[allow(clippy::expect_used)]
             // Signal registration failure is a fundamental OS issue with no recovery
             let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
