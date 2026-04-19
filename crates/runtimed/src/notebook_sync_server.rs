@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use automerge::sync;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use notify_debouncer_mini::DebounceEventResult;
@@ -1034,6 +1034,14 @@ pub struct NotebookRoom {
     /// Channel to send doc bytes to the debounced persistence task.
     /// Uses watch for "latest value" semantics - always keeps most recent state.
     pub persist_tx: Option<watch::Sender<Option<Vec<u8>>>>,
+    /// Channel to request a synchronous flush from the persist debouncer.
+    /// Receiver handles the request and replies on the oneshot after the write
+    /// completes. Used by room eviction to guarantee disk consistency *before*
+    /// the room is removed from the map, closing the race where a fast reconnect
+    /// would load stale bytes from the still-pending .automerge file.
+    ///
+    /// `None` for ephemeral rooms (persistence skipped) and matches `persist_tx`.
+    pub flush_request_tx: Option<mpsc::UnboundedSender<FlushRequest>>,
     /// Persistence path for this room's document.
     pub persist_path: PathBuf,
     /// Number of active peer connections in this room.
@@ -1264,12 +1272,13 @@ impl NotebookRoom {
             let _ = doc.set_metadata("ephemeral", "true");
         }
 
-        let persist_tx = if ephemeral {
-            None
+        let (persist_tx, flush_request_tx) = if ephemeral {
+            (None, None)
         } else {
             let (persist_tx, persist_rx) = watch::channel::<Option<Vec<u8>>>(None);
-            spawn_persist_debouncer(persist_rx, persist_path.clone());
-            Some(persist_tx)
+            let (flush_tx, flush_rx) = mpsc::unbounded_channel::<FlushRequest>();
+            spawn_persist_debouncer(persist_rx, flush_rx, persist_path.clone());
+            (Some(persist_tx), Some(flush_tx))
         };
 
         let trust_state = match &path {
@@ -1337,6 +1346,7 @@ impl NotebookRoom {
             presence_tx,
             presence: Arc::new(RwLock::new(PresenceState::new())),
             persist_tx,
+            flush_request_tx,
             persist_path,
             active_peers: AtomicUsize::new(0),
             had_peers: AtomicBool::new(false),
@@ -1397,7 +1407,8 @@ impl NotebookRoom {
         let (changed_tx, _) = broadcast::channel(16);
         let (kernel_broadcast_tx, _) = broadcast::channel(KERNEL_BROADCAST_CAPACITY);
         let (persist_tx, persist_rx) = watch::channel::<Option<Vec<u8>>>(None);
-        spawn_persist_debouncer(persist_rx, persist_path.clone());
+        let (flush_request_tx, flush_rx) = mpsc::unbounded_channel::<FlushRequest>();
+        spawn_persist_debouncer(persist_rx, flush_rx, persist_path.clone());
         let (presence_tx, _) = broadcast::channel(64);
         let path = if is_untitled_notebook(notebook_id) {
             None
@@ -1430,6 +1441,7 @@ impl NotebookRoom {
             presence_tx,
             presence: Arc::new(RwLock::new(PresenceState::new())),
             persist_tx: Some(persist_tx),
+            flush_request_tx: Some(flush_request_tx),
             persist_path,
             active_peers: AtomicUsize::new(0),
             had_peers: AtomicBool::new(false),
@@ -2128,15 +2140,89 @@ where
         );
 
         tokio::spawn(async move {
-            tokio::time::sleep(eviction_delay).await;
+            // Outer loop wraps the eviction attempt so a flush timeout can
+            // back off and retry rather than leak the room (and any attached
+            // kernel / watcher) indefinitely. The loop exits either by
+            // cancelling (peers reconnected) or by completing teardown.
+            let mut delay = eviction_delay;
+            let mut flush_retries: u32 = 0;
+            loop {
+                tokio::time::sleep(delay).await;
 
-            // Check if peers reconnected during the delay
-            if room_for_eviction.active_peers.load(Ordering::Relaxed) > 0 {
-                info!(
-                    "[notebook-sync] Eviction cancelled for {} (peers reconnected)",
-                    notebook_id_for_eviction
-                );
-                return;
+                // Check if peers reconnected during the delay
+                if room_for_eviction.active_peers.load(Ordering::Relaxed) > 0 {
+                    info!(
+                        "[notebook-sync] Eviction cancelled for {} (peers reconnected)",
+                        notebook_id_for_eviction
+                    );
+                    return;
+                }
+
+                // Force a synchronous flush of the persist debouncer BEFORE removing
+                // the room from the map. Without this, a fast reconnect lands in
+                // the window between HashMap removal and the debouncer's shutdown
+                // flush (which only fires when the last Arc to the room drops, and
+                // the eviction task still holds one while running kernel/env
+                // teardown). In that window get_or_create_room creates a fresh
+                // room that loads stale bytes from the .automerge file — or no
+                // file at all for brand-new untitled notebooks — silently losing
+                // cells and edits.
+                //
+                // Request/ack over a dedicated channel. The debouncer has a
+                // select! arm that writes the latest doc bytes and replies on
+                // the oneshot with the I/O result.
+                //
+                // On timeout or write failure we back off and retry indefinitely.
+                // Proceeding with HashMap removal on a failed flush reopens the
+                // race: either the write is still in flight, or the latest bytes
+                // are only in the soon-to-be-dropped room. We'd rather leak a
+                // room than silently lose user edits. A reconnect still finds
+                // the live in-memory room and recovers; a genuinely wedged
+                // filesystem will surface through other signals, and daemon
+                // shutdown still tries a last flush on persist_tx drop.
+                const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+                const FLUSH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+                let mut flush_ok = true;
+                let mut flush_failure_kind: Option<&'static str> = None;
+                if let Some(ref flush_tx) = room_for_eviction.flush_request_tx {
+                    let (ack_tx, ack_rx) = oneshot::channel::<bool>();
+                    if flush_tx.send(ack_tx).is_ok() {
+                        match tokio::time::timeout(FLUSH_TIMEOUT, ack_rx).await {
+                            Ok(Ok(true)) => {}
+                            Ok(Ok(false)) => {
+                                flush_ok = false;
+                                flush_failure_kind = Some("write error");
+                            }
+                            Ok(Err(_)) => {
+                                // Debouncer dropped the ack sender without
+                                // replying — task already exited (e.g. a
+                                // previous eviction flushed and closed). Any
+                                // pending bytes went through the shutdown path.
+                                debug!(
+                                    "[notebook-sync] Eviction flush ack dropped for {} (debouncer exited)",
+                                    notebook_id_for_eviction
+                                );
+                            }
+                            Err(_) => {
+                                flush_ok = false;
+                                flush_failure_kind = Some("timeout");
+                            }
+                        }
+                    }
+                }
+                if !flush_ok {
+                    flush_retries += 1;
+                    warn!(
+                        "[notebook-sync] Eviction flush failed for {} ({}; attempt {}); keeping room resident, retrying in {:?}",
+                        notebook_id_for_eviction,
+                        flush_failure_kind.unwrap_or("unknown"),
+                        flush_retries,
+                        FLUSH_RETRY_DELAY
+                    );
+                    delay = FLUSH_RETRY_DELAY;
+                    continue;
+                }
+                break;
             }
 
             // Remove room from the map under the lock, then drop the lock
@@ -7878,6 +7964,14 @@ impl Default for PersistDebouncerConfig {
     }
 }
 
+/// Request to force the persist debouncer to flush pending data immediately.
+/// The debouncer replies on the oneshot with `true` if the write succeeded
+/// (or if there were no pending bytes to write), `false` on I/O error. Used
+/// by room eviction to guarantee the persisted file reflects the latest doc
+/// state *before* the room is removed from the map; a `false` reply tells
+/// the caller the file on disk is still stale.
+type FlushRequest = oneshot::Sender<bool>;
+
 /// Spawn a debounced persistence task that coalesces writes.
 ///
 /// Uses a `watch` channel for "latest value" semantics - new values replace old ones,
@@ -7886,12 +7980,18 @@ impl Default for PersistDebouncerConfig {
 /// Persistence strategy:
 /// - **Debounce (500ms)**: Wait 500ms after last update before writing
 /// - **Max interval (5s)**: During continuous output, flush at least every 5s
+/// - **Flush request**: Force an immediate write and ack (used by eviction)
 /// - **Shutdown flush**: Persist any pending data when channel closes
 ///
 /// This reduces disk I/O during rapid output while ensuring durability.
-fn spawn_persist_debouncer(persist_rx: watch::Receiver<Option<Vec<u8>>>, persist_path: PathBuf) {
+fn spawn_persist_debouncer(
+    persist_rx: watch::Receiver<Option<Vec<u8>>>,
+    flush_rx: mpsc::UnboundedReceiver<FlushRequest>,
+    persist_path: PathBuf,
+) {
     spawn_persist_debouncer_with_config(
         persist_rx,
+        flush_rx,
         persist_path,
         PersistDebouncerConfig::default(),
     );
@@ -7900,6 +8000,7 @@ fn spawn_persist_debouncer(persist_rx: watch::Receiver<Option<Vec<u8>>>, persist
 /// Spawn debouncer with custom timing configuration (for testing).
 fn spawn_persist_debouncer_with_config(
     mut persist_rx: watch::Receiver<Option<Vec<u8>>>,
+    mut flush_rx: mpsc::UnboundedReceiver<FlushRequest>,
     persist_path: PathBuf,
     config: PersistDebouncerConfig,
 ) {
@@ -7930,6 +8031,44 @@ fn spawn_persist_debouncer_with_config(
                         break;
                     }
                     last_receive = Some(Instant::now());
+                }
+                maybe_req = flush_rx.recv() => {
+                    match maybe_req {
+                        Some(ack) => {
+                            // Eviction (or another caller) wants a synchronous flush.
+                            // Write the latest doc bytes, then ack with the write
+                            // result so the caller knows whether the file is
+                            // current. No pending bytes = nothing to write = ack true
+                            // (the file either doesn't exist or already reflects
+                            // the latest state).
+                            let bytes = persist_rx.borrow().clone();
+                            let ok = if let Some(data) = bytes {
+                                let write_ok = do_persist(&data, &persist_path);
+                                if write_ok {
+                                    last_flush = Some(Instant::now());
+                                    last_receive = None;
+                                }
+                                write_ok
+                            } else {
+                                true
+                            };
+                            // Receiver may have dropped (eviction timed out); ignore.
+                            let _ = ack.send(ok);
+                        }
+                        None => {
+                            // All flush senders dropped. The room is being torn
+                            // down; the watch receiver will close next and we'll
+                            // hit the shutdown flush on the persist_rx.changed()
+                            // Err arm. Break defensively to avoid hot-looping if
+                            // that somehow doesn't fire (we still want to flush
+                            // any pending bytes first).
+                            let bytes = persist_rx.borrow().clone();
+                            if let Some(data) = bytes {
+                                do_persist(&data, &persist_path);
+                            }
+                            break;
+                        }
+                    }
                 }
                 _ = check_interval.tick() => {
                     // Check if we should flush based on debounce or max interval
@@ -8096,9 +8235,10 @@ fn spawn_autosave_debouncer_with_config(
 }
 
 /// Actually persist bytes to disk, logging if it takes too long.
-fn do_persist(data: &[u8], path: &Path) {
+/// Returns `true` on success, `false` on I/O error.
+fn do_persist(data: &[u8], path: &Path) -> bool {
     let start = std::time::Instant::now();
-    persist_notebook_bytes(data, path);
+    let ok = persist_notebook_bytes(data, path);
     let elapsed = start.elapsed();
     if elapsed > std::time::Duration::from_millis(500) {
         warn!(
@@ -8106,22 +8246,30 @@ fn do_persist(data: &[u8], path: &Path) {
             path, elapsed
         );
     }
+    ok
 }
 
 /// Persist pre-serialized notebook bytes to disk.
-pub(crate) fn persist_notebook_bytes(data: &[u8], path: &Path) {
+///
+/// Returns `true` on success, `false` on I/O error. Callers that need to
+/// know whether the bytes actually hit disk (e.g. eviction's flush-and-ack
+/// path) must check the return value; earlier call sites that only care
+/// about best-effort debounced writes can ignore it.
+pub(crate) fn persist_notebook_bytes(data: &[u8], path: &Path) -> bool {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!(
                 "[notebook-sync] Failed to create parent dir for {:?}: {}",
                 path, e
             );
-            return;
+            return false;
         }
     }
     if let Err(e) = std::fs::write(path, data) {
         warn!("[notebook-sync] Failed to save notebook doc: {}", e);
+        return false;
     }
+    true
 }
 
 // =============================================================================
@@ -10218,7 +10366,8 @@ mod tests {
         let (kernel_broadcast_tx, _) = broadcast::channel(KERNEL_BROADCAST_CAPACITY);
         let persist_path = tmp.path().join("doc.automerge");
         let (persist_tx, persist_rx) = watch::channel::<Option<Vec<u8>>>(None);
-        spawn_persist_debouncer(persist_rx, persist_path.clone());
+        let (flush_request_tx, flush_rx) = mpsc::unbounded_channel::<FlushRequest>();
+        spawn_persist_debouncer(persist_rx, flush_rx, persist_path.clone());
 
         let (presence_tx, _) = broadcast::channel(64);
 
@@ -10232,6 +10381,7 @@ mod tests {
             presence_tx,
             presence: Arc::new(RwLock::new(PresenceState::new())),
             persist_tx: Some(persist_tx),
+            flush_request_tx: Some(flush_request_tx),
             persist_path,
             active_peers: AtomicUsize::new(0),
             had_peers: AtomicBool::new(false),
@@ -10476,12 +10626,13 @@ mod tests {
 
         // Create watch channel and spawn debouncer with short intervals for testing
         let (tx, rx) = watch::channel::<Option<Vec<u8>>>(None);
+        let (_flush_tx, flush_rx) = mpsc::unbounded_channel::<FlushRequest>();
         let config = PersistDebouncerConfig {
             debounce_ms: 50,       // 50ms debounce window
             max_interval_ms: 200,  // 200ms max between flushes
             check_interval_ms: 10, // Check every 10ms
         };
-        spawn_persist_debouncer_with_config(rx, persist_path.clone(), config);
+        spawn_persist_debouncer_with_config(rx, flush_rx, persist_path.clone(), config);
 
         // Send updates every 20ms (faster than 50ms debounce, so debounce never triggers)
         // The 200ms max interval should force a flush even without a quiet period.
@@ -10506,6 +10657,95 @@ mod tests {
         assert!(
             content_str.starts_with("update-"),
             "Content should be from an update"
+        );
+    }
+
+    /// Regression test for the eviction/debouncer race.
+    ///
+    /// The bug: room eviction used to remove the room from the HashMap before
+    /// the persist debouncer's debounce window elapsed, so a fast reconnect
+    /// would load stale/empty bytes. The fix: eviction sends a flush request
+    /// on `flush_request_tx` and awaits an ack on the oneshot *before* the
+    /// HashMap mutation. This test pins the contract: the ack must arrive
+    /// after the latest watch value has been written to disk, well inside
+    /// the debounce window.
+    #[tokio::test]
+    async fn test_persist_debouncer_flush_request_is_synchronous() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let persist_path = tmp.path().join("race.automerge");
+
+        // Use production defaults for debounce (500ms) so the timed flush
+        // can't mask the flush-request ack timing.
+        let (tx, rx) = watch::channel::<Option<Vec<u8>>>(None);
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel::<FlushRequest>();
+        spawn_persist_debouncer(rx, flush_rx, persist_path.clone());
+
+        // Push latest bytes and request a flush immediately. No sleeps — the
+        // debounce timer must not be the thing that persists this write.
+        let payload = b"eviction-latest-bytes".to_vec();
+        tx.send(Some(payload.clone())).unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel::<bool>();
+        flush_tx.send(ack_tx).unwrap();
+
+        // The ack must come back fast (success=true). 500ms is 10x margin over
+        // local disk I/O.
+        let ack_result = tokio::time::timeout(Duration::from_millis(500), ack_rx).await;
+        assert!(
+            matches!(ack_result, Ok(Ok(true))),
+            "flush ack did not arrive synchronously with success=true: {:?}",
+            ack_result
+        );
+
+        // And the file on disk must hold the latest payload, not stale bytes.
+        assert!(persist_path.exists(), "file must exist after flush ack");
+        let on_disk = std::fs::read(&persist_path).unwrap();
+        assert_eq!(
+            on_disk, payload,
+            "file contents must match latest payload after flush ack"
+        );
+    }
+
+    /// The flush-and-ack must report I/O failures so the eviction task can
+    /// retry (rather than remove the room and leave stale bytes on disk).
+    /// Force a write failure by pointing persist_path at a non-writable
+    /// location, then confirm the ack carries `false`.
+    #[tokio::test]
+    async fn test_persist_debouncer_flush_request_reports_write_failure() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Write target is a file *inside* a path that includes a non-directory
+        // component — `std::fs::create_dir_all` on parent will succeed, but
+        // `std::fs::write` on the final path will fail because it conflicts
+        // with a regular file we planted there. This simulates ENOSPC-class
+        // failures without needing OS-specific tricks.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"regular file").unwrap();
+        let persist_path = blocker.join("race.automerge");
+
+        let (tx, rx) = watch::channel::<Option<Vec<u8>>>(None);
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel::<FlushRequest>();
+        spawn_persist_debouncer(rx, flush_rx, persist_path.clone());
+
+        let payload = b"write-will-fail".to_vec();
+        tx.send(Some(payload)).unwrap();
+
+        let (ack_tx, ack_rx) = oneshot::channel::<bool>();
+        flush_tx.send(ack_tx).unwrap();
+
+        let ack_result = tokio::time::timeout(Duration::from_millis(500), ack_rx).await;
+        assert!(
+            matches!(ack_result, Ok(Ok(false))),
+            "flush ack must report write failure: {:?}",
+            ack_result
+        );
+        // The file should not exist, since the write errored before any bytes hit disk.
+        assert!(
+            !persist_path.exists(),
+            "persist_path must not exist after failed write"
         );
     }
 
