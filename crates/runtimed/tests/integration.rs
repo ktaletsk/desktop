@@ -571,9 +571,40 @@ async fn test_untitled_notebook_persists_through_eviction() {
         // Both clients drop here — the room should be evicted from memory
     }
 
-    // Give the daemon time to process disconnects and evict the room.
-    // 200ms was too tight for CI runners under load — bump to 2s.
-    sleep(Duration::from_secs(2)).await;
+    // Wait deterministically for the daemon to:
+    //   1. Evict the room (scheduled `room_eviction_delay_ms` after the last
+    //      peer disconnects — 50ms in this test config).
+    //   2. Flush the Automerge doc to `notebook-docs/<hash>.automerge` (persist
+    //      debouncer: 500ms debounce / 5s max-interval, plus a final flush on
+    //      channel close when the evicted room is dropped).
+    //
+    // Polling for the persisted file alone isn't enough: the debouncer can
+    // flush periodically while the room is still resident, and this test is
+    // specifically exercising the evict-then-reload-from-disk path. Give
+    // eviction a 500ms head start (10x the configured 50ms delay) before we
+    // start trusting the file as a sign that reload-from-disk is the only
+    // code path the reconnect can hit.
+    sleep(Duration::from_millis(500)).await;
+
+    let persist_path = temp_dir
+        .path()
+        .join("notebook-docs")
+        .join(runtimed::notebook_doc::notebook_doc_filename(&notebook_id));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(meta) = tokio::fs::metadata(&persist_path).await {
+            if meta.len() > 0 {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "persisted Automerge doc for untitled notebook did not appear within 10s at {:?}",
+                persist_path
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 
     // Phase 2: Reconnect — untitled notebook state should be restored from
     // the persisted Automerge doc (there's no .ipynb to load from)
