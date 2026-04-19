@@ -19,6 +19,51 @@ type CrdtCommWriter = (commId: string, patch: Record<string, unknown>) => void;
 /** Debounce interval for CRDT writes (ms). */
 const DEBOUNCE_MS = 50;
 
+/**
+ * Grace period after CRDT flush before clearing optimistic keys (ms).
+ *
+ * Covers the full round trip: CRDT write → sync flush (20ms) → daemon
+ * receives sync → diffs → sends comm_msg to kernel → kernel processes
+ * @interact callback → echoes on IOPub → 16ms coalesce → CRDT write →
+ * sync back to frontend. With a slow callback this can take 200–500ms.
+ */
+const ECHO_GRACE_MS = 500;
+
+/**
+ * Structural equality for JSON-serializable widget values.
+ *
+ * Widget state travels through comm messages as JSON, so values are
+ * limited to null, booleans, numbers, strings, arrays, and plain
+ * objects. `Object.is` handles primitives (including NaN); arrays and
+ * plain objects recurse.
+ */
+function structuralEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== "object" || typeof b !== "object") return false;
+
+  const aIsArray = Array.isArray(a);
+  const bIsArray = Array.isArray(b);
+  if (aIsArray !== bIsArray) return false;
+  if (aIsArray && bIsArray) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!structuralEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const aKeys = Object.keys(ao);
+  if (aKeys.length !== Object.keys(bo).length) return false;
+  for (const key of aKeys) {
+    if (!Object.prototype.hasOwnProperty.call(bo, key)) return false;
+    if (!structuralEqual(ao[key], bo[key])) return false;
+  }
+  return true;
+}
+
 export interface WidgetUpdateManagerOptions {
   getStore: () => WidgetStore | null;
   getCrdtWriter: () => CrdtCommWriter | null;
@@ -30,10 +75,20 @@ export class WidgetUpdateManager {
 
   /** Accumulated patches waiting for debounced flush, per comm. */
   private pendingState = new Map<string, Record<string, unknown>>();
-  /** Keys with local-only values not yet flushed to CRDT. */
-  private optimisticKeys = new Map<string, Set<string>>();
+  /**
+   * Last-written value per key for echo deduplication.
+   *
+   * Stores the value we most recently wrote locally for each key. Only
+   * echoes whose value structurally matches the last-written value are
+   * suppressed — if the kernel normalizes/clamps/rewrites the trait
+   * (e.g., `5.1` → `5.0` on a max-`5.0` slider), the corrected value
+   * passes through and replaces local state.
+   */
+  private optimisticKeys = new Map<string, Map<string, unknown>>();
   /** Per-comm debounce timers. */
   private flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per-comm grace timers for delayed optimistic key cleanup. */
+  private echoGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(opts: WidgetUpdateManagerOptions) {
     this.getStore = opts.getStore;
@@ -53,14 +108,14 @@ export class WidgetUpdateManager {
     // 1. Instant store update — UI reflects change immediately
     this.getStore()?.updateModel(commId, patch, buffers);
 
-    // 2. Track optimistic keys
+    // 2. Track optimistic keys + their last-written values
     let keys = this.optimisticKeys.get(commId);
     if (!keys) {
-      keys = new Set();
+      keys = new Map();
       this.optimisticKeys.set(commId, keys);
     }
-    for (const key of Object.keys(patch)) {
-      keys.add(key);
+    for (const [key, value] of Object.entries(patch)) {
+      keys.set(key, value);
     }
 
     // 3. Accumulate patch
@@ -85,8 +140,13 @@ export class WidgetUpdateManager {
   }
 
   /**
-   * Filter an incoming CRDT echo, suppressing keys that have pending
-   * optimistic values.
+   * Filter an incoming CRDT echo, suppressing keys whose echoed value
+   * matches the frontend's most recent local write.
+   *
+   * A kernel correction (e.g., ipywidgets clamping `5.1` → `5.0`) has a
+   * value that differs from what we wrote, so it passes through and
+   * updates the store. A true echo (kernel bouncing back what we sent)
+   * has an identical value and is dropped.
    *
    * Returns the filtered patch to apply, or null if entirely suppressed.
    */
@@ -100,10 +160,13 @@ export class WidgetUpdateManager {
     const filtered: Record<string, unknown> = {};
     let hasKeys = false;
     for (const [key, value] of Object.entries(incomingPatch)) {
-      if (!keys.has(key)) {
-        filtered[key] = value;
-        hasKeys = true;
+      const optimisticValue = keys.get(key);
+      const isOptimistic = keys.has(key);
+      if (isOptimistic && structuralEqual(optimisticValue, value)) {
+        continue;
       }
+      filtered[key] = value;
+      hasKeys = true;
     }
     return hasKeys ? filtered : null;
   }
@@ -116,7 +179,11 @@ export class WidgetUpdateManager {
     for (const timer of this.flushTimers.values()) {
       clearTimeout(timer);
     }
+    for (const timer of this.echoGraceTimers.values()) {
+      clearTimeout(timer);
+    }
     this.flushTimers.clear();
+    this.echoGraceTimers.clear();
     this.pendingState.clear();
     this.optimisticKeys.clear();
   }
@@ -137,6 +204,11 @@ export class WidgetUpdateManager {
     if (timer !== undefined) {
       clearTimeout(timer);
       this.flushTimers.delete(commId);
+    }
+    const graceTimer = this.echoGraceTimers.get(commId);
+    if (graceTimer !== undefined) {
+      clearTimeout(graceTimer);
+      this.echoGraceTimers.delete(commId);
     }
     this.pendingState.delete(commId);
     this.optimisticKeys.delete(commId);
@@ -167,9 +239,21 @@ export class WidgetUpdateManager {
     this.pendingState.delete(commId);
     writer(commId, patch);
 
-    // Clear optimistic keys after flush. Echoes arriving after this
-    // point carry the value we just wrote (or a kernel-validated value)
-    // and should pass through.
-    this.optimisticKeys.delete(commId);
+    // Keep optimistic keys alive for a grace period after flush.
+    // The CRDT write triggers a sync chain (frontend → daemon →
+    // kernel → IOPub echo → CRDT → frontend) that can take 200-500ms.
+    // If we cleared immediately, the stale kernel echo would pass
+    // through shouldSuppressEcho and clobber the user's value.
+    const existingGrace = this.echoGraceTimers.get(commId);
+    if (existingGrace !== undefined) {
+      clearTimeout(existingGrace);
+    }
+    this.echoGraceTimers.set(
+      commId,
+      setTimeout(() => {
+        this.optimisticKeys.delete(commId);
+        this.echoGraceTimers.delete(commId);
+      }, ECHO_GRACE_MS),
+    );
   }
 }

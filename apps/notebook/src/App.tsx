@@ -363,6 +363,24 @@ function AppContent() {
     };
   }, [getHandle, triggerSync]);
 
+  // E2E-only bridge for driving widget updates through the real pipeline
+  // (WidgetUpdateManager → debounced CRDT write → daemon → kernel) from
+  // a WebDriver spec, without reaching into the security-isolated iframe.
+  // Gated on `VITE_E2E` — `cargo xtask e2e build` sets it, production
+  // builds don't, so these globals aren't exposed to end users.
+  useEffect(() => {
+    if (!import.meta.env.VITE_E2E) return;
+    const w = window as unknown as Record<string, unknown>;
+    w.__nteractWidgetUpdate = (commId: string, patch: Record<string, unknown>) => {
+      updateManager.updateAndPersist(commId, patch);
+    };
+    w.__nteractWidgetStore = widgetStore;
+    return () => {
+      delete w.__nteractWidgetUpdate;
+      delete w.__nteractWidgetStore;
+    };
+  }, [widgetStore]);
+
   // ── CRDT → WidgetStore projection via SyncEngine.commChanges$ ──────
   // Replaces the old Jupyter message synthesis path. The SyncEngine diffs
   // RuntimeStateDoc.comms, resolves ContentRefs via WASM, and emits

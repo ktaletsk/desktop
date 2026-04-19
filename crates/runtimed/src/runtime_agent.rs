@@ -157,19 +157,39 @@ pub async fn run_runtime_agent(
                                     // detect frontend-originated widget state changes.
                                     let comms_before = sd.read_state().comms;
 
-                                    if let Ok(changed) = sd.receive_sync_message_with_changes(
+                                    // Per-change actor filter: diff comm state against a
+                                    // foreign-only view of the post-sync doc. If the
+                                    // coordinator coalesces a kernel-authored echo with a
+                                    // frontend widget write into one RuntimeStateSync frame,
+                                    // the foreign view omits the echo so we don't re-forward
+                                    // it back to the kernel and trigger amplification.
+                                    // Actors are opaque byte strings; the kernel-side writer
+                                    // uses a UTF-8 `rt:kernel:<session>` prefix (see
+                                    // `jupyter_kernel.rs`), so `starts_with` on the raw
+                                    // bytes is sufficient.
+                                    match sd.receive_sync_and_foreign_comms(
                                         &mut coordinator_sync_state,
                                         msg,
+                                        |actor| !actor.to_bytes().starts_with(b"rt:kernel:"),
                                     ) {
-                                        if changed {
+                                        Ok(view) if !view.applied_actors.is_empty() => {
                                             let _ = state_changed_tx.send(());
 
-                                            // Diff comm state -- forward changes to kernel
-                                            let comms_after = sd.read_state().comms;
                                             let queued = sd.get_queued_executions();
                                             drop(sd); // release write lock before kernel interaction
 
-                                            let comm_updates = diff_comm_state(&comms_before, &comms_after);
+                                            let comm_updates = match view.foreign_comms {
+                                                Some(foreign_comms) => {
+                                                    diff_comm_state(&comms_before, &foreign_comms)
+                                                }
+                                                None => {
+                                                    debug!(
+                                                        "[runtime-agent] Skipping comm forward: {} applied change(s) were all self-kernel echoes",
+                                                        view.applied_actors.len()
+                                                    );
+                                                    Vec::new()
+                                                }
+                                            };
                                             if !comm_updates.is_empty() {
                                                 if let Some(ref mut k) = kernel {
                                                     for (comm_id, delta) in &comm_updates {
@@ -208,7 +228,16 @@ pub async fn run_runtime_agent(
                                                     }
                                                 }
                                             }
-                                        } else {
+                                        }
+                                        Ok(_) => {
+                                            // No changes applied (handshake/ack).
+                                            drop(sd);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "[runtime-agent] Failed to apply RuntimeStateSync: {}",
+                                                e
+                                            );
                                             drop(sd);
                                         }
                                     }

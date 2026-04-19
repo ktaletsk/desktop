@@ -920,9 +920,15 @@ fn cmd_e2e_build() {
     // Build runtimed daemon binary for bundling (debug mode for faster builds)
     build_runtimed_daemon(false);
 
-    // pnpm build runs: notebook UI
+    // pnpm build runs: notebook UI. Set `VITE_E2E=1` so the bundler
+    // keeps the E2E-only test bridge (`window.__nteractWidgetUpdate`,
+    // `window.__nteractWidgetStore`) in the output — it's gated on
+    // `import.meta.env.VITE_E2E` in `App.tsx` so production bundles
+    // without this env var don't expose it.
     println!("Building frontend (notebook)...");
+    std::env::set_var("VITE_E2E", "1");
     run_frontend_build(true);
+    std::env::remove_var("VITE_E2E");
 
     println!("Building debug binary with WebDriver server...");
     run_cmd(
@@ -1121,6 +1127,11 @@ fn cmd_e2e_test_all() {
             "crates/notebook/fixtures/audit-test/10-deno.ipynb",
             "e2e/specs/deno.spec.js",
             "Deno Kernel Test",
+        ),
+        (
+            "crates/notebook/fixtures/audit-test/16-widget-slider.ipynb",
+            "e2e/specs/widget-slider-stall.spec.js",
+            "Widget Slider Stall Reproducer",
         ),
     ];
 
