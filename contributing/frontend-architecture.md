@@ -170,7 +170,7 @@ Security boundary for untrusted HTML/widget outputs. See [iframe-isolation.md](i
 | `useEnvProgress` | Environment setup progress tracking |
 | `useDependencies` | UV dependency management |
 | `useCondaDependencies` | Conda dependency management |
-| `useDenoDependencies` | Deno dependency management |
+| `useDenoConfig` | Deno config detection plus flexible-npm-imports toggle |
 | `useManifestResolver` | Resolves blob hashes to output data |
 | `useCellKeyboardNavigation` | Arrow keys, enter/escape modes |
 | `useEditorRegistry` | CodeMirror editor instance registry |
@@ -179,7 +179,7 @@ Security boundary for untrusted HTML/widget outputs. See [iframe-isolation.md](i
 | `useHistorySearch` | Kernel input history search |
 | `useTrust` | Notebook trust verification state |
 | `useUpdater` | App update checking and installation |
-| `usePixiDependencies` | Pixi/conda dependency management |
+| `usePixiDetection` | Pixi project detection (pixi.toml is the source of truth) |
 | `usePoolState` | Daemon pool state |
 | `useCrdtBridge` | CodeMirror ↔ CRDT character-level sync |
 
