@@ -3549,6 +3549,15 @@ async fn capture_env_into_metadata(
             let _ = fork.set_metadata_snapshot(&snap);
         }
     });
+    drop(doc);
+    if changed {
+        // Notify the autosave debouncer so the capture lands in the .ipynb
+        // even when the user closes the notebook without any other edits.
+        // Without this, captured metadata lives only in the in-memory CRDT
+        // and evaporates on room eviction, making the next reopen re-capture
+        // from scratch.
+        let _ = room.changed_tx.send(());
+    }
     changed
 }
 
@@ -3707,6 +3716,18 @@ fn captured_env_source_override(
     resolve_captured_env_override(metadata_snapshot).0
 }
 
+/// A notebook is considered "captured" only when its claimed env is still
+/// present on disk. Deps-present-but-disk-absent is intentionally NOT
+/// captured — we can't distinguish a GC'd captured env from a fresh
+/// notebook whose user added inline deps before the first launch. Treating
+/// the latter as captured would bypass the cross-notebook inline-deps
+/// cache. The tradeoff: GC'd captured envs rebuild via the normal inline
+/// path using legacy hashing. Same deps still dedup across notebooks; they
+/// just lose per-notebook env_id isolation for that rebuild.
+fn is_captured(captured: &CapturedEnv) -> bool {
+    unified_env_on_disk(captured).is_some()
+}
+
 /// Like `captured_env_source_override` but also returns the full
 /// `CapturedEnv` that matched. The capture data feeds into
 /// `build_launched_config` so drift detection knows what the launch
@@ -3718,12 +3739,12 @@ fn resolve_captured_env_override(
         return (None, None);
     };
     if let Some(captured) = captured_env_for_runtime(Some(snap), CapturedEnvRuntime::Uv) {
-        if unified_env_on_disk(&captured).is_some() {
+        if is_captured(&captured) {
             return (Some("uv:prewarmed".to_string()), Some(captured));
         }
     }
     if let Some(captured) = captured_env_for_runtime(Some(snap), CapturedEnvRuntime::Conda) {
-        if unified_env_on_disk(&captured).is_some() {
+        if is_captured(&captured) {
             return (Some("conda:prewarmed".to_string()), Some(captured));
         }
     }
@@ -3760,8 +3781,15 @@ async fn acquire_prewarmed_env_with_capture(
     // Uses the FULL dep-shape from metadata (requires-python, prerelease,
     // channels, python pin) so the hash matches what the capture step wrote,
     // even after the user edits one of those resolver-affecting fields.
+    //
+    // `is_captured` checks for the env on disk — deps-present-but-disk-absent
+    // falls through to the pool-take + capture path. That covers both fresh
+    // notebooks (empty deps) and GC'd captured envs (non-empty deps with no
+    // on-disk presence). The GC'd case accepts a rebuild via the normal
+    // inline path rather than routing through unified hashing, to avoid
+    // conflating "captured" with "user added inline deps before first launch."
     if let Some(captured) = captured_env_for_runtime(metadata_snapshot, runtime) {
-        if unified_env_on_disk(&captured).is_some() {
+        if is_captured(&captured) {
             match &captured {
                 CapturedEnv::Uv { deps, env_id } => {
                     let cache_dir = kernel_env::uv::default_cache_dir_uv();
@@ -5447,54 +5475,26 @@ async fn handle_notebook_request(
                     None
                 };
 
-                // Priority 0: captured prewarmed env on disk wins over both
-                // project-file and inline-deps detection. Without this,
-                // stopping + restarting a kernel on a captured notebook
-                // would route through the inline-deps path (because captured
-                // deps look structurally identical to inline ones), producing
-                // a fresh env instead of reusing the already-claimed one.
-                //
-                // Respects `auto_scope`: if the user explicitly asked for
-                // `auto:uv` but the captured env is conda (or vice versa),
-                // the explicit scope wins and we fall through to normal
-                // detection. `auto:pixi` always falls through — pixi captures
-                // aren't supported yet.
-                let captured =
-                    captured_env_source_override(metadata_snapshot.as_ref()).filter(|src| {
-                        match auto_scope {
-                            Some("uv") => src == "uv:prewarmed",
-                            Some("conda") => src == "conda:prewarmed",
-                            Some("pixi") => false,
-                            _ => true,
-                        }
-                    });
-                if let Some(captured_src) = captured {
-                    info!(
-                        "[notebook-sync] LaunchKernel: captured env on disk -> {}",
-                        captured_src
-                    );
-                    captured_src
-                }
                 // Priority 1: Detect project files near notebook path.
                 // Project file wins because inline deps get promoted to the
                 // project file at sync/launch time (project is source of truth).
-                else if let Some(detected) =
-                    notebook_path.as_ref().and_then(|path| match auto_scope {
-                        Some("uv") => crate::project_file::find_nearest_project_file(
-                            path,
-                            &[crate::project_file::ProjectFileKind::PyprojectToml],
-                        ),
-                        Some("conda") => crate::project_file::find_nearest_project_file(
-                            path,
-                            &[crate::project_file::ProjectFileKind::EnvironmentYml],
-                        ),
-                        Some("pixi") => crate::project_file::find_nearest_project_file(
-                            path,
-                            &[crate::project_file::ProjectFileKind::PixiToml],
-                        ),
-                        _ => crate::project_file::detect_project_file(path),
-                    })
-                {
+                // A project file added after capture means the user wants the
+                // project env, not the stale captured one.
+                if let Some(detected) = notebook_path.as_ref().and_then(|path| match auto_scope {
+                    Some("uv") => crate::project_file::find_nearest_project_file(
+                        path,
+                        &[crate::project_file::ProjectFileKind::PyprojectToml],
+                    ),
+                    Some("conda") => crate::project_file::find_nearest_project_file(
+                        path,
+                        &[crate::project_file::ProjectFileKind::EnvironmentYml],
+                    ),
+                    Some("pixi") => crate::project_file::find_nearest_project_file(
+                        path,
+                        &[crate::project_file::ProjectFileKind::PixiToml],
+                    ),
+                    _ => crate::project_file::detect_project_file(path),
+                }) {
                     info!(
                         "[notebook-sync] Auto-detected project file: {:?} -> {}",
                         detected.path,
@@ -5502,7 +5502,34 @@ async fn handle_notebook_request(
                     );
                     detected.to_env_source().to_string()
                 }
-                // Priority 2: Check inline deps in notebook metadata
+                // Priority 2: Captured prewarmed env wins over inline deps.
+                // Captured deps look structurally identical to user-authored
+                // inline deps, so without this override, reopening a captured
+                // notebook would route through the inline-deps path and miss
+                // the already-claimed env. Ordering is project file > captured
+                // > inline > default so a pyproject.toml added post-capture
+                // still wins.
+                //
+                // Respects `auto_scope`: `auto:uv` with a conda-captured
+                // notebook (or vice versa) falls through. `auto:pixi` always
+                // falls through — no pixi capture path yet.
+                else if let Some(captured_src) =
+                    captured_env_source_override(metadata_snapshot.as_ref()).filter(|src| {
+                        match auto_scope {
+                            Some("uv") => src == "uv:prewarmed",
+                            Some("conda") => src == "conda:prewarmed",
+                            Some("pixi") => false,
+                            _ => true,
+                        }
+                    })
+                {
+                    info!(
+                        "[notebook-sync] LaunchKernel: captured env on disk -> {}",
+                        captured_src
+                    );
+                    captured_src
+                }
+                // Priority 3: Check inline deps in notebook metadata
                 else if let Some(inline_source) =
                     metadata_snapshot
                         .as_ref()
@@ -14646,14 +14673,34 @@ mod tests {
     }
 
     #[test]
-    fn captured_env_source_override_returns_none_when_env_missing_on_disk() {
-        // env_id + captured deps but no env in cache_dir. We rely on the disk
-        // absence to fall back to the inline/pool path rather than loop back
-        // into the prewarmed capture path with a broken reference.
+    fn captured_env_source_override_returns_none_when_deps_present_but_env_missing() {
+        // Deps-present-but-disk-absent is intentionally NOT treated as
+        // captured: we cannot tell a GC'd captured env apart from a fresh
+        // notebook whose user added inline deps before the first launch.
+        // Falling through to the normal inline path is the safer default —
+        // same deps still dedup across notebooks via the legacy inline
+        // cache; they just lose per-notebook env_id isolation for that
+        // rebuild.
         let mut snap = NotebookMetadataSnapshot::default();
         snap.runt.env_id = Some(format!("unlikely-env-id-{}", uuid::Uuid::new_v4()));
         snap.runt.uv = Some(notebook_doc::metadata::UvInlineMetadata {
             dependencies: vec!["pandas".to_string()],
+            requires_python: None,
+            prerelease: None,
+        });
+        assert!(captured_env_source_override(Some(&snap)).is_none());
+    }
+
+    #[test]
+    fn captured_env_source_override_returns_none_for_fresh_notebook_empty_deps() {
+        // `create_empty_notebook` assigns an env_id and an empty uv/conda
+        // section on every new notebook. Empty deps + no env on disk must
+        // NOT be treated as captured, otherwise brand-new `uv:prewarmed`
+        // launches bypass the warmed pool and build a base env from scratch.
+        let mut snap = NotebookMetadataSnapshot::default();
+        snap.runt.env_id = Some(format!("fresh-env-{}", uuid::Uuid::new_v4()));
+        snap.runt.uv = Some(notebook_doc::metadata::UvInlineMetadata {
+            dependencies: vec![],
             requires_python: None,
             prerelease: None,
         });
