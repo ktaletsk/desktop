@@ -4222,6 +4222,11 @@ async fn auto_launch_kernel(
         crate::inline_env::BroadcastProgressHandler::new(room.kernel_broadcast_tx.clone()),
     );
 
+    // Fetch feature flags now so inline env prep hashes match what the
+    // kernel will actually receive (bootstrap_dx changes the install set).
+    let feature_flags_for_inline = daemon.feature_flags().await;
+    let bootstrap_dx = feature_flags_for_inline.bootstrap_dx;
+
     let (pooled_env, inline_deps) = if env_source == "uv:pep723" {
         // PEP 723 deps were extracted from cell source in step 2b
         if let Some(ref deps) = pep723_deps {
@@ -4233,7 +4238,7 @@ async fn auto_launch_kernel(
                 deps,
                 None,
                 progress_handler.clone(),
-                daemon.feature_flags().await,
+                bootstrap_dx,
             )
             .await
             {
@@ -4273,7 +4278,7 @@ async fn auto_launch_kernel(
 
             // Fast path: check inline env cache first (instant on hit)
             if let Some(cached) =
-                crate::inline_env::check_uv_inline_cache(&deps, prerelease.as_deref())
+                crate::inline_env::check_uv_inline_cache(&deps, prerelease.as_deref(), bootstrap_dx)
             {
                 info!(
                     "[notebook-sync] UV inline cache hit at {:?}",
@@ -4304,7 +4309,7 @@ async fn auto_launch_kernel(
                             &deps,
                             prerelease.as_deref(),
                             progress_handler.clone(),
-                            daemon.feature_flags().await,
+                            bootstrap_dx,
                         )
                         .await
                         {
@@ -4348,7 +4353,7 @@ async fn auto_launch_kernel(
                     &deps,
                     prerelease.as_deref(),
                     progress_handler.clone(),
-                    daemon.feature_flags().await,
+                    bootstrap_dx,
                 )
                 .await
                 {
@@ -4513,7 +4518,7 @@ async fn auto_launch_kernel(
     } else {
         None
     };
-    let feature_flags = daemon.feature_flags().await;
+    let feature_flags = feature_flags_for_inline;
     let launched_config = build_launched_config(
         kernel_type,
         &env_source,
@@ -5248,6 +5253,11 @@ async fn handle_notebook_request(
                     room.kernel_broadcast_tx.clone(),
                 ));
 
+            // Fetch feature flags up front so inline env hashing matches
+            // the kernel's install set (bootstrap_dx adds `dx`).
+            let feature_flags_for_inline = daemon.feature_flags().await;
+            let bootstrap_dx = feature_flags_for_inline.bootstrap_dx;
+
             let (pooled_env, inline_deps) = if resolved_env_source == "uv:pep723" {
                 // Extract PEP 723 deps from cell source
                 let cells = room.doc.read().await.get_cells();
@@ -5275,7 +5285,7 @@ async fn handle_notebook_request(
                         &deps,
                         None,
                         launch_progress_handler.clone(),
-                        daemon.feature_flags().await,
+                        bootstrap_dx,
                     )
                     .await
                     {
@@ -5314,9 +5324,11 @@ async fn handle_notebook_request(
                         .and_then(get_inline_uv_prerelease);
 
                     // Fast path: check inline env cache first (instant on hit)
-                    if let Some(cached) =
-                        crate::inline_env::check_uv_inline_cache(&deps, prerelease.as_deref())
-                    {
+                    if let Some(cached) = crate::inline_env::check_uv_inline_cache(
+                        &deps,
+                        prerelease.as_deref(),
+                        bootstrap_dx,
+                    ) {
                         info!(
                             "[notebook-sync] LaunchKernel: UV inline cache hit at {:?}",
                             cached.python_path
@@ -5352,7 +5364,7 @@ async fn handle_notebook_request(
                                     &deps,
                                     prerelease.as_deref(),
                                     launch_progress_handler.clone(),
-                                    daemon.feature_flags().await,
+                                    bootstrap_dx,
                                 )
                                 .await
                                 {
@@ -5387,7 +5399,7 @@ async fn handle_notebook_request(
                             &deps,
                             prerelease.as_deref(),
                             launch_progress_handler.clone(),
-                            daemon.feature_flags().await,
+                            bootstrap_dx,
                         )
                         .await
                         {
@@ -5739,7 +5751,7 @@ async fn handle_notebook_request(
             let venv_path = pooled_env.as_ref().map(|e| e.venv_path.clone());
             let python_path = pooled_env.as_ref().map(|e| e.python_path.clone());
             let prewarmed_pkgs = pooled_env.as_ref().map(|e| e.prewarmed_packages.clone());
-            let feature_flags = daemon.feature_flags().await;
+            let feature_flags = feature_flags_for_inline;
             let launched_config = build_launched_config(
                 &resolved_kernel_type,
                 &resolved_env_source,

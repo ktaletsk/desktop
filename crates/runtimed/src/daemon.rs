@@ -257,7 +257,7 @@ fn uv_prewarmed_packages(
         "uv".to_string(),
     ];
     if feature_flags.bootstrap_dx {
-        packages.push("nteract-kernel-launcher".to_string());
+        // Launcher is vendored post-creation; only `dx` needs installing.
         packages.push("dx".to_string());
     }
     packages.extend(extra.iter().cloned());
@@ -347,8 +347,7 @@ impl Pool {
     /// Compares `PooledEnv::prewarmed_packages` as a sorted list against the
     /// caller-provided expected list. This catches changes to `uv.default_packages`,
     /// `conda.default_packages`, `pixi.default_packages`, and feature flags that
-    /// affect the install set (e.g. `bootstrap_dx` adding `nteract-kernel-launcher`
-    /// to UV envs).
+    /// affect the install set (e.g. `bootstrap_dx` adding `dx` to UV envs).
     ///
     /// Returned paths are normalised via [`pool_env_root`] so callers delete the
     /// top-level pool directory (Pixi envs are nested under `.pixi/envs/default`
@@ -2287,6 +2286,18 @@ impl Daemon {
                     "[runtimed] Took UV env for kernel launch: {:?}",
                     e.venv_path
                 );
+                // Backstop: re-vendor the launcher into this env. Pool entries
+                // warmed by a pre-upgrade daemon (or rehydrated from disk) may
+                // be missing `nteract_kernel_launcher.py`. Idempotent and
+                // cheap. On failure, warn and continue -- the env is still
+                // usable for non-launcher kernels, and launcher-using kernels
+                // will fail with a clearer error at startup.
+                if let Err(err) = kernel_env::launcher::vendor_into_venv(&e.python_path).await {
+                    warn!(
+                        "[runtimed] Pool take (UV): failed to re-vendor launcher into {:?}: {}",
+                        e.python_path, err
+                    );
+                }
                 let daemon = self.clone();
                 spawn_best_effort("uv-replenish", async move {
                     daemon.create_uv_env().await;
@@ -2362,6 +2373,14 @@ impl Daemon {
                     "[runtimed] Took Conda env for kernel launch: {:?}",
                     e.venv_path
                 );
+                // Backstop: re-vendor the launcher into this env. See take_uv_env
+                // for rationale. Warn-and-continue on failure.
+                if let Err(err) = kernel_env::launcher::vendor_into_venv(&e.python_path).await {
+                    warn!(
+                        "[runtimed] Pool take (Conda): failed to re-vendor launcher into {:?}: {}",
+                        e.python_path, err
+                    );
+                }
                 let daemon = self.clone();
                 spawn_best_effort("conda-replenish", async move {
                     daemon.replenish_conda_env().await;
@@ -2432,6 +2451,14 @@ impl Daemon {
                 "[runtimed] Took Pixi env for kernel launch: {:?}",
                 e.venv_path
             );
+            // Backstop: re-vendor the launcher into this env. See take_uv_env
+            // for rationale. Warn-and-continue on failure.
+            if let Err(err) = kernel_env::launcher::vendor_into_venv(&e.python_path).await {
+                warn!(
+                    "[runtimed] Pool take (Pixi): failed to re-vendor launcher into {:?}: {}",
+                    e.python_path, err
+                );
+            }
             let daemon = self.clone();
             spawn_best_effort("pixi-replenish", async move {
                 daemon.replenish_pixi_env().await;
@@ -3992,6 +4019,27 @@ impl Daemon {
             return;
         }
 
+        // Vendor the single-file nteract_kernel_launcher module into
+        // site-packages so `python -m nteract_kernel_launcher` resolves for
+        // pool-served conda envs. Without this, bootstrap_dx kernels die with
+        // ModuleNotFoundError at launch. Run before warmup so .pyc is built
+        // with the launcher present.
+        if let Err(e) = kernel_env::launcher::vendor_into_venv(&python_path).await {
+            error!(
+                "[runtimed] Failed to vendor nteract_kernel_launcher into conda pool env at {:?}: {}",
+                python_path, e
+            );
+            let _ = tokio::fs::remove_dir_all(&env_path).await;
+            guard
+                .fail_with(Some(PackageInstallError {
+                    failed_package: None,
+                    error_message: format!("Failed to vendor nteract_kernel_launcher: {}", e),
+                    error_kind: "setup_failed".to_string(),
+                }))
+                .await;
+            return;
+        }
+
         // Run warmup script
         let warmup_outcome = self
             .warmup_conda_env(&python_path, &env_path, &extra_conda_packages)
@@ -4478,6 +4526,27 @@ impl Daemon {
                     .await;
                 return;
             }
+        }
+
+        // Vendor the single-file nteract_kernel_launcher module into
+        // site-packages so `python -m nteract_kernel_launcher` resolves for
+        // pool-served UV envs. Without this, bootstrap_dx kernels die with
+        // ModuleNotFoundError at launch. Run before warmup so .pyc is built
+        // with the launcher present.
+        if let Err(e) = kernel_env::launcher::vendor_into_venv(&python_path).await {
+            error!(
+                "[runtimed] Failed to vendor nteract_kernel_launcher into UV pool env at {:?}: {}",
+                python_path, e
+            );
+            let _ = tokio::fs::remove_dir_all(&venv_path).await;
+            guard
+                .fail_with(Some(PackageInstallError {
+                    failed_package: None,
+                    error_message: format!("Failed to vendor nteract_kernel_launcher: {}", e),
+                    error_kind: "setup_failed".to_string(),
+                }))
+                .await;
+            return;
         }
 
         // Warm up the environment (30 second timeout)
