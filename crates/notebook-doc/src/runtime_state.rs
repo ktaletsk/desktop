@@ -3196,6 +3196,32 @@ mod tests {
     }
 
     #[test]
+    fn test_replace_output_removes_stale_keys() {
+        let mut doc = RuntimeStateDoc::new();
+        doc.create_execution("exec-1", "cell-1");
+
+        // Original manifest has an extra key (display_id)
+        let original = serde_json::json!({
+            "output_type": "display_data",
+            "display_id": "plot-1",
+            "data": {"text/plain": {"blob": "h1", "size": 2}}
+        });
+        doc.append_output("exec-1", &original).unwrap();
+
+        // Replacement manifest omits display_id
+        let replacement = serde_json::json!({
+            "output_type": "display_data",
+            "data": {"text/plain": {"blob": "h2", "size": 2}}
+        });
+        doc.replace_output("exec-1", 0, &replacement).unwrap();
+
+        let outputs = doc.get_outputs("exec-1");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], replacement);
+        assert!(outputs[0].get("display_id").is_none());
+    }
+
+    #[test]
     fn test_upsert_stream_output_append() {
         let mut doc = RuntimeStateDoc::new();
         doc.create_execution("exec-1", "cell-1");
@@ -3377,8 +3403,8 @@ mod tests {
         }
 
         let size_after_100 = doc.doc.save().len();
-        // With in-place updates, only text.blob and text.size scalars change
-        // (2 ops per update). The doc should stay well under 3x initial size.
+        // In-place scalar puts generate zero Map tombstones (unlike delete+insert),
+        // so history grows only by the op log for ~5 scalar puts per update.
         let growth_factor = size_after_100 as f64 / size_after_first as f64;
         assert!(
             growth_factor < 3.0,
