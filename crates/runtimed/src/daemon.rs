@@ -340,6 +340,41 @@ impl Pool {
         removed_paths
     }
 
+    /// Evict pool entries whose installed package set no longer matches the
+    /// current expected list, returning the pool-root paths so the caller can
+    /// delete them from disk.
+    ///
+    /// Compares `PooledEnv::prewarmed_packages` as a sorted list against the
+    /// caller-provided expected list. This catches changes to `uv.default_packages`,
+    /// `conda.default_packages`, `pixi.default_packages`, and feature flags that
+    /// affect the install set (e.g. `bootstrap_dx` adding `nteract-kernel-launcher`
+    /// to UV envs).
+    ///
+    /// Returned paths are normalised via [`pool_env_root`] so callers delete the
+    /// top-level pool directory (Pixi envs are nested under `.pixi/envs/default`
+    /// but GC and eviction must both operate on the `runtimed-pixi-*` root).
+    ///
+    /// Note: envs that are still warming are not affected. Their `prewarmed_packages`
+    /// is the snapshot the warming task captured at install time; once they finish,
+    /// the next sweep here will evict them if the expected list has drifted again.
+    fn evict_mismatched_packages(&mut self, expected: &[String]) -> Vec<PathBuf> {
+        let mut expected_sorted: Vec<String> = expected.to_vec();
+        expected_sorted.sort();
+        let mut evicted = Vec::new();
+        let mut kept = VecDeque::new();
+        for entry in self.available.drain(..) {
+            let mut entry_pkgs = entry.env.prewarmed_packages.clone();
+            entry_pkgs.sort();
+            if entry_pkgs == expected_sorted {
+                kept.push_back(entry);
+            } else {
+                evicted.push(pool_env_root(&entry.env.venv_path));
+            }
+        }
+        self.available = kept;
+        evicted
+    }
+
     /// Take an environment from the pool.
     fn take(&mut self) -> (Option<PooledEnv>, Vec<PathBuf>) {
         let stale_paths = self.prune_stale();
@@ -3352,24 +3387,30 @@ impl Daemon {
                 break;
             }
 
-            let (deficit, should_retry, backoff_info) = {
-                // Read pool size from SettingsDoc (imported from settings.json)
-                // BUT: Honor config.uv_pool_size = 0 for test isolation.
-                // Tests set config.uv_pool_size = 0 to disable warming, but
-                // SettingsDoc defaults to 3 when there's no settings.json.
-                // Verified by: test_pool_size_config_honored, test_daemon_take_empty_pool
+            // Snapshot expected package list and target pool size from settings
+            // so we can detect pool-entry drift (issue #1915) without holding
+            // the settings lock across the pool lock.
+            let (target, expected_packages) = {
+                let settings = self.settings.read().await;
                 let target = if self.config.uv_pool_size == 0 {
                     0 // Test mode: explicit 0 in config means don't warm
                 } else {
-                    let settings = self.settings.read().await;
                     settings
                         .get_u64("uv_pool_size")
                         .unwrap_or(runtimed_client::settings_doc::DEFAULT_UV_POOL_SIZE)
                         .min(runtimed_client::settings_doc::MAX_POOL_SIZE)
                         as usize
                 };
+                let synced = settings.get_all();
+                let pkgs =
+                    uv_prewarmed_packages(&synced.uv.default_packages, synced.feature_flags());
+                (target, pkgs)
+            };
+
+            let (evicted_paths, deficit, should_retry, backoff_info) = {
                 let mut pool = self.uv_pool.lock().await;
                 pool.set_target(target);
+                let evicted = pool.evict_mismatched_packages(&expected_packages);
                 let d = pool.deficit();
                 let retry = pool.should_retry();
                 let info = if pool.failure_state.consecutive_failures > 0 {
@@ -3386,8 +3427,20 @@ impl Daemon {
                 if d > 0 && retry {
                     pool.mark_warming(d);
                 }
-                (d, retry, info)
+                (evicted, d, retry, info)
             };
+
+            if !evicted_paths.is_empty() {
+                info!(
+                    "[runtimed] UV pool: evicting {} env(s) after settings change",
+                    evicted_paths.len()
+                );
+                spawn_env_deletions(evicted_paths);
+                // Publish the post-eviction state immediately so clients don't
+                // see ghost entries while the pool is in backoff or waiting
+                // for the next warm tick.
+                self.update_pool_doc().await;
+            }
 
             if deficit > 0 {
                 if should_retry {
@@ -3447,24 +3500,27 @@ impl Daemon {
                 break;
             }
 
-            let (deficit, should_retry, backoff_info) = {
-                // Read pool size from SettingsDoc (imported from settings.json)
-                // BUT: Honor config.conda_pool_size = 0 for test isolation.
-                // Tests set config.conda_pool_size = 0 to disable warming, but
-                // SettingsDoc defaults to 3 when there's no settings.json.
-                // Verified by: test_pool_size_config_honored, test_daemon_take_empty_pool
+            // Snapshot expected package list and target pool size (issue #1915).
+            let (target, expected_packages) = {
+                let settings = self.settings.read().await;
                 let target = if self.config.conda_pool_size == 0 {
                     0 // Test mode: explicit 0 in config means don't warm
                 } else {
-                    let settings = self.settings.read().await;
                     settings
                         .get_u64("conda_pool_size")
                         .unwrap_or(runtimed_client::settings_doc::DEFAULT_CONDA_POOL_SIZE)
                         .min(runtimed_client::settings_doc::MAX_POOL_SIZE)
                         as usize
                 };
+                let synced = settings.get_all();
+                let pkgs = conda_prewarmed_packages(&synced.conda.default_packages);
+                (target, pkgs)
+            };
+
+            let (evicted_paths, deficit, should_retry, backoff_info) = {
                 let mut pool = self.conda_pool.lock().await;
                 pool.set_target(target);
+                let evicted = pool.evict_mismatched_packages(&expected_packages);
                 let d = pool.deficit();
                 let retry = pool.should_retry();
                 let info = if pool.failure_state.consecutive_failures > 0 {
@@ -3481,8 +3537,17 @@ impl Daemon {
                 if d > 0 && retry {
                     pool.mark_warming(d);
                 }
-                (d, retry, info)
+                (evicted, d, retry, info)
             };
+
+            if !evicted_paths.is_empty() {
+                info!(
+                    "[runtimed] Conda pool: evicting {} env(s) after settings change",
+                    evicted_paths.len()
+                );
+                spawn_env_deletions(evicted_paths);
+                self.update_pool_doc().await;
+            }
 
             if deficit > 0 {
                 if should_retry {
@@ -3552,24 +3617,27 @@ impl Daemon {
                 break;
             }
 
-            let (deficit, should_retry, backoff_info) = {
-                // Read pool size from SettingsDoc (imported from settings.json)
-                // BUT: Honor config.pixi_pool_size = 0 for test isolation.
-                // Tests set config.pixi_pool_size = 0 to disable warming, but
-                // SettingsDoc defaults to 2 when there's no settings.json.
-                // Verified by: test_pool_size_config_honored, test_daemon_take_empty_pool
+            // Snapshot expected package list and target pool size (issue #1915).
+            let (target, expected_packages) = {
+                let settings = self.settings.read().await;
                 let target = if self.config.pixi_pool_size == 0 {
                     0 // Test mode: explicit 0 in config means don't warm
                 } else {
-                    let settings = self.settings.read().await;
                     settings
                         .get_u64("pixi_pool_size")
                         .unwrap_or(runtimed_client::settings_doc::DEFAULT_PIXI_POOL_SIZE)
                         .min(runtimed_client::settings_doc::MAX_POOL_SIZE)
                         as usize
                 };
+                let synced = settings.get_all();
+                let pkgs = pixi_prewarmed_packages(&synced.pixi.default_packages);
+                (target, pkgs)
+            };
+
+            let (evicted_paths, deficit, should_retry, backoff_info) = {
                 let mut pool = self.pixi_pool.lock().await;
                 pool.set_target(target);
+                let evicted = pool.evict_mismatched_packages(&expected_packages);
                 let d = pool.deficit();
                 let retry = pool.should_retry();
                 let info = if pool.failure_state.consecutive_failures > 0 {
@@ -3586,8 +3654,17 @@ impl Daemon {
                 if d > 0 && retry {
                     pool.mark_warming(d);
                 }
-                (d, retry, info)
+                (evicted, d, retry, info)
             };
+
+            if !evicted_paths.is_empty() {
+                info!(
+                    "[runtimed] Pixi pool: evicting {} env(s) after settings change",
+                    evicted_paths.len()
+                );
+                spawn_env_deletions(evicted_paths);
+                self.update_pool_doc().await;
+            }
 
             if deficit > 0 {
                 if should_retry {
@@ -5305,6 +5382,109 @@ mod tests {
         pool.warming_failed_for_path(&path1, None);
         assert_eq!(pool.warming_paths.len(), 1);
         assert!(pool.warming_paths.contains(&path3));
+    }
+
+    // ── Pool eviction on settings change (issue #1915) ───────────────
+
+    #[test]
+    fn test_evict_mismatched_packages_removes_stale_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut pool = Pool::new(3, 3600);
+
+        let mut e1 = create_test_env(&temp_dir, "runtimed-uv-a");
+        e1.prewarmed_packages = vec!["ipykernel".into(), "pandas".into()];
+        let mut e2 = create_test_env(&temp_dir, "runtimed-uv-b");
+        e2.prewarmed_packages = vec!["ipykernel".into(), "numpy".into()];
+        let e2_path = e2.venv_path.clone();
+        pool.add(e1);
+        pool.add(e2);
+        assert_eq!(pool.available.len(), 2);
+
+        let expected = vec!["ipykernel".to_string(), "pandas".to_string()];
+        let evicted = pool.evict_mismatched_packages(&expected);
+
+        assert_eq!(evicted, vec![e2_path]);
+        assert_eq!(pool.available.len(), 1);
+        assert_eq!(
+            pool.available.front().unwrap().env.prewarmed_packages,
+            vec!["ipykernel".to_string(), "pandas".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_evict_mismatched_packages_ignores_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut pool = Pool::new(3, 3600);
+
+        let mut env = create_test_env(&temp_dir, "runtimed-uv-reorder");
+        env.prewarmed_packages = vec!["pandas".into(), "ipykernel".into(), "numpy".into()];
+        pool.add(env);
+
+        let expected = vec!["numpy".into(), "ipykernel".into(), "pandas".into()];
+        let evicted = pool.evict_mismatched_packages(&expected);
+
+        assert!(evicted.is_empty(), "sorted equality should ignore order");
+        assert_eq!(pool.available.len(), 1);
+    }
+
+    #[test]
+    fn test_evict_mismatched_packages_evicts_all_when_all_stale() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut pool = Pool::new(3, 3600);
+
+        for name in ["runtimed-uv-1", "runtimed-uv-2", "runtimed-uv-3"] {
+            let mut env = create_test_env(&temp_dir, name);
+            env.prewarmed_packages = vec!["ipykernel".into()];
+            pool.add(env);
+        }
+        assert_eq!(pool.available.len(), 3);
+
+        // Settings added a new default package — every env is now stale.
+        let expected = vec!["ipykernel".to_string(), "pandas".to_string()];
+        let evicted = pool.evict_mismatched_packages(&expected);
+
+        assert_eq!(evicted.len(), 3);
+        assert!(pool.available.is_empty());
+    }
+
+    #[test]
+    fn test_evict_mismatched_packages_empty_pool_is_noop() {
+        let mut pool = Pool::new(3, 3600);
+        let evicted = pool.evict_mismatched_packages(&["ipykernel".to_string()]);
+        assert!(evicted.is_empty());
+        assert!(pool.available.is_empty());
+    }
+
+    #[test]
+    fn test_evict_mismatched_packages_returns_pool_root_for_nested_venv() {
+        // Pixi envs live at `runtimed-pixi-*/.pixi/envs/default`. Eviction
+        // must return the pool root so `spawn_env_deletions` removes the
+        // whole directory, not just the inner venv.
+        let temp_dir = TempDir::new().unwrap();
+        let mut pool = Pool::new(3, 3600);
+
+        let pool_root = temp_dir.path().join("runtimed-pixi-abc");
+        let nested_venv = pool_root.join(".pixi").join("envs").join("default");
+        let python = nested_venv.join("bin").join("python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, "").unwrap();
+        std::fs::write(nested_venv.join(".warmed"), "").unwrap();
+
+        pool.add(PooledEnv {
+            env_type: EnvType::Conda,
+            venv_path: nested_venv,
+            python_path: python,
+            prewarmed_packages: vec!["ipykernel".into()],
+        });
+
+        let expected = vec!["ipykernel".to_string(), "pandas".to_string()];
+        let evicted = pool.evict_mismatched_packages(&expected);
+
+        assert_eq!(
+            evicted,
+            vec![pool_root],
+            "nested venv should evict by pool root, not inner venv path"
+        );
     }
 
     // ── Blob GC correctness (spec 1) ─────────────────────────────────
